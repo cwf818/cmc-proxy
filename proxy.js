@@ -293,7 +293,9 @@ function anthropicToOpenAIRequest(body) {
     messages,
     stream: !!body.stream,
   };
-  if (body.max_tokens != null) req.max_tokens = body.max_tokens;
+  // 部分上游模型 (如 gpt-5.6-sol) 要求 max_tokens >= 16; Claude Code 的 /model
+  // 探测请求会发 max_tokens=1, 需钳制到最小值避免 400
+  if (body.max_tokens != null) req.max_tokens = Math.max(16, body.max_tokens);
   if (body.temperature != null) req.temperature = body.temperature;
   if (body.top_p != null) req.top_p = body.top_p;
   if (body.tools && Array.isArray(body.tools) && body.tools.length) {
@@ -663,7 +665,8 @@ function responsesToChatRequest(body) {
   if (body.instructions) messages.push({ role: "system", content: body.instructions });
   messages.push(...responsesInputToChatMessages(body.input));
   const req = { model: mapped, messages, stream: !!body.stream };
-  if (body.max_output_tokens != null) req.max_tokens = body.max_output_tokens;
+  // 钳制 max_output_tokens 到最小 16 (部分上游模型要求, 如 gpt-5.6-sol)
+  if (body.max_output_tokens != null) req.max_tokens = Math.max(16, body.max_output_tokens);
   if (body.temperature != null) req.temperature = body.temperature;
   if (body.tools && Array.isArray(body.tools) && body.tools.length) {
     // 兼容两种 tool 结构: Responses 平铺 {type,name,description,parameters}

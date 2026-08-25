@@ -142,7 +142,7 @@ function estimateTokens(obj) {
   }
 }
 
-/** 估算 Anthropic 请求的输入 tokens (用于 message_start.usage.input_tokens) */
+/** 估算 Anthropic/Responses 请求的输入 tokens (用于 message_start.usage.input_tokens) */
 function estimateInputTokens(body) {
   try {
     let n = 0;
@@ -150,7 +150,9 @@ function estimateInputTokens(body) {
       n += Math.ceil((typeof s === "string" ? s : JSON.stringify(s || {})).length / 4);
     };
     if (body.system) count(body.system);
+    if (body.instructions) count(body.instructions);
     for (const m of body.messages || []) count(m.content);
+    if (body.input) count(body.input);
     if (body.tools && body.tools.length) count(body.tools);
     return Math.max(1, n);
   } catch {
@@ -573,6 +575,351 @@ class StreamConverter {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Responses API (Codex wire_api="responses") -> Chat Completions 请求转换
+// ---------------------------------------------------------------------------
+function makeResponsesId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 提取 Responses content blocks 的文本 */
+function responsesContentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => {
+        if (b.type === "input_text" || b.type === "output_text") return b.text || "";
+        if (b.type === "function_call_output") return typeof b.output === "string" ? b.output : JSON.stringify(b.output ?? "");
+        return "";
+      })
+      .join("");
+  }
+  return "";
+}
+
+/** 把 Responses 的 input 数组转换为 chat messages */
+function responsesInputToChatMessages(input) {
+  const messages = [];
+  // input 可以是字符串
+  if (typeof input === "string") {
+    if (input) messages.push({ role: "user", content: input });
+    return messages;
+  }
+  const push = (m) => {
+    const last = messages[messages.length - 1];
+    if (last && last.role === m.role && last.role !== "assistant" && typeof last.content === "string" && typeof m.content === "string") {
+      last.content += "\n" + m.content;
+    } else {
+      messages.push(m);
+    }
+  };
+
+  for (const item of input || []) {
+    const role = item.role;
+    const blocks = Array.isArray(item.content) ? item.content : [];
+    if (role === "user") {
+      const toolOutputs = blocks.filter((b) => b.type === "function_call_output");
+      if (toolOutputs.length) {
+        for (const b of toolOutputs) {
+          push({
+            role: "tool",
+            tool_call_id: b.call_id || b.id || "",
+            content: typeof b.output === "string" ? b.output : JSON.stringify(b.output ?? ""),
+          });
+        }
+        const texts = blocks.filter((b) => b.type === "input_text").map((b) => b.text).join("");
+        if (texts) push({ role: "user", content: texts });
+      } else {
+        push({ role: "user", content: responsesContentToText(blocks) });
+      }
+    } else if (role === "assistant") {
+      const text = responsesContentToText(blocks.filter((b) => b.type === "output_text" || b.type === "input_text"));
+      const fnCalls = blocks.filter((b) => b.type === "function_call");
+      const m = { role: "assistant" };
+      if (text) m.content = text;
+      if (fnCalls.length) {
+        m.tool_calls = fnCalls.map((fc) => ({
+          id: fc.call_id || fc.id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          type: "function",
+          function: {
+            name: fc.name || "unknown",
+            arguments: typeof fc.arguments === "string" ? fc.arguments : JSON.stringify(fc.arguments ?? {}),
+          },
+        }));
+      }
+      push(m);
+    } else if (role === "developer" || role === "system") {
+      push({ role: "system", content: responsesContentToText(blocks) });
+    }
+    // reasoning 等其他 item 忽略
+  }
+  return messages;
+}
+
+/** 把 Responses 请求体转换为 chat/completions 请求体 */
+function responsesToChatRequest(body) {
+  const mapped = resolveModel(body.model);
+  const messages = [];
+  if (body.instructions) messages.push({ role: "system", content: body.instructions });
+  messages.push(...responsesInputToChatMessages(body.input));
+  const req = { model: mapped, messages, stream: !!body.stream };
+  if (body.max_output_tokens != null) req.max_tokens = body.max_output_tokens;
+  if (body.temperature != null) req.temperature = body.temperature;
+  if (body.tools && Array.isArray(body.tools) && body.tools.length) {
+    // 兼容两种 tool 结构: Responses 平铺 {type,name,description,parameters}
+    // 与 chat 嵌套 {type,function:{name,description,parameters}}; 无 name 的跳过
+    req.tools = body.tools
+      .map((t) => {
+        const fn = t.function && typeof t.function === "object" ? t.function : t;
+        return {
+          type: "function",
+          function: {
+            name: fn.name,
+            description: fn.description || "",
+            parameters: fn.parameters || { type: "object", properties: {} },
+          },
+        };
+      })
+      .filter((t) => {
+        if (!t.function.name) {
+          console.warn("[cmc-proxy] 跳过无 name 的工具:", JSON.stringify(t.function).slice(0, 120));
+          return false;
+        }
+        return true;
+      });
+  }
+  if (body.tool_choice && typeof body.tool_choice === "object" && body.tool_choice.type === "function") {
+    const choiceName = body.tool_choice.name || (body.tool_choice.function && body.tool_choice.function.name);
+    if (choiceName) req.tool_choice = { type: "function", function: { name: choiceName } };
+  } else if (body.tool_choice === "auto" || body.tool_choice === "required" || body.tool_choice === "none") {
+    req.tool_choice = body.tool_choice;
+  }
+  if (body.stream) req.stream_options = { include_usage: true };
+  return req;
+}
+
+// ---------------------------------------------------------------------------
+// Chat Completions -> Responses 响应转换
+// ---------------------------------------------------------------------------
+function chatMessageToResponsesOutput(msg) {
+  const output = [];
+  if (msg.content) {
+    output.push({
+      type: "message",
+      id: makeResponsesId("msg"),
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: msg.content, annotations: [] }],
+    });
+  }
+  for (const tc of msg.tool_calls || []) {
+    output.push({
+      type: "function_call",
+      id: makeResponsesId("fc"),
+      status: "completed",
+      call_id: tc.id,
+      name: tc.function.name,
+      arguments: tc.function.arguments || "{}",
+    });
+  }
+  return output;
+}
+
+/** 非流式: chat.completion -> response 对象 */
+function chatResponseToResponses(obj, requestedModel) {
+  const choice = obj.choices && obj.choices[0] ? obj.choices[0] : {};
+  const msg = choice.message || {};
+  const output = chatMessageToResponsesOutput(msg);
+  const u = obj.usage || {};
+  return {
+    id: makeResponsesId("resp"),
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    model: requestedModel || obj.model,
+    status: "completed",
+    output,
+    usage: {
+      input_tokens: u.prompt_tokens ?? 0,
+      output_tokens: u.completion_tokens ?? 0,
+      total_tokens: u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0),
+    },
+    output_text: msg.content || "",
+  };
+}
+
+function sseResponses(data) {
+  return `data: ${JSON.stringify(data)}\n\n`;
+}
+
+/** 流式: chat SSE chunks -> Responses SSE 事件序列 */
+class ResponsesStreamConverter {
+  constructor(requestedModel, estimateInputTokens = 0) {
+    this.requestedModel = requestedModel;
+    this.resp = {
+      id: makeResponsesId("resp"),
+      object: "response",
+      created_at: Math.floor(Date.now() / 1000),
+      model: requestedModel,
+      status: "in_progress",
+      output: [],
+    };
+    this.usage = { input_tokens: estimateInputTokens || 0, output_tokens: 0, total_tokens: 0 };
+    this.started = false;
+    this.msgItem = null;
+    this.msgText = "";
+    this.msgStarted = false;
+    this.msgOutputIndex = -1;
+    this.toolStates = {}; // index -> {callId, name, argsBuf, item, outputIndex}
+    this.finished = false;
+    this.stopReason = "completed";
+    this.pending = "";
+  }
+
+  push(rawText) {
+    this.pending += rawText;
+    const events = [];
+    let idx;
+    while ((idx = this.pending.indexOf("\n\n")) >= 0) {
+      const rawEvent = this.pending.slice(0, idx);
+      this.pending = this.pending.slice(idx + 2);
+      const parsed = parseSSEEvent(rawEvent);
+      if (parsed && parsed.data) {
+        try {
+          this.handleChunk(JSON.parse(parsed.data), events);
+        } catch {
+          /* 忽略坏 chunk */
+        }
+      }
+    }
+    return events.join("");
+  }
+
+  handleChunk(json, events) {
+    if (json.usage) {
+      const u = json.usage;
+      this.usage = {
+        input_tokens: u.prompt_tokens ?? this.usage.input_tokens,
+        output_tokens: u.completion_tokens ?? this.usage.output_tokens,
+        total_tokens: u.total_tokens ?? (u.prompt_tokens ?? this.usage.input_tokens) + (u.completion_tokens ?? this.usage.output_tokens),
+      };
+    }
+    if (!json.choices || !json.choices.length) return;
+    const choice = json.choices[0];
+    const delta = choice.delta || {};
+
+    if (!this.started) {
+      this.started = true;
+      events.push(sseResponses({ type: "response.created", response: { ...this.resp, status: "in_progress" } }));
+      events.push(sseResponses({ type: "response.in_progress", response: { ...this.resp, status: "in_progress" } }));
+    }
+
+    // 文本增量
+    if (delta.content) {
+      if (!this.msgStarted) {
+        this.msgStarted = true;
+        this.msgItem = { id: makeResponsesId("msg"), type: "message", status: "in_progress", role: "assistant", content: [] };
+        this.msgOutputIndex = this.resp.output.length;
+        events.push(sseResponses({ type: "response.output_item.added", output_index: this.msgOutputIndex, item: { ...this.msgItem } }));
+        events.push(sseResponses({
+          type: "response.content_part.added",
+          item_id: this.msgItem.id,
+          output_index: this.msgOutputIndex,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        }));
+      }
+      this.msgText += delta.content;
+      events.push(sseResponses({
+        type: "response.output_text.delta",
+        item_id: this.msgItem.id,
+        output_index: this.msgOutputIndex,
+        content_index: 0,
+        delta: delta.content,
+      }));
+    }
+
+    // 工具调用增量
+    for (const tc of delta.tool_calls || []) {
+      let st = this.toolStates[tc.index];
+      if (!st) {
+        st = this.toolStates[tc.index] = { callId: tc.id, name: "", argsBuf: "", item: null, outputIndex: -1 };
+      }
+      if (tc.id) st.callId = tc.id;
+      if (tc.function) {
+        if (tc.function.name) st.name = tc.function.name;
+        if (tc.function.arguments) st.argsBuf += tc.function.arguments;
+      }
+      if (!st.item) {
+        st.item = { id: makeResponsesId("fc"), type: "function_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", arguments: "" };
+        st.outputIndex = this.resp.output.length;
+        events.push(sseResponses({ type: "response.output_item.added", output_index: st.outputIndex, item: { ...st.item } }));
+      }
+      if (tc.function && tc.function.arguments) {
+        events.push(sseResponses({
+          type: "response.function_call_arguments.delta",
+          item_id: st.item.id,
+          output_index: st.outputIndex,
+          delta: tc.function.arguments,
+        }));
+      }
+    }
+
+    if (choice.finish_reason && !this.finished) {
+      this.finished = true;
+      this.stopReason = choice.finish_reason === "length" ? "incomplete" : "completed";
+    }
+  }
+
+  /** 流结束: 补全 done 事件与终止事件 */
+  finish() {
+    let out = "";
+    const push = (d) => { out += sseResponses(d); };
+
+    if (!this.started) {
+      this.started = true;
+      push({ type: "response.created", response: { ...this.resp, status: "in_progress" } });
+      push({ type: "response.in_progress", response: { ...this.resp, status: "in_progress" } });
+    }
+
+    if (this.msgStarted) {
+      push({ type: "response.output_text.done", item_id: this.msgItem.id, output_index: this.msgOutputIndex, content_index: 0, text: this.msgText });
+      push({
+        type: "response.content_part.done",
+        item_id: this.msgItem.id,
+        output_index: this.msgOutputIndex,
+        content_index: 0,
+        part: { type: "output_text", text: this.msgText, annotations: [] },
+      });
+      const doneItem = { ...this.msgItem, status: "completed", content: [{ type: "output_text", text: this.msgText, annotations: [] }] };
+      push({ type: "response.output_item.done", output_index: this.msgOutputIndex, item: doneItem });
+      this.resp.output.push(doneItem);
+    }
+
+    for (const st of Object.values(this.toolStates)) {
+      if (!st.item) continue;
+      push({ type: "response.function_call_arguments.done", item_id: st.item.id, output_index: st.outputIndex, arguments: st.argsBuf });
+      const doneItem = {
+        ...st.item,
+        status: "completed",
+        call_id: st.callId || st.item.call_id,
+        name: st.name || st.item.name,
+        arguments: st.argsBuf,
+      };
+      push({ type: "response.output_item.done", output_index: st.outputIndex, item: doneItem });
+      this.resp.output.push(doneItem);
+    }
+
+    const finalResp = {
+      ...this.resp,
+      status: this.stopReason === "incomplete" ? "incomplete" : "completed",
+      output: this.resp.output,
+      usage: this.usage,
+    };
+    push({ type: this.stopReason === "incomplete" ? "response.incomplete" : "response.completed", response: finalResp });
+    return out;
+  }
+}
+
 /** 解析单个 SSE 原始事件文本 (不含末尾空行) */
 function parseSSEEvent(raw) {
   let event = "message";
@@ -684,7 +1031,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // 非模型类 body 路径 (GET 等): 立即打印本地请求日志
-    const isModelBodyPath = pathname === "/v1/messages" || pathname === "/v1/chat/completions";
+    const isModelBodyPath = pathname === "/v1/messages" || pathname === "/v1/chat/completions" || pathname === "/v1/responses";
     if (!isModelBodyPath) logReq();
 
     // 健康检查
@@ -823,7 +1170,77 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ---- 其他 /v1/* 通配透传 (如 /v1/responses 等) ----
+    // ---- /v1/responses (Codex wire_api="responses") ----
+    // Codex 新版只支持 Responses API; commandcode 上游仅提供 chat/completions,
+    // 因此在此做 Responses <-> Chat Completions 协议转换。
+    if (pathname === "/v1/responses" && req.method === "POST") {
+      const bodyRaw = await readBody(req);
+      const body = JSON.parse(bodyRaw || "{}");
+      const requested = body.model || DEFAULT_MODEL;
+      const mapped = resolveModel(requested);
+      const isStream = !!body.stream;
+      req._cmdc = { model: requested, mapped, stream: isStream };
+      logReq();
+
+      const chatReq = responsesToChatRequest(body);
+      const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
+        method: "POST",
+        headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
+        body: JSON.stringify(chatReq),
+      });
+
+      if (!isStream) {
+        const text = await up.text();
+        if (!up.ok) {
+          res.writeHead(up.status, { "Content-Type": up.headers.get("content-type") || "application/json" });
+          res.end(text);
+          return;
+        }
+        try {
+          const oai = JSON.parse(text);
+          const respObj = chatResponseToResponses(oai, requested);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(respObj));
+        } catch (e) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "上游响应解析失败: " + e.message, type: "api_error" } }));
+        }
+        return;
+      }
+
+      if (!up.ok) {
+        const text = await up.text();
+        res.writeHead(up.status, { "Content-Type": "application/json" });
+        res.end(text);
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body));
+      try {
+        for await (const chunk of up.body) {
+          const raw = Buffer.from(chunk).toString("utf8");
+          const outText = conv.push(raw);
+          if (outText) res.write(outText);
+        }
+      } catch (e) {
+        console.warn("[cmc-proxy] 上游 responses 流中断:", e.message);
+      }
+      try {
+        const tail = conv.finish();
+        if (tail) res.write(tail);
+      } catch (e) {
+        console.warn("[cmc-proxy] responses 收尾失败:", e.message);
+      }
+      res.end();
+      return;
+    }
+
+    // ---- 其他 /v1/* 通配透传 ----
     if (pathname.startsWith("/v1/")) {
       const upstreamPath = pathname;
       const headers = buildUpstreamHeaders(req, { "Content-Type": req.headers["content-type"] || "application/json" });

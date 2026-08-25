@@ -57,7 +57,7 @@ claude
 
 ## Codex 接入
 
-Codex CLI 走 OpenAI 兼容协议，编辑 `~/.codex/config.toml`：
+Codex CLI（≥ 0.84）只支持 Responses API（`wire_api = "chat"` 已移除）。编辑 `~/.codex/config.toml`：
 
 ```toml
 model_provider = "cmdc-goat"
@@ -66,7 +66,7 @@ model = "deepseek-v4-flash"
 [model_providers.cmdc-goat]
 name = "CommandCode GOAT"
 base_url = "http://localhost:5411/v1"
-wire_api = "chat"
+wire_api = "responses"
 env_key = "CMD_GOAT_KEY"
 ```
 
@@ -85,7 +85,7 @@ export OPENAI_API_KEY=sk-local-any-value
 export OPENAI_MODEL=deepseek-v4-flash
 ```
 
-> 注意 `base_url` 需要带 `/v1` 后缀（Codex 会自动拼接 `/chat/completions`）。
+> `base_url` 需要带 `/v1` 后缀。Codex 会请求 `POST /v1/responses`；cmc-proxy 内置 **Responses ↔ Chat Completions 协议转换**（因为 commandcode 上游只提供 chat/completions 端点），流式与工具调用均支持。
 
 ## 模型说明
 
@@ -122,14 +122,15 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 ```
 Claude Code ──Anthropic /v1/messages──▶ cmc-proxy:5411
-                                              │  协议转换 + 模型映射 + Key 注入
-Codex ──────OpenAI /v1/chat/completions──▶   │
+Codex ──────Responses /v1/responses──▶  │
+OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + 模型映射 + Key 注入
                                               ▼
                               https://api.commandcode.ai/provider/v1/*
 ```
 
 - `/v1/messages` 收到 `claude-*` 模型名 → 转换请求为 OpenAI 格式 → 请求上游 `/chat/completions`（用映射后的模型）→ 把流式/非流式响应转回 Anthropic SSE / JSON，包含 `tool_use` / `input_json_delta` 工具事件。
 - 收到非 Claude 模型名 → 直接透传上游 `/messages`（预留 Pro/Provider 升级后使用真实 Claude 模型）。
+- `/v1/responses`（Codex `wire_api="responses"`）→ 转换 Responses 请求为 chat/completions → 上游响应转回 Responses SSE 事件（`response.created` → `output_text.delta` / `function_call_arguments.delta` → `response.completed`），含工具调用。
 - `/v1/chat/completions`、`/v1/models`、`/v1/*` 其他路径 → 原样透传，仅注入 Key 与模型映射。
 
 ## 访问日志

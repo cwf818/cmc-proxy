@@ -134,24 +134,27 @@ Codex ──────OpenAI /v1/chat/completions──▶   │
 
 ## 访问日志
 
-每个来自本地客户端的请求都会打印一行访问日志，便于观察 Claude Code / Codex 的活动：
+每个请求打印**两行日志**：`REQ` 行记录本地客户端发来的请求，`RES` 行记录外部上游返回的结果，便于对照感知请求与返回：
 
 ```
-[19:33:57.449] 200 POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=claude-sonnet-4-6→gpt-5.6-sol stream=1 took=1.62s out=1467B
-[19:34:41.375] 200 POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0 took=1.52s out=567B
+[20:15:55.877] REQ POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=deepseek-v4-flash→deepseek/deepseek-v4-flash stream=1
+[20:15:58.232] RES 200 POST /v1/messages model=deepseek-v4-flash→deepseek/deepseek-v4-flash took=2.35s out=1736B
+[20:15:58.822] REQ POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0
+[20:16:00.510] RES 200 POST /v1/chat/completions model=gpt-5.6-sol took=1.69s out=567B
 ```
 
 字段说明：
 
 | 字段 | 含义 |
 |---|---|
-| `status` / `method` / `path` | HTTP 状态码、方法与路径 |
-| `src` | 客户端 IP |
+| `REQ` / `RES` | 本地请求到达 / 外部返回完成 |
+| `status` / `method` / `path` | HTTP 状态码、方法与路径（`RES` 行含状态码） |
+| `src` | 客户端 IP（仅 `REQ` 行） |
 | `ua` | 客户端 User-Agent（`claude-cli/*` 即 Claude Code，`codex/*` 即 Codex） |
 | `model` | 请求模型 → 实际转发的上游模型（`→` 表示发生了模型映射） |
-| `stream` | 是否为流式请求（1 流式 / 0 非流式） |
-| `took` | 总耗时（含上游推理时间） |
-| `out` | 响应输出字节数 |
+| `stream` | 是否为流式请求（1 流式 / 0 非流式，仅 `REQ` 行） |
+| `took` | 总耗时（含上游推理时间，仅 `RES` 行） |
+| `out` | 响应输出字节数（仅 `RES` 行） |
 
 ## 常见问题
 

@@ -630,17 +630,40 @@ async function passThrough(res, upstreamResp) {
 }
 
 // ---------------------------------------------------------------------------
+// 访问日志
+// ---------------------------------------------------------------------------
+function logTs(ms) {
+  const d = new Date(ms);
+  return `${d.toLocaleTimeString("zh-CN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
+}
+
+// ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = url.pathname;
 
-  // ---- 访问日志基础设施 ----
+  // ---- 访问日志基础设施 (一次请求两行: REQ 本地请求 / RES 外部返回) ----
   const startAt = Date.now();
   const srcIp = req.socket.remoteAddress || "-";
-  req._cmdc = { model: null, mapped: null, stream: null };
+  req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false };
   let outBytes = 0;
+  const uaShort = () => (req.headers["user-agent"] || "-").slice(0, 48);
+  const modelPart = () => {
+    const c = req._cmdc;
+    if (!c || !c.model) return "";
+    return ` model=${c.model}${c.mapped && c.mapped !== c.model ? "→" + c.mapped : ""}`;
+  };
+  const streamPart = () => {
+    const c = req._cmdc;
+    return c && c.stream != null ? ` stream=${c.stream ? 1 : 0}` : "";
+  };
+  const logReq = () => {
+    if (req._cmdc.reqLogged) return;
+    req._cmdc.reqLogged = true;
+    console.log(`[${logTs(startAt)}] REQ ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${modelPart()}${streamPart()}`);
+  };
   {
     const origWrite = res.write.bind(res);
     res.write = (...args) => {
@@ -655,18 +678,15 @@ const server = http.createServer(async (req, res) => {
   }
   res.on("finish", () => {
     const ms = Date.now() - startAt;
-    const c = req._cmdc || {};
-    const ua = (req.headers["user-agent"] || "-").slice(0, 48);
-    const modelPart = c.model ? ` model=${c.model}${c.mapped && c.mapped !== c.model ? "→" + c.mapped : ""}` : "";
-    const streamPart = c.stream == null ? "" : ` stream=${c.stream ? 1 : 0}`;
     const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
-    console.log(
-      `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}.${String(startAt % 1000).padStart(3, "0")}] ` +
-        `${res.statusCode} ${req.method} ${pathname} src=${srcIp} ua=${ua}${modelPart}${streamPart} took=${took} out=${outBytes}B`
-    );
+    console.log(`[${logTs(Date.now())}] RES ${res.statusCode} ${req.method} ${pathname}${modelPart()} took=${took} out=${outBytes}B`);
   });
 
   try {
+    // 非模型类 body 路径 (GET 等): 立即打印本地请求日志
+    const isModelBodyPath = pathname === "/v1/messages" || pathname === "/v1/chat/completions";
+    if (!isModelBodyPath) logReq();
+
     // 健康检查
     if (pathname === "/health" || pathname === "/") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -706,6 +726,7 @@ const server = http.createServer(async (req, res) => {
       const useAnthropicEndpoint = isClaudeModel(mapped);
       const isStream = !!body.stream;
       req._cmdc = { model: requested, mapped, stream: isStream };
+      logReq();
 
       if (useAnthropicEndpoint) {
         // Claude 模型 -> 直接走上游 /messages
@@ -792,6 +813,7 @@ const server = http.createServer(async (req, res) => {
       const requested = body.model || DEFAULT_MODEL;
       if (body.model) body.model = resolveModel(body.model);
       req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream };
+      logReq();
       const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
         method: "POST",
         headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),

@@ -120,6 +120,22 @@ function estimateTokens(obj) {
   }
 }
 
+/** 估算 Anthropic 请求的输入 tokens (用于 message_start.usage.input_tokens) */
+function estimateInputTokens(body) {
+  try {
+    let n = 0;
+    const count = (s) => {
+      n += Math.ceil((typeof s === "string" ? s : JSON.stringify(s || {})).length / 4);
+    };
+    if (body.system) count(body.system);
+    for (const m of body.messages || []) count(m.content);
+    if (body.tools && body.tools.length) count(body.tools);
+    return Math.max(1, n);
+  } catch {
+    return 1;
+  }
+}
+
 function mapStopReason(openaiReason) {
   switch (openaiReason) {
     case "tool_calls":
@@ -293,6 +309,7 @@ function openAIToAnthropic(obj, requestedModel) {
     contentBlocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
   }
   const u = obj.usage || {};
+  const pd = u.prompt_tokens_details || {};
   return {
     id: obj.id || `msg_${Date.now()}`,
     type: "message",
@@ -304,6 +321,8 @@ function openAIToAnthropic(obj, requestedModel) {
     usage: {
       input_tokens: u.prompt_tokens ?? 0,
       output_tokens: u.completion_tokens ?? 0,
+      ...(pd.cached_tokens !== undefined ? { cache_read_input_tokens: pd.cached_tokens } : {}),
+      ...(pd.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: pd.cache_creation_input_tokens } : {}),
     },
   };
 }
@@ -312,16 +331,39 @@ function openAIToAnthropic(obj, requestedModel) {
 // OpenAI SSE 流 -> Anthropic SSE 流 转换
 // ---------------------------------------------------------------------------
 class StreamConverter {
-  constructor(requestedModel, usage) {
+  constructor(requestedModel, estimateInputTokens = 0) {
     this.requestedModel = requestedModel;
+    this.estimateInputTokens = estimateInputTokens; // message_start 用的估算输入 tokens
     this.started = false; // 是否已发 message_start
     this.contentIndex = 0; // 内容块索引
     this.toolState = {}; // index -> {id, name, buffer, startSent}
     this.activeBlocks = []; // 已开始的块索引
     this.finished = false;
     this.stopReason = "end_turn";
-    this.usage = usage || { input_tokens: 0, output_tokens: 0 };
+    this.usage = { input_tokens: 0, output_tokens: 0 };
+    this.cacheRead = undefined; // cache_read_input_tokens
+    this.cacheCreation = undefined; // cache_creation_input_tokens
     this.pending = "";
+  }
+
+  /** 从 OpenAI chunk 中提取 usage (chat/completions 流式的 usage 在末尾 chunk) */
+  updateUsageFromChunk(json) {
+    if (!json.usage) return;
+    const u = json.usage;
+    if (u.prompt_tokens != null) this.usage.input_tokens = u.prompt_tokens;
+    if (u.completion_tokens != null) this.usage.output_tokens = u.completion_tokens;
+    const pd = u.prompt_tokens_details || {};
+    if (pd.cached_tokens !== undefined) this.cacheRead = pd.cached_tokens;
+    if (pd.cache_creation_input_tokens !== undefined) this.cacheCreation = pd.cache_creation_input_tokens;
+  }
+
+  usageObject(includeInput) {
+    const obj = {};
+    if (includeInput) obj.input_tokens = this.usage.input_tokens || this.estimateInputTokens || 0;
+    obj.output_tokens = this.usage.output_tokens || 0;
+    if (this.cacheRead !== undefined) obj.cache_read_input_tokens = this.cacheRead;
+    if (this.cacheCreation !== undefined) obj.cache_creation_input_tokens = this.cacheCreation;
+    return obj;
   }
 
   /** 写入原始 SSE 文本, 返回要发给客户端的 Anthropic SSE 文本 */
@@ -346,14 +388,10 @@ class StreamConverter {
   }
 
   handleChunk(json, events) {
+    // 任何携带 usage 的 chunk 都提取 (OpenAI 流式的 usage 在末尾 finish chunk 中)
+    this.updateUsageFromChunk(json);
     // usage-only chunk (stream_options include_usage)
     if (!json.choices || !json.choices.length) {
-      if (json.usage) {
-        this.usage = {
-          input_tokens: json.usage.prompt_tokens ?? this.usage.input_tokens,
-          output_tokens: json.usage.completion_tokens ?? this.usage.output_tokens,
-        };
-      }
       return;
     }
     const choice = json.choices[0];
@@ -374,7 +412,7 @@ class StreamConverter {
               content: [],
               stop_reason: null,
               stop_sequence: null,
-              usage: { input_tokens: this.usage.input_tokens || 0, output_tokens: 0 },
+              usage: this.usageObject(true),
             },
           })
         )
@@ -490,7 +528,7 @@ class StreamConverter {
         JSON.stringify({
           type: "message_delta",
           delta: { stop_reason: this.stopReason, stop_sequence: null },
-          usage: { output_tokens: this.usage.output_tokens || 0 },
+          usage: this.usageObject(false),
         })
       );
       out += sse("message_stop", JSON.stringify({ type: "message_stop" }));
@@ -505,7 +543,7 @@ class StreamConverter {
       JSON.stringify({
         type: "message_delta",
         delta: { stop_reason: this.stopReason, stop_sequence: null },
-        usage: { output_tokens: this.usage.output_tokens || 0 },
+        usage: this.usageObject(false),
       })
     );
     out += sse("message_stop", JSON.stringify({ type: "message_stop" }));
@@ -703,7 +741,7 @@ const server = http.createServer(async (req, res) => {
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
       });
-      const conv = new StreamConverter(requested);
+      const conv = new StreamConverter(requested, estimateInputTokens(body));
       try {
         for await (const chunk of up.body) {
           // undici 流式 chunk 是 Uint8Array, 必须经 Buffer.from 才能正确 utf8 解码

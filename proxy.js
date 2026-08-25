@@ -576,6 +576,36 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = url.pathname;
 
+  // ---- 访问日志基础设施 ----
+  const startAt = Date.now();
+  const srcIp = req.socket.remoteAddress || "-";
+  req._cmdc = { model: null, mapped: null, stream: null };
+  let outBytes = 0;
+  {
+    const origWrite = res.write.bind(res);
+    res.write = (...args) => {
+      const b = args[0];
+      if (b) {
+        if (Buffer.isBuffer(b)) outBytes += b.length;
+        else if (typeof b === "string") outBytes += Buffer.byteLength(b);
+        else if (b instanceof Uint8Array) outBytes += b.byteLength;
+      }
+      return origWrite(...args);
+    };
+  }
+  res.on("finish", () => {
+    const ms = Date.now() - startAt;
+    const c = req._cmdc || {};
+    const ua = (req.headers["user-agent"] || "-").slice(0, 48);
+    const modelPart = c.model ? ` model=${c.model}${c.mapped && c.mapped !== c.model ? "→" + c.mapped : ""}` : "";
+    const streamPart = c.stream == null ? "" : ` stream=${c.stream ? 1 : 0}`;
+    const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
+    console.log(
+      `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}.${String(startAt % 1000).padStart(3, "0")}] ` +
+        `${res.statusCode} ${req.method} ${pathname} src=${srcIp} ua=${ua}${modelPart}${streamPart} took=${took} out=${outBytes}B`
+    );
+  });
+
   try {
     // 健康检查
     if (pathname === "/health" || pathname === "/") {
@@ -615,6 +645,7 @@ const server = http.createServer(async (req, res) => {
       const mapped = resolveModel(requested);
       const useAnthropicEndpoint = isClaudeModel(mapped);
       const isStream = !!body.stream;
+      req._cmdc = { model: requested, mapped, stream: isStream };
 
       if (useAnthropicEndpoint) {
         // Claude 模型 -> 直接走上游 /messages
@@ -698,7 +729,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/v1/chat/completions" && req.method === "POST") {
       const bodyRaw = await readBody(req);
       const body = JSON.parse(bodyRaw || "{}");
+      const requested = body.model || DEFAULT_MODEL;
       if (body.model) body.model = resolveModel(body.model);
+      req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream };
       const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
         method: "POST",
         headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),

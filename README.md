@@ -123,6 +123,27 @@ Codex ──────OpenAI /v1/chat/completions──▶   │
 - 收到非 Claude 模型名 → 直接透传上游 `/messages`（预留 Pro/Provider 升级后使用真实 Claude 模型）。
 - `/v1/chat/completions`、`/v1/models`、`/v1/*` 其他路径 → 原样透传，仅注入 Key 与模型映射。
 
+## 访问日志
+
+每个来自本地客户端的请求都会打印一行访问日志，便于观察 Claude Code / Codex 的活动：
+
+```
+[19:33:57.449] 200 POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=claude-sonnet-4-6→gpt-5.6-sol stream=1 took=1.62s out=1467B
+[19:34:41.375] 200 POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0 took=1.52s out=567B
+```
+
+字段说明：
+
+| 字段 | 含义 |
+|---|---|
+| `status` / `method` / `path` | HTTP 状态码、方法与路径 |
+| `src` | 客户端 IP |
+| `ua` | 客户端 User-Agent（`claude-cli/*` 即 Claude Code，`codex/*` 即 Codex） |
+| `model` | 请求模型 → 实际转发的上游模型（`→` 表示发生了模型映射） |
+| `stream` | 是否为流式请求（1 流式 / 0 非流式） |
+| `took` | 总耗时（含上游推理时间） |
+| `out` | 响应输出字节数 |
+
 ## 常见问题
 
 **端口被占用**

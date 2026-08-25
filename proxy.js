@@ -61,15 +61,37 @@ if (!API_KEY) {
 // 模型解析
 // ---------------------------------------------------------------------------
 const modelMap = config.modelMap || {};
-const DEFAULT_MODEL = config.defaultModel || "gpt-5.6-sol";
+const DEFAULT_MODEL = config.defaultModel || "deepseek/deepseek-v4-flash";
 
-/** 把客户端请求的模型名解析为上游模型名 (可被 modelMap 覆盖) */
+/**
+ * 模型解析 helper:
+ *   1. modelMap 显式映射优先
+ *   2. 上游模型目录匹配: 精确 / 去前缀(无前缀名) / 大小写不敏感
+ *      例: deepseek-v4-flash -> deepseek/deepseek-v4-flash, qwen3.8-max -> Qwen/Qwen3.8-Max
+ *   3. 无任何匹配 -> fallback 到默认模型 (defaultModel)
+ */
 function resolveModel(requested) {
   if (!requested) return DEFAULT_MODEL;
+
+  // 1. 显式映射表
   if (modelMap[requested]) return modelMap[requested];
-  // Claude 系兜底: GOAT 订阅不含任何 Claude 模型, 一律映射到默认模型
-  if (isClaudeModel(requested)) return DEFAULT_MODEL;
-  return requested;
+
+  // 2. 上游模型目录匹配
+  const models = upstreamModelsCache.list;
+  if (models.length) {
+    const reqLower = requested.toLowerCase();
+    const bareLower = requested.replace(/^[^/]*\//, "").toLowerCase(); // 去掉 provider 前缀
+    for (const m of models) {
+      const id = m.id;
+      if (id === requested) return id; // 精确
+      const idLower = id.toLowerCase();
+      if (idLower === reqLower) return id; // 大小写不敏感精确
+      if (idLower.endsWith("/" + bareLower)) return id; // 无前缀名匹配带前缀模型
+    }
+  }
+
+  // 3. 无匹配 -> 默认模型 (GOAT 无 Claude 模型, claude-* 也会落到这里)
+  return DEFAULT_MODEL;
 }
 
 /** 判断某模型是否需要走 Anthropic /messages 端点 (Claude 系) */

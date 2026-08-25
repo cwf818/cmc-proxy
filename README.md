@@ -43,19 +43,17 @@ Claude Code 走 Anthropic 协议。设置环境变量后启动 `claude`：
 # Windows (PowerShell)
 $env:ANTHROPIC_BASE_URL="http://localhost:5411"
 $env:ANTHROPIC_AUTH_TOKEN="sk-local-any-value"
-$env:ANTHROPIC_MODEL="gpt-5.6-sol"
+# 不设置 ANTHROPIC_MODEL 时使用默认模型 deepseek/deepseek-v4-flash
 claude
 
 # macOS / Linux
 export ANTHROPIC_BASE_URL=http://localhost:5411
 export ANTHROPIC_AUTH_TOKEN=sk-local-any-value
-export ANTHROPIC_MODEL=gpt-5.6-sol
 claude
 ```
 
 > `ANTHROPIC_AUTH_TOKEN` 填任意值即可，反代会替换成真实 Key。
-> 也可以在 Claude Code 里用 `/model` 选择反代 `/v1/models` 返回的模型。
-> 请求任意 `claude-*` 模型名都会被自动映射到 `defaultModel`（GOAT 无 Claude 模型）。
+> 也可以在 Claude Code 里用 `/model` 选择反代 `/v1/models` 返回的模型，或直接输入**不带前缀**的模型名（如 `deepseek-v4-flash`、`qwen3.8-max`），反代会自动匹配到对应的上游模型。
 
 ## Codex 接入
 
@@ -63,7 +61,7 @@ Codex CLI 走 OpenAI 兼容协议，编辑 `~/.codex/config.toml`：
 
 ```toml
 model_provider = "cmdc-goat"
-model = "gpt-5.6-sol"
+model = "deepseek-v4-flash"
 
 [model_providers.cmdc-goat]
 name = "CommandCode GOAT"
@@ -84,7 +82,7 @@ codex
 ```bash
 export OPENAI_BASE_URL=http://localhost:5411/v1
 export OPENAI_API_KEY=sk-local-any-value
-export OPENAI_MODEL=gpt-5.6-sol
+export OPENAI_MODEL=deepseek-v4-flash
 ```
 
 > 注意 `base_url` 需要带 `/v1` 后缀（Codex 会自动拼接 `/chat/completions`）。
@@ -95,8 +93,9 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 | 模型 ID | 说明 |
 |---|---|
-| `gpt-5.6-sol` | 默认模型，编码/智能体能力强，Codex 系 |
-| `deepseek/deepseek-v4-pro` / `deepseek/deepseek-v4-flash` | DeepSeek V4，性价比高 |
+| `deepseek/deepseek-v4-flash` | **默认模型**，DeepSeek V4，速度快性价比高 |
+| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro |
+| `gpt-5.6-sol` | GPT 编码/智能体能力强，Codex 系 |
 | `moonshotai/Kimi-K2.7-Code` / `moonshotai/Kimi-K3` | Kimi 编码系 |
 | `zai-org/GLM-5.2` | 智谱 GLM |
 | `Qwen/Qwen3.8-Max` / `Qwen/Qwen3.7-Flash` | 阿里 Qwen |
@@ -108,6 +107,16 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 - 完整列表：`curl http://127.0.0.1:5411/v1/models`（已过滤 GOAT 不可用模型，`?raw=1` 看全量）。
 - 换模型：改 `config.json` 的 `defaultModel`，或在 `modelMap` 里把特定模型名映射到目标模型后重启。
 - GOAT 按订阅额度计费，模型实际可用性以上游返回为准。
+
+### 模型匹配规则
+
+客户端请求的模型名会依次按以下规则解析（`proxy.js` 的 `resolveModel` helper）：
+
+1. **显式映射表** `modelMap`：`claude-*`、`gpt-5.x-codex` 等已内置映射。
+2. **上游模型目录匹配**：精确匹配 → 大小写不敏感匹配 → **无前缀名匹配**（如 `deepseek-v4-flash` → `deepseek/deepseek-v4-flash`、`qwen3.8-max` → `Qwen/Qwen3.8-Max`）。
+3. **无任何匹配** → fallback 到 `defaultModel`（`deepseek/deepseek-v4-flash`）。
+
+因此本地客户端（尤其 Claude Code）可以直接用**不带前缀**的模型名，例如 `/model` 输入 `deepseek-v4-flash`、`kimi-k2.7-code` 等，都会被自动映射。
 
 ## 原理
 

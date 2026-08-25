@@ -1,0 +1,43 @@
+{
+  "_说明": "cmc-proxy 配置模板。复制为 config.json 并填入你的 commandcode API key。apiKey 请妥善保管, 不要提交到公开仓库。",
+  "port": 5411,
+  "host": "127.0.0.1",
+  "upstream": "https://api.commandcode.ai/provider",
+  "apiKey": "",
+
+  "_默认模型说明": "GOAT 订阅实测可用: deepseek/deepseek-v4-flash(默认) / deepseek/deepseek-v4-pro / gpt-5.6-sol / moonshotai/Kimi-K2.7-Code / moonshotai/Kimi-K3 / zai-org/GLM-5.2 / Qwen/Qwen3.8-Max / Qwen/Qwen3.7-Flash / MiniMaxAI/MiniMax-M3 / xai/grok-4.6 / xiaomi/mimo-v2.5-pro / tencent/hy3-paid。Claude 全系与 GPT-5.5 及以下需 Pro/Provider 计划。",
+  "defaultModel": "deepseek/deepseek-v4-flash",
+
+  "_模型映射说明": "key 是客户端请求的模型名, value 是实际转发到上游的模型名。未命中映射表且上游目录中不存在(含无前缀名匹配)的模型, 会 fallback 到 defaultModel。",
+  "modelMap": {
+    "claude-sonnet-4-6": "deepseek/deepseek-v4-flash",
+    "claude-sonnet-4-5": "deepseek/deepseek-v4-flash",
+    "claude-sonnet-4-5-20250929": "deepseek/deepseek-v4-flash",
+    "claude-sonnet-4-5-20251101": "deepseek/deepseek-v4-flash",
+    "claude-sonnet-5": "deepseek/deepseek-v4-flash",
+    "claude-opus-4-x": "deepseek/deepseek-v4-flash",
+    "claude-opus-4-1": "deepseek/deepseek-v4-flash",
+    "claude-opus-4-6": "deepseek/deepseek-v4-flash",
+    "claude-opus-5": "deepseek/deepseek-v4-flash",
+    "claude-haiku-4-5": "deepseek/deepseek-v4-flash",
+    "claude-haiku-4-5-20251001": "deepseek/deepseek-v4-flash",
+    "gpt-5.3-codex": "gpt-5.6-sol",
+    "gpt-5.2-codex": "gpt-5.6-sol",
+    "gpt-5.1-codex": "gpt-5.6-sol"
+  },
+
+  "_屏蔽说明": "这些模型在 GOAT 计划下不可用, 从 /v1/models 列表中隐藏, 避免客户端误选。",
+  "blockedModels": [
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "google/gemini-3.6-flash"
+  ]
+}

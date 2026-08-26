@@ -52,8 +52,8 @@ const UPSTREAM = (config.upstream || "https://api.commandcode.ai/provider").repl
 const API_KEY = process.env.CMDC_API_KEY || config.apiKey || "";
 
 if (!API_KEY) {
-  console.error("[cmc-proxy] 错误: 未配置 apiKey。请在 config.json 中填入你的 commandcode API key，");
-  console.error("[cmc-proxy]        或通过环境变量 CMDC_API_KEY 传入。");
+  console.error(TAGE, "错误: 未配置 apiKey。请在 config.json 中填入你的 commandcode API key，");
+  console.error(TAGE, "       或通过环境变量 CMDC_API_KEY 传入。");
   process.exit(1);
 }
 
@@ -117,7 +117,7 @@ async function refreshModels(force) {
     const j = await r.json();
     upstreamModelsCache = { list: j.data || [], fetchedAt: now };
   } catch (e) {
-    console.warn("[cmc-proxy] 刷新上游模型列表失败:", e.message);
+    console.warn(TAGW, "刷新上游模型列表失败:", e.message);
   }
   return upstreamModelsCache.list;
 }
@@ -685,7 +685,7 @@ function responsesToChatRequest(body) {
       })
       .filter((t) => {
         if (!t.function.name) {
-          console.warn("[cmc-proxy] 跳过无 name 的工具:", JSON.stringify(t.function).slice(0, 120));
+          console.warn(TAGW, "跳过无 name 的工具:", JSON.stringify(t.function).slice(0, 120));
           return false;
         }
         return true;
@@ -980,8 +980,41 @@ async function passThrough(res, upstreamResp) {
 }
 
 // ---------------------------------------------------------------------------
-// 访问日志
+// 访问日志 (带 ANSI 颜色, 非 TTY/重定向时自动无色)
 // ---------------------------------------------------------------------------
+const C = {
+  reset: "\x1b[0m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  cyan: "\x1b[36m",
+  dim: "\x1b[2m",
+};
+const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+const paint = (code) => (s) => (useColor ? `${code}${s}${C.reset}` : String(s));
+const cRed = paint(C.red);
+const cGreen = paint(C.green);
+const cYellow = paint(C.yellow);
+const cCyan = paint(C.cyan);
+const cDim = paint(C.dim);
+const cBlue = paint(C.blue);
+
+/** 按 HTTP 状态码着色: 2xx 绿 / 4xx 黄 / 5xx 红 */
+function cStatus(code) {
+  const s = String(code);
+  if (code >= 500) return cRed(s);
+  if (code >= 400) return cYellow(s);
+  if (code >= 300) return cCyan(s);
+  return cGreen(s);
+}
+
+// 日志标签 (前缀着色)
+const TAGW = cYellow("[cmc-proxy]");
+const TAGE = cRed("[cmc-proxy]");
+const TAGD = cDim("[cmc-proxy]");
+const TAGI = cBlue("[cmc-proxy]");
+
 function logTs(ms) {
   const d = new Date(ms);
   return `${d.toLocaleTimeString("zh-CN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
@@ -1012,7 +1045,7 @@ const server = http.createServer(async (req, res) => {
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
-    console.log(`[${logTs(startAt)}] REQ ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${modelPart()}${streamPart()}`);
+    console.log(`${cDim(`[${logTs(startAt)}]`)} ${cCyan("REQ")} ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${cYellow(modelPart())}${streamPart()}`);
   };
   {
     const origWrite = res.write.bind(res);
@@ -1029,7 +1062,7 @@ const server = http.createServer(async (req, res) => {
   res.on("finish", () => {
     const ms = Date.now() - startAt;
     const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
-    console.log(`[${logTs(Date.now())}] RES ${res.statusCode} ${req.method} ${pathname}${modelPart()} took=${took} out=${outBytes}B`);
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}`);
   });
 
   try {
@@ -1144,13 +1177,13 @@ const server = http.createServer(async (req, res) => {
           if (outText) res.write(outText);
         }
       } catch (e) {
-        console.warn("[cmc-proxy] 上游流中断:", e.message);
+        console.warn(TAGW, "上游流中断:", e.message);
       }
       try {
         const tail = conv.finish();
         if (tail) res.write(tail);
       } catch (e) {
-        console.warn("[cmc-proxy] 收尾 SSE 失败:", e.message);
+        console.warn(TAGW, "收尾 SSE 失败:", e.message);
       }
       res.end();
       return;
@@ -1231,13 +1264,13 @@ const server = http.createServer(async (req, res) => {
           if (outText) res.write(outText);
         }
       } catch (e) {
-        console.warn("[cmc-proxy] 上游 responses 流中断:", e.message);
+        console.warn(TAGW, "上游 responses 流中断:", e.message);
       }
       try {
         const tail = conv.finish();
         if (tail) res.write(tail);
       } catch (e) {
-        console.warn("[cmc-proxy] responses 收尾失败:", e.message);
+        console.warn(TAGW, "responses 收尾失败:", e.message);
       }
       res.end();
       return;
@@ -1260,7 +1293,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: `Not found: ${pathname}`, type: "invalid_request_error" } }));
   } catch (e) {
-    console.error("[cmc-proxy] 处理请求出错:", e.message);
+    console.error(TAGE, "处理请求出错:", e.message);
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
     }
@@ -1274,15 +1307,16 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log("==========================================================");
-  console.log("  cmc-proxy 已启动");
-  console.log(`  监听地址   : http://${HOST}:${PORT}`);
-  console.log(`  上游端点   : ${UPSTREAM}`);
-  console.log(`  默认模型   : ${DEFAULT_MODEL}`);
-  console.log("----------------------------------------------------------");
-  console.log("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT);
-  console.log("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = chat)");
-  console.log("==========================================================");
+  const line = cBlue("=".repeat(58));
+  console.log(line);
+  console.log(cBlue("  cmc-proxy 已启动"));
+  console.log(cBlue(`  监听地址   : http://${HOST}:${PORT}`));
+  console.log(cBlue(`  上游端点   : ${UPSTREAM}`));
+  console.log(cBlue(`  默认模型   : ${DEFAULT_MODEL}`));
+  console.log(cBlue("-".repeat(58)));
+  console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
+  console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));
+  console.log(line);
   // 启动时预热模型列表
   refreshModels(true);
 });

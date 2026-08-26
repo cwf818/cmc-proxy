@@ -160,6 +160,26 @@ function estimateInputTokens(body) {
   }
 }
 
+/**
+ * 从上游 usage 对象中提取日志关心的字段 (同时兼容 OpenAI 与 Anthropic 两种格式):
+ *   input / output / reasoning(rt) / cacheRead(cr) / cacheWrite(cw)
+ */
+function normalizeUsage(u) {
+  if (!u) return null;
+  const pd = u.prompt_tokens_details || {};
+  const cd = u.completion_tokens_details || {};
+  const out = {};
+  if (u.prompt_tokens != null) out.input = u.prompt_tokens; // OpenAI
+  if (u.input_tokens != null) out.input = u.input_tokens; // Anthropic
+  if (u.completion_tokens != null) out.output = u.completion_tokens; // OpenAI
+  if (u.output_tokens != null) out.output = u.output_tokens; // Anthropic
+  if (pd.cached_tokens !== undefined) out.cacheRead = pd.cached_tokens; // OpenAI
+  if (u.cache_read_input_tokens !== undefined) out.cacheRead = u.cache_read_input_tokens; // Anthropic
+  if (u.cache_creation_input_tokens !== undefined) out.cacheWrite = u.cache_creation_input_tokens;
+  if (cd.reasoning_tokens !== undefined) out.reasoning = cd.reasoning_tokens; // OpenAI (DeepSeek 思考量)
+  return out;
+}
+
 function mapStopReason(openaiReason) {
   switch (openaiReason) {
     case "tool_calls":
@@ -369,12 +389,14 @@ class StreamConverter {
     this.usage = { input_tokens: 0, output_tokens: 0 };
     this.cacheRead = undefined; // cache_read_input_tokens
     this.cacheCreation = undefined; // cache_creation_input_tokens
+    this.rawUsage = null; // 最后一次完整 usage 对象 (供日志输出)
     this.pending = "";
   }
 
   /** 从 OpenAI chunk 中提取 usage (chat/completions 流式的 usage 在末尾 chunk) */
   updateUsageFromChunk(json) {
     if (!json.usage) return;
+    this.rawUsage = json.usage;
     const u = json.usage;
     if (u.prompt_tokens != null) this.usage.input_tokens = u.prompt_tokens;
     if (u.completion_tokens != null) this.usage.output_tokens = u.completion_tokens;
@@ -776,6 +798,7 @@ class ResponsesStreamConverter {
     this.finished = false;
     this.stopReason = "completed";
     this.pending = "";
+    this.rawUsage = null; // 最后一次完整 usage 对象 (供日志输出)
   }
 
   push(rawText) {
@@ -799,6 +822,7 @@ class ResponsesStreamConverter {
 
   handleChunk(json, events) {
     if (json.usage) {
+      this.rawUsage = json.usage;
       const u = json.usage;
       this.usage = {
         input_tokens: u.prompt_tokens ?? this.usage.input_tokens,
@@ -968,12 +992,52 @@ function buildUpstreamHeaders(req, extra) {
   return h;
 }
 
-/** 通用透传: 把上游响应(含流式)转发给客户端 */
-async function passThrough(res, upstreamResp) {
+/**
+ * 通用透传: 把上游响应(含流式)转发给客户端。
+ * opts.collectUsage 存在时, 顺带从响应中提取 usage 对象 (流式扫描 SSE 事件, 非流式解析 JSON),
+ * 不改变转发语义, 仅用于访问日志输出。
+ */
+async function passThrough(res, upstreamResp, opts) {
+  const collectUsage = opts && opts.collectUsage;
+  const hdrs = upstreamResp.headers || {};
+  // Node fetch 的 headers 是 Headers 实例 (支持 .get), 也可能是普通对象, 兼容两者
+  const ctype = typeof hdrs.get === "function" ? hdrs.get("content-type") : hdrs["content-type"];
+  const isSse = (ctype || "").includes("text/event-stream");
+  let acc = "";
+  let sseBuf = "";
   res.writeHead(upstreamResp.status, upstreamResp.statusText || "", upstreamResp.headers);
   if (upstreamResp.body) {
     for await (const chunk of upstreamResp.body) {
       res.write(chunk);
+      if (collectUsage) {
+        if (isSse) {
+          // 按 \n\n 切出完整 SSE 事件, 命中 usage 键时解析 (跨 chunk 截断的事件丢弃, usage 事件一般完整)
+          sseBuf += Buffer.from(chunk).toString("utf8");
+          let idx;
+          while ((idx = sseBuf.indexOf("\n\n")) >= 0) {
+            const evt = sseBuf.slice(0, idx);
+            sseBuf = sseBuf.slice(idx + 2);
+            const parsed = parseSSEEvent(evt);
+            if (parsed && parsed.data && parsed.data.indexOf('"usage"') >= 0) {
+              try {
+                collectUsage(JSON.parse(parsed.data).usage);
+              } catch {
+                /* 忽略坏事件 */
+              }
+            }
+          }
+        } else {
+          acc += Buffer.from(chunk).toString("utf8");
+        }
+      }
+    }
+    if (collectUsage && !isSse && acc) {
+      try {
+        const j = JSON.parse(acc);
+        if (j.usage) collectUsage(j.usage);
+      } catch {
+        /* 非 JSON 响应 (如错误页) 忽略 */
+      }
     }
   }
   res.end();
@@ -1030,7 +1094,7 @@ const server = http.createServer(async (req, res) => {
   // ---- 访问日志基础设施 (一次请求两行: REQ 本地请求 / RES 外部返回) ----
   const startAt = Date.now();
   const srcIp = req.socket.remoteAddress || "-";
-  req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false };
+  req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false, usage: null };
   let outBytes = 0;
   const uaShort = () => (req.headers["user-agent"] || "-").slice(0, 48);
   const modelPart = () => {
@@ -1058,11 +1122,32 @@ const server = http.createServer(async (req, res) => {
       }
       return origWrite(...args);
     };
+    // 非流式路径直接 res.end(body) 不经 write, 补一个 end 计数让 out= 字节数准确
+    const origEnd = res.end.bind(res);
+    res.end = (...args) => {
+      const b = args[0];
+      if (b && (typeof b === "string" || Buffer.isBuffer(b))) {
+        outBytes += Buffer.isBuffer(b) ? b.length : Buffer.byteLength(b);
+      }
+      return origEnd(...args);
+    };
   }
   res.on("finish", () => {
     const ms = Date.now() - startAt;
     const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}`);
+    // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
+    const u = req._cmdc && req._cmdc.usage;
+    let usageStr = "";
+    if (u) {
+      const parts = [];
+      if (u.input != null) parts.push(`in:${u.input}`);
+      if (u.output != null) parts.push(`out:${u.output}`);
+      if (u.reasoning != null) parts.push(`rt:${u.reasoning}`);
+      if (u.cacheRead != null) parts.push(`cr:${u.cacheRead}`);
+      if (u.cacheWrite != null) parts.push(`cw:${u.cacheWrite}`);
+      if (parts.length) usageStr = ` ${cGreen(parts.join(" "))}`;
+    }
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}`);
   });
 
   try {
@@ -1122,7 +1207,7 @@ const server = http.createServer(async (req, res) => {
           }),
           body: JSON.stringify(body),
         });
-        await passThrough(res, up);
+        await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); } });
         return;
       }
 
@@ -1144,6 +1229,7 @@ const server = http.createServer(async (req, res) => {
         }
         try {
           const oai = JSON.parse(text);
+          req._cmdc.usage = normalizeUsage(oai.usage);
           const anthropic = openAIToAnthropic(oai, requested);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(anthropic));
@@ -1185,6 +1271,7 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         console.warn(TAGW, "收尾 SSE 失败:", e.message);
       }
+      req._cmdc.usage = normalizeUsage(conv.rawUsage);
       res.end();
       return;
     }
@@ -1202,7 +1289,7 @@ const server = http.createServer(async (req, res) => {
         headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
         body: JSON.stringify(body),
       });
-      await passThrough(res, up);
+      await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); } });
       return;
     }
 
@@ -1234,6 +1321,7 @@ const server = http.createServer(async (req, res) => {
         }
         try {
           const oai = JSON.parse(text);
+          req._cmdc.usage = normalizeUsage(oai.usage);
           const respObj = chatResponseToResponses(oai, requested);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(respObj));
@@ -1272,6 +1360,7 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         console.warn(TAGW, "responses 收尾失败:", e.message);
       }
+      req._cmdc.usage = normalizeUsage(conv.rawUsage);
       res.end();
       return;
     }

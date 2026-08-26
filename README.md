@@ -158,9 +158,9 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 
 ```
 [20:15:55.877] REQ POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=deepseek-v4-flash→deepseek/deepseek-v4-flash stream=1
-[20:15:58.232] RES 200 POST /v1/messages model=deepseek-v4-flash→deepseek/deepseek-v4-flash took=2.35s out=1736B
+[20:15:58.232] RES 200 POST /v1/messages model=deepseek-v4-flash→deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0
 [20:15:58.822] REQ POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0
-[20:16:00.510] RES 200 POST /v1/chat/completions model=gpt-5.6-sol took=1.69s out=567B
+[20:16:00.510] RES 200 POST /v1/chat/completions model=gpt-5.6-sol took=1.69s out=567B in:987 out:45 cr:0 cw:0
 ```
 
 字段说明：
@@ -175,6 +175,11 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 | `stream` | 是否为流式请求（1 流式 / 0 非流式，仅 `REQ` 行） |
 | `took` | 总耗时（含上游推理时间，仅 `RES` 行） |
 | `out` | 响应输出字节数（仅 `RES` 行） |
+| `in:` / `out:` | 上游实际计费的输入 / 输出 tokens（流式与非流式、转换与透传路径均解析；上游未返回时缺省） |
+| `rt:` | 思考 tokens（`reasoning_tokens`，DeepSeek 系常见，仅上游返回时出现） |
+| `cr:` / `cw:` | 缓存读取（`cached_tokens`） / 缓存写入（`cache_creation_input_tokens`） tokens，命中缓存可大幅省钱 |
+
+> 流式请求上游默认不返回 usage，需请求体带 `stream_options: {"include_usage": true}` —— Claude Code / Codex 转换路径已自动带上；直接调用 `/v1/chat/completions` 的客户端需自行加该参数才能在日志中看到用量。
 
 ## 常见问题
 

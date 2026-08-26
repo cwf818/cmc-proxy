@@ -175,9 +175,9 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 | `stream` | 是否为流式请求（1 流式 / 0 非流式，仅 `REQ` 行） |
 | `took` | 总耗时（含上游推理时间，仅 `RES` 行） |
 | `out` | 响应输出字节数（仅 `RES` 行） |
-| `in:` / `out:` | 上游实际计费的输入 / 输出 tokens（流式与非流式、转换与透传路径均解析；上游未返回时缺省） |
-| `rt:` | 思考 tokens（`reasoning_tokens`，DeepSeek 系常见，仅上游返回时出现） |
-| `cr:` / `cw:` | 缓存读取（`cached_tokens`） / 缓存写入（`cache_creation_input_tokens`） tokens，命中缓存可大幅省钱 |
+| `in:` / `out:` | 输入 / 输出 tokens。**`in:` 为净输入**（已扣除缓存命中部分，即按原价计费的量；流式与非流式、转换与透传路径均解析；上游未返回时缺省） |
+| `rt:` | 思考 tokens（`reasoning_tokens`，DeepSeek 系常见，已包含在 `out:` 中，仅上游返回时出现） |
+| `cr:` / `cw:` | 缓存读取（`cached_tokens`） / 缓存写入（`cache_creation_input_tokens`） tokens，命中缓存可大幅省钱。`in:` + `cr:` = 总输入 |
 
 > 流式请求上游默认不返回 usage，需请求体带 `stream_options: {"include_usage": true}` —— Claude Code / Codex 转换路径已自动带上；直接调用 `/v1/chat/completions` 的客户端需自行加该参数才能在日志中看到用量。
 

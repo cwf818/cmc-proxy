@@ -163,6 +163,8 @@ function estimateInputTokens(body) {
 /**
  * 从上游 usage 对象中提取日志关心的字段 (同时兼容 OpenAI 与 Anthropic 两种格式):
  *   input / output / reasoning(rt) / cacheRead(cr) / cacheWrite(cw)
+ * 注: input 返回"净输入"(总输入 - 缓存命中), 缓存命中量由 cacheRead 单独展示,
+ *     两者之和才是上游返回的总输入 tokens。
  */
 function normalizeUsage(u) {
   if (!u) return null;
@@ -177,6 +179,8 @@ function normalizeUsage(u) {
   if (u.cache_read_input_tokens !== undefined) out.cacheRead = u.cache_read_input_tokens; // Anthropic
   if (u.cache_creation_input_tokens !== undefined) out.cacheWrite = u.cache_creation_input_tokens;
   if (cd.reasoning_tokens !== undefined) out.reasoning = cd.reasoning_tokens; // OpenAI (DeepSeek 思考量)
+  // in = in - cr: 扣掉缓存命中的部分, 剩余才是按原价计费的输入
+  if (out.input != null && out.cacheRead != null) out.input = Math.max(0, out.input - out.cacheRead);
   return out;
 }
 

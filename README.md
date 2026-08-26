@@ -12,11 +12,30 @@
 ```
 cmc-proxy/
 ├── proxy.js        # 主程序（反代 + 协议转换）
-├── config.json     # 配置：端口、API Key、模型映射
+├── config.json     # 配置：端口、API Key、模型映射（gitignore，不入库）
+├── config.example.json  # 配置模板
+├── build.js        # 构建脚本：导出 release 版本
 ├── start.bat       # Windows 启动脚本
 ├── start.sh        # macOS/Linux 启动脚本
+├── release/        # build 产物（gitignore，由 build.js 生成）
 └── README.md
 ```
+
+## 构建 Release
+
+`release/` 目录是构建产物（已 gitignore），由 `build.js` 生成，不要手动编辑：
+
+```bash
+node build.js                  # 导出到 release/，版本号自动取 git tag/commit
+node build.js --version v1.0.1 # 指定版本号
+node build.js --out dist       # 自定义输出目录
+```
+
+产物包含 `proxy.js`、`config.example.json`、`start.bat`、`start.sh`、`README.md` 与 `VERSION.txt`（版本 / 构建时间 / git commit / 文件校验和）。**不含 `config.json`**（含私有 apiKey）。拿到 release 后：
+
+1. 复制 `config.example.json` 为 `config.json`；
+2. 填入你的 apiKey，按需调整端口 / 模型映射；
+3. `start.bat`（Windows）或 `./start.sh`（macOS/Linux）启动。
 
 ## 快速开始
 

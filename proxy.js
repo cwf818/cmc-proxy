@@ -369,7 +369,8 @@ function openAIToAnthropic(obj, requestedModel) {
     stop_reason: mapStopReason(choice.finish_reason),
     stop_sequence: null,
     usage: {
-      input_tokens: u.prompt_tokens ?? 0,
+      // input_tokens 为净输入 (总输入 - 缓存命中), 与日志 in=in-cr 保持一致; 命中量由 cache_read_input_tokens 单独返回
+      input_tokens: Math.max(0, (u.prompt_tokens ?? 0) - (pd.cached_tokens ?? 0)),
       output_tokens: u.completion_tokens ?? 0,
       ...(pd.cached_tokens !== undefined ? { cache_read_input_tokens: pd.cached_tokens } : {}),
       ...(pd.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: pd.cache_creation_input_tokens } : {}),
@@ -402,9 +403,10 @@ class StreamConverter {
     if (!json.usage) return;
     this.rawUsage = json.usage;
     const u = json.usage;
-    if (u.prompt_tokens != null) this.usage.input_tokens = u.prompt_tokens;
-    if (u.completion_tokens != null) this.usage.output_tokens = u.completion_tokens;
     const pd = u.prompt_tokens_details || {};
+    // input_tokens 存净输入 (总输入 - 缓存命中), 与日志 in=in-cr 及非流式 openAIToAnthropic 保持一致
+    if (u.prompt_tokens != null) this.usage.input_tokens = Math.max(0, u.prompt_tokens - (pd.cached_tokens ?? 0));
+    if (u.completion_tokens != null) this.usage.output_tokens = u.completion_tokens;
     if (pd.cached_tokens !== undefined) this.cacheRead = pd.cached_tokens;
     if (pd.cache_creation_input_tokens !== undefined) this.cacheCreation = pd.cache_creation_input_tokens;
   }

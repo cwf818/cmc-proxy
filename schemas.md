@@ -240,7 +240,7 @@ User-Agent: claude-cli/2.0.0
   "stop_reason": "max_tokens",                      // 映射: length → max_tokens
   "stop_sequence": null,
   "usage": {
-    "input_tokens": 84,
+    "input_tokens": 84,                           // 净输入 = prompt_tokens - cached_tokens (本例 cached=0 故不变)
     "output_tokens": 32,
     "cache_read_input_tokens": 0,
     "cache_creation_input_tokens": 0
@@ -257,7 +257,7 @@ User-Agent: claude-cli/2.0.0
 | `finish_reason:"tool_calls"` | `stop_reason:"tool_use"` |
 | `finish_reason:"length"` | `stop_reason:"max_tokens"` |
 | `finish_reason:"stop"/"end_turn"` | `stop_reason:"end_turn"` |
-| `usage.prompt_tokens` | `usage.input_tokens` |
+| `usage.prompt_tokens` | `usage.input_tokens`（**净输入** = max(0, prompt_tokens − cached_tokens)，与日志 in=in-cr 一致） |
 | `usage.completion_tokens` | `usage.output_tokens` |
 | `prompt_tokens_details.cached_tokens` | `usage.cache_read_input_tokens` |
 | `prompt_tokens_details.cache_creation_input_tokens` | `usage.cache_creation_input_tokens` |
@@ -484,7 +484,7 @@ data: [DONE]
 | 阶段 | 字段 |
 |---|---|
 | Upstream Response（OpenAI） | `prompt_tokens`、`completion_tokens`、`total_tokens`、`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`、`cache_creation_input_tokens` |
-| Local Response（Anthropic） | `input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` |
+| Local Response（Anthropic） | `input_tokens`（净输入 = 总输入 − 缓存命中）、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` |
 | Local Response（Responses） | `input_tokens`、`output_tokens`、`total_tokens` |
 | 访问日志（RES 行） | `in`（**净输入** = 总输入 − 缓存命中）、`out`、`rt`（reasoning，已含在 out 内）、`cr`（缓存读）、`cw`（缓存写） |
 

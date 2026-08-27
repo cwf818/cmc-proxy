@@ -1080,6 +1080,7 @@ const cDim = paint(C.dim);
 const cBlue = paint(C.blue);
 const cOrange = paint("\x1b[38;5;208m"); // 256 色橙
 const cBrightGreen = paint("\x1b[92m"); // 亮绿
+const cBrightCyan = paint("\x1b[96m"); // 亮青
 
 /** 按 HTTP 状态码着色: 2xx 绿 / 4xx 黄 / 5xx 红 */
 function cStatus(code) {
@@ -1097,6 +1098,17 @@ function cSpeed(v) {
   if (v >= 60) return cGreen(s);
   if (v >= 40) return cYellow(s);
   if (v >= 20) return cOrange(s);
+  return cRed(s);
+}
+
+/** 缓存命中率波段色: ch% — <60 红 / 60-79 橙 / 80-89 黄 / 90-94 绿 / 95-97 亮绿 / >=98 亮青 */
+function cCacheHit(pct) {
+  const s = pct + "%";
+  if (pct >= 98) return cBrightCyan(s);
+  if (pct >= 95) return cBrightGreen(s);
+  if (pct >= 90) return cGreen(s);
+  if (pct >= 80) return cYellow(s);
+  if (pct >= 60) return cOrange(s);
   return cRed(s);
 }
 
@@ -1128,14 +1140,14 @@ const fmtNum = (n) =>
 const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0 });
 const stats = { day: null, today: zeroAgg(), total: zeroAgg(), last10: [] };
 
-/** 打印一行统计 (字段全用冒号; ch=平均缓存命中率 cr/(in+cr)) */
+/** 打印一行统计 (字段全用冒号; ch=平均缓存命中率 cr/(in+cr), ch 与 ts 用波段色) */
 function statsLine(label, agg) {
   if (!agg || !agg.req) return;
   const totalIn = agg.in + agg.cr;
-  const ch = totalIn > 0 ? Math.round((agg.cr / totalIn) * 100) + "%" : "-";
-  const avg = agg.ms > 0 ? (agg.out / (agg.ms / 1000)).toFixed(1) + "/s" : "-";
+  const chStr = totalIn > 0 ? cCacheHit(Math.round((agg.cr / totalIn) * 100)) : "-";
+  const tsStr = agg.ms > 0 ? cSpeed(agg.out / (agg.ms / 1000)) : "-";
   console.log(
-    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ch:${ch} avg_ts:${avg}`
+    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ch:${chStr} ${tsStr}`
   );
 }
 
@@ -1145,7 +1157,7 @@ function logStats() {
   for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
     l10[k] = stats.last10.reduce((a, x) => a + (x[k] || 0), 0);
   }
-  statsLine("Last10", l10);
+  statsLine("Ten", l10);
   statsLine("Today", stats.today);
   statsLine("Total", stats.total);
 }

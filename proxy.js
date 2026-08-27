@@ -1102,6 +1102,24 @@ function logTs(ms) {
 // ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
+
+// ---- 用量统计 (进程内按天累计, 每 STATS_EVERY 个请求打印一行 STATS; 可用环境变量 CMC_STATS_EVERY 调整频率) ----
+const STATS_EVERY = parseInt(process.env.CMC_STATS_EVERY || "25", 10);
+const dayKey = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const fmtNum = (n) =>
+  n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(n);
+const stats = { day: null, req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0 };
+function logStats(day) {
+  if (!stats.req) return;
+  const avg = stats.ms > 0 ? (stats.out / (stats.ms / 1000)).toFixed(1) : "-";
+  console.log(
+    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${day} req=${stats.req} in=${fmtNum(stats.in)} out=${fmtNum(stats.out)} rt=${fmtNum(stats.rt)} cr=${fmtNum(stats.cr)} cw=${fmtNum(stats.cw)} avg_ts=${avg}/s`
+  );
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = url.pathname;
@@ -1159,6 +1177,7 @@ const server = http.createServer(async (req, res) => {
     // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
     const u = req._cmdc && req._cmdc.usage;
     let usageStr = "";
+    let tsStr = "";
     if (u) {
       const parts = [];
       if (u.input != null) parts.push(`in:${u.input}`);
@@ -1167,8 +1186,28 @@ const server = http.createServer(async (req, res) => {
       if (u.cacheRead != null) parts.push(`cr:${u.cacheRead}`);
       if (u.cacheWrite != null) parts.push(`cw:${u.cacheWrite}`);
       if (parts.length) usageStr = ` ${cGreen(parts.join(" "))}`;
+      // 速度: 输出 tokens / 秒 (含上游推理耗时)
+      if (u.output != null && ms >= 200) tsStr = ` ${cGreen(`ts=${(u.output / (ms / 1000)).toFixed(1)}/s`)}`;
     }
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}`);
+    // 统计累计 (按天)
+    const day = dayKey();
+    if (stats.day !== day) {
+      logStats(stats.day); // 跨天: 先打印上日汇总
+      stats.day = day;
+      stats.req = 0;
+      stats.in = stats.out = stats.rt = stats.cr = stats.cw = stats.ms = 0;
+    }
+    stats.req += 1;
+    if (u) {
+      stats.in += u.input ?? 0;
+      stats.out += u.output ?? 0;
+      stats.rt += u.reasoning ?? 0;
+      stats.cr += u.cacheRead ?? 0;
+      stats.cw += u.cacheWrite ?? 0;
+    }
+    stats.ms += ms;
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${tsStr}`);
+    if (stats.req % STATS_EVERY === 0) logStats(day);
   });
 
   try {

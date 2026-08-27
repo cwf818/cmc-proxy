@@ -1080,7 +1080,6 @@ const cDim = paint(C.dim);
 const cBlue = paint(C.blue);
 const cOrange = paint("\x1b[38;5;208m"); // 256 色橙
 const cBrightGreen = paint("\x1b[92m"); // 亮绿
-const cBrightCyan = paint("\x1b[96m"); // 亮青
 
 /** 按 HTTP 状态码着色: 2xx 绿 / 4xx 黄 / 5xx 红 */
 function cStatus(code) {
@@ -1100,9 +1099,8 @@ function speedSegment(text, v) {
   return cRed(text);
 }
 
-/** 缓存命中率波段色: <60 红 / 60-79 橙 / 80-89 黄 / 90-94 绿 / 95-97 亮绿 / >=98 亮青 (text 为整段含前缀/逗号, pct 为数值) */
+/** 缓存命中率波段色(5档): <60 红 / 60-79 橙 / 80-89 黄 / 90-94 绿 / >=95 亮绿 (text 为整段含前缀/逗号, pct 为数值) */
 function cacheSegment(text, pct) {
-  if (pct >= 98) return cBrightCyan(text);
   if (pct >= 95) return cBrightGreen(text);
   if (pct >= 90) return cGreen(text);
   if (pct >= 80) return cYellow(text);
@@ -1199,16 +1197,18 @@ function logStats() {
   if (!same) statsLine("ALL", stats.total);
 }
 
-/** 记录一条请求: 滚动窗口 + TOD/ALL 累计 */
-function accumulate(rec) {
+/** 记录一条请求: TOD/ALL 全部计入; 滚动窗口仅计入有 usage 的请求 (trackRolling) */
+function accumulate(rec, trackRolling) {
   stats.today.req += 1;
   stats.total.req += 1;
   for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
     stats.today[k] += rec[k];
     stats.total[k] += rec[k];
   }
-  stats.recent.push(rec);
-  if (stats.recent.length > RECENT_N) stats.recent.shift();
+  if (trackRolling) {
+    stats.recent.push(rec);
+    if (stats.recent.length > RECENT_N) stats.recent.shift();
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1296,8 +1296,10 @@ const server = http.createServer(async (req, res) => {
       stats.day = day;
       stats.today = zeroAgg();
     }
-    accumulate(rec);
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(resModelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${movingStatsStr()}`);
+    accumulate(rec, !!usageStr);
+    // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加
+    const movingStr = usageStr ? movingStatsStr() : "";
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(resModelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 

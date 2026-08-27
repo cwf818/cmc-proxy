@@ -158,10 +158,10 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 每个请求打印**两行日志**：`REQ` 行记录本地客户端发来的请求，`RES` 行记录外部上游返回的结果，便于对照感知请求与返回：
 
 ```
-[20:15:55.877] REQ POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=deepseek-v4-flash→deepseek/deepseek-v4-flash stream=1 body=186.5KB
-[20:15:58.232] RES 200 POST /v1/messages model=deepseek-v4-flash→deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ts:241.3/s
+[20:15:55.877] REQ POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=deepseek-v4-flash stream=1 body=186.5KB
+[20:15:58.232] RES 200 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ts:241.3/s
 [20:15:58.822] REQ POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0 body=88B
-[20:16:00.510] RES 200 POST /v1/chat/completions model=gpt-5.6-sol took=1.69s out=567B in:987 out:45 cr:0 cw:0 ts:26.6/s
+[20:16:00.510] RES 200 POST /v1/chat/completions took=1.69s out=567B in:987 out:45 cr:0 cw:0 ts:26.6/s
 ```
 
 字段说明：
@@ -172,7 +172,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 | `status` / `method` / `path` | HTTP 状态码、方法与路径（`RES` 行含状态码） |
 | `src` | 客户端 IP（仅 `REQ` 行） |
 | `ua` | 客户端 User-Agent（`claude-cli/*` 即 Claude Code，`codex/*` 即 Codex） |
-| `model` | 请求模型 → 实际转发的上游模型（`→` 表示发生了模型映射） |
+| `model` | 仅 `REQ` 行显示**本地请求的模型名**（如 `deepseek-v4-flash`）；`RES` 行只在**实际转发的模型名与本地名不同**时显示转发名（如 `deepseek/deepseek-v4-flash`），字符串相同时省略 —— 两行对照即知映射关系 |
 | `stream` | 是否为流式请求（1 流式 / 0 非流式，仅 `REQ` 行） |
 | `body` | 请求体大小（仅 `REQ` 行；用于区分两条请求是否完全相同：工具循环的请求体会递增，客户端重试的请求体一致） |
 | `took` | 总耗时（含上游推理时间，仅 `RES` 行） |

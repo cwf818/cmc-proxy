@@ -1109,7 +1109,7 @@ const server = http.createServer(async (req, res) => {
   // ---- 访问日志基础设施 (一次请求两行: REQ 本地请求 / RES 外部返回) ----
   const startAt = Date.now();
   const srcIp = req.socket.remoteAddress || "-";
-  req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false, usage: null };
+  req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false, usage: null, bodyBytes: 0 };
   let outBytes = 0;
   const uaShort = () => (req.headers["user-agent"] || "-").slice(0, 48);
   const modelPart = () => {
@@ -1121,10 +1121,16 @@ const server = http.createServer(async (req, res) => {
     const c = req._cmdc;
     return c && c.stream != null ? ` stream=${c.stream ? 1 : 0}` : "";
   };
+  // 请求体大小 (帮助区分两条请求是否完全相同: 工具循环请求体递增, 重试请求体相同)
+  const fmtBytes = (n) => (n >= 1024 ? (n / 1024).toFixed(1) + "KB" : n + "B");
+  const bodyPart = () => {
+    const bb = req._cmdc.bodyBytes;
+    return bb ? ` body=${fmtBytes(bb)}` : "";
+  };
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
-    console.log(`${cDim(`[${logTs(startAt)}]`)} ${cCyan("REQ")} ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${cYellow(modelPart())}${streamPart()}`);
+    console.log(`${cDim(`[${logTs(startAt)}]`)} ${cCyan("REQ")} ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${cYellow(modelPart())}${streamPart()}${cDim(bodyPart())}`);
   };
   {
     const origWrite = res.write.bind(res);
@@ -1215,6 +1221,7 @@ const server = http.createServer(async (req, res) => {
       const useAnthropicEndpoint = isClaudeModel(mapped);
       const isStream = !!body.stream;
       req._cmdc = { model: requested, mapped, stream: isStream };
+      req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       logReq();
 
       if (useAnthropicEndpoint) {
@@ -1306,6 +1313,7 @@ const server = http.createServer(async (req, res) => {
       const requested = body.model || DEFAULT_MODEL;
       if (body.model) body.model = resolveModel(body.model);
       req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream };
+      req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       logReq();
       const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
         method: "POST",
@@ -1326,6 +1334,7 @@ const server = http.createServer(async (req, res) => {
       const mapped = resolveModel(requested);
       const isStream = !!body.stream;
       req._cmdc = { model: requested, mapped, stream: isStream };
+      req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       logReq();
 
       const chatReq = responsesToChatRequest(body);

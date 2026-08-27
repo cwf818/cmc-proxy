@@ -189,16 +189,16 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 每 **10 个请求**打印三行汇总（跨天自动先打印上日汇总；频率可用环境变量 `CMC_STATS_EVERY` 调整）：
 
 ```
-[20:16:30.000] STATS Ten   req:10 in:2.3K out:1.2K rt:900 cr:19.8K cw:0 ch:90% ts:241.3/s
-[20:16:30.000] STATS Today req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
-[20:16:30.000] STATS Total req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
+[20:16:30.000] STATS L10  req:10 in:2.3K out:1.2K rt:900 cr:19.8K cw:0 ch:90% ts:241.3/s
+[20:16:30.000] STATS TOD  req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
+[20:16:30.000] STATS ALL  req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
 ```
 
 | 行 | 范围 |
 |---|---|
-| `Ten` | 最近 10 个请求（滚动窗口） |
-| `Today` | 当天累计（按自然日） |
-| `Total` | 进程启动以来累计 |
+| `L10` | 最近 10 个请求（滚动窗口） |
+| `TOD` | 当天累计（按自然日） |
+| `ALL` | 进程启动以来累计（**当天启动时 TOD 与 ALL 一致，自动省略 ALL 行**） |
 
 | 字段 | 含义 |
 |---|---|

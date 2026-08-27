@@ -1152,14 +1152,18 @@ function statsLine(label, agg) {
 }
 
 /** 打印三行统计: Last10 / Today / Total */
+/** 打印统计行: L10(最近10) / TOD(当天) / ALL(进程累计); 当天启动时 TOD 与 ALL 一致, 省略 ALL */
 function logStats() {
   const l10 = { req: stats.last10.length };
   for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
     l10[k] = stats.last10.reduce((a, x) => a + (x[k] || 0), 0);
   }
-  statsLine("Ten", l10);
-  statsLine("Today", stats.today);
-  statsLine("Total", stats.total);
+  statsLine("L10", l10);
+  statsLine("TOD", stats.today);
+  const same =
+    stats.today.req === stats.total.req &&
+    ["in", "out", "rt", "cr", "cw", "ms"].every((k) => stats.today[k] === stats.total[k]);
+  if (!same) statsLine("ALL", stats.total);
 }
 
 /** 累计一条请求记录到三个维度 */

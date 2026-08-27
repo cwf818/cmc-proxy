@@ -1188,10 +1188,16 @@ const server = http.createServer(async (req, res) => {
   req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false, usage: null, bodyBytes: 0 };
   let outBytes = 0;
   const uaShort = () => (req.headers["user-agent"] || "-").slice(0, 48);
-  const modelPart = () => {
+  // REQ 行: 只显示本地请求的模型名 (前半), 映射关系留给 RES 行对照
+  const reqModelPart = () => {
     const c = req._cmdc;
-    if (!c || !c.model) return "";
-    return ` model=${c.model}${c.mapped && c.mapped !== c.model ? "→" + c.mapped : ""}`;
+    return c && c.model ? ` model=${c.model}` : "";
+  };
+  // RES 行: 只显示实际转发的模型名 (后半); 与本地请求名完全相同(字符串相等)时省略
+  const resModelPart = () => {
+    const c = req._cmdc;
+    if (!c || !c.mapped || c.mapped === c.model) return "";
+    return ` model=${c.mapped}`;
   };
   const streamPart = () => {
     const c = req._cmdc;
@@ -1206,7 +1212,7 @@ const server = http.createServer(async (req, res) => {
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
-    console.log(`${cDim(`[${logTs(startAt)}]`)} ${cCyan("REQ")} ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${cYellow(modelPart())}${streamPart()}${cDim(bodyPart())}`);
+    console.log(`${cDim(`[${logTs(startAt)}]`)} ${cCyan("REQ")} ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${cYellow(reqModelPart())}${streamPart()}${cDim(bodyPart())}`);
   };
   {
     const origWrite = res.write.bind(res);
@@ -1261,7 +1267,7 @@ const server = http.createServer(async (req, res) => {
       stats.today = zeroAgg();
     }
     accumulate(rec);
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${tsStr}`);
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(resModelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${tsStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 

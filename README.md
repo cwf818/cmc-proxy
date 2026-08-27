@@ -158,9 +158,9 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 每个请求打印**两行日志**：`REQ` 行记录本地客户端发来的请求，`RES` 行记录外部上游返回的结果，便于对照感知请求与返回：
 
 ```
-[20:15:55.877] REQ POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=deepseek-v4-flash→deepseek/deepseek-v4-flash stream=1
+[20:15:55.877] REQ POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=deepseek-v4-flash→deepseek/deepseek-v4-flash stream=1 body=186.5KB
 [20:15:58.232] RES 200 POST /v1/messages model=deepseek-v4-flash→deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0
-[20:15:58.822] REQ POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0
+[20:15:58.822] REQ POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0 body=88B
 [20:16:00.510] RES 200 POST /v1/chat/completions model=gpt-5.6-sol took=1.69s out=567B in:987 out:45 cr:0 cw:0
 ```
 
@@ -174,6 +174,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 | `ua` | 客户端 User-Agent（`claude-cli/*` 即 Claude Code，`codex/*` 即 Codex） |
 | `model` | 请求模型 → 实际转发的上游模型（`→` 表示发生了模型映射） |
 | `stream` | 是否为流式请求（1 流式 / 0 非流式，仅 `REQ` 行） |
+| `body` | 请求体大小（仅 `REQ` 行；用于区分两条请求是否完全相同：工具循环的请求体会递增，客户端重试的请求体一致） |
 | `took` | 总耗时（含上游推理时间，仅 `RES` 行） |
 | `out` | 响应输出字节数（仅 `RES` 行） |
 | `in:` / `out:` | 输入 / 输出 tokens。**`in:` 为净输入**（已扣除缓存命中部分，即按原价计费的量；流式与非流式、转换与透传路径均解析；上游未返回时缺省） |

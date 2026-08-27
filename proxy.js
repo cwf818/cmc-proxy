@@ -604,7 +604,9 @@ class StreamConverter {
       JSON.stringify({
         type: "message_delta",
         delta: { stop_reason: this.stopReason, stop_sequence: null },
-        usage: this.usageObject(false),
+        // 带 input_tokens(净输入): 上游 usage 在流末尾返回, message_delta 是最后能修正客户端用量的机会
+        // (Claude Code 按 input_tokens + cache_read_input_tokens 统计, 若此处不带净输入会与 message_start 的估算值重复计算缓存)
+        usage: this.usageObject(true),
       })
     );
     out += sse("message_stop", JSON.stringify({ type: "message_stop" }));

@@ -17,6 +17,7 @@ cmc-proxy/
 ├── build.js        # 构建脚本：导出 release 版本
 ├── start.bat       # Windows 启动脚本
 ├── start.sh        # macOS/Linux 启动脚本
+├── schemas.md      # 四阶段数据格式与样例参考（Local/Upstream 请求与响应）
 ├── release/        # build 产物（gitignore，由 build.js 生成）
 └── README.md
 ```

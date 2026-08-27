@@ -189,14 +189,14 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 每 **10 个请求**打印三行汇总（跨天自动先打印上日汇总；频率可用环境变量 `CMC_STATS_EVERY` 调整）：
 
 ```
-[20:16:30.000] STATS Last10 req:10 in:2.3K out:1.2K rt:900 cr:19.8K cw:0 ch:90% avg_ts:241.3/s
-[20:16:30.000] STATS Today  req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% avg_ts:210.1/s
-[20:16:30.000] STATS Total  req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% avg_ts:210.1/s
+[20:16:30.000] STATS Ten   req:10 in:2.3K out:1.2K rt:900 cr:19.8K cw:0 ch:90% ts:241.3/s
+[20:16:30.000] STATS Today req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
+[20:16:30.000] STATS Total req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
 ```
 
 | 行 | 范围 |
 |---|---|
-| `Last10` | 最近 10 个请求（滚动窗口） |
+| `Ten` | 最近 10 个请求（滚动窗口） |
 | `Today` | 当天累计（按自然日） |
 | `Total` | 进程启动以来累计 |
 
@@ -206,8 +206,8 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 | `in` / `out` | 累计净输入 / 输出 tokens（数字超 1K/1M 自动缩写） |
 | `rt` | 累计思考 tokens（已含在 out 内） |
 | `cr` / `cw` | 累计缓存读取 / 写入 tokens |
-| `ch` | 平均缓存命中率 = `cr ÷ (in + cr)` |
-| `avg_ts` | 平均生成速度（tokens/s） |
+| `ch` | 平均缓存命中率 = `cr ÷ (in + cr)`，**波段色**：<60 红 / 60–79 橙 / 80–89 黄 / 90–94 绿 / 95–97 亮绿 / ≥98 亮青 |
+| `ts` | 平均生成速度（tokens/s），**波段色**与 RES 行 `ts:` 相同（<20 红 / 20–39 橙 / 40–59 黄 / 60–79 绿 / ≥80 亮绿） |
 
 > 统计为内存态，进程重启后清零。
 

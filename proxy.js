@@ -1160,7 +1160,13 @@ const server = http.createServer(async (req, res) => {
       if (u.cacheWrite != null) parts.push(`cw:${u.cacheWrite}`);
       if (parts.length) usageStr = ` ${cGreen(parts.join(" "))}`;
     }
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}`);
+    // 实际发给客户端的 usage (local response), 与上游 usage 对比用
+    const lu = req._cmdc && req._cmdc.localUsage;
+    let localStr = "";
+    if (lu && Object.keys(lu).length) {
+      localStr = ` ${cCyan("local=" + JSON.stringify(lu))}`;
+    }
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${localStr}`);
   });
 
   try {
@@ -1244,6 +1250,7 @@ const server = http.createServer(async (req, res) => {
           const oai = JSON.parse(text);
           req._cmdc.usage = normalizeUsage(oai.usage);
           const anthropic = openAIToAnthropic(oai, requested);
+          req._cmdc.localUsage = anthropic.usage; // 实际发给客户端的 usage (路径B非流式)
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(anthropic));
         } catch (e) {
@@ -1285,6 +1292,7 @@ const server = http.createServer(async (req, res) => {
         console.warn(TAGW, "收尾 SSE 失败:", e.message);
       }
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
+      req._cmdc.localUsage = conv.usageObject(true); // 实际发给客户端的 usage (路径B流式: message_start + message_delta 合并)
       res.end();
       return;
     }
@@ -1336,6 +1344,7 @@ const server = http.createServer(async (req, res) => {
           const oai = JSON.parse(text);
           req._cmdc.usage = normalizeUsage(oai.usage);
           const respObj = chatResponseToResponses(oai, requested);
+          req._cmdc.localUsage = respObj.usage; // 实际发给客户端的 usage (路径C非流式)
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(respObj));
         } catch (e) {
@@ -1374,6 +1383,7 @@ const server = http.createServer(async (req, res) => {
         console.warn(TAGW, "responses 收尾失败:", e.message);
       }
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
+      req._cmdc.localUsage = conv.usage; // 实际发给客户端的 usage (路径C流式)
       res.end();
       return;
     }

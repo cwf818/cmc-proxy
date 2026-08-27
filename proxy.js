@@ -1125,11 +1125,21 @@ function logTs(ms) {
 // 路由
 // ---------------------------------------------------------------------------
 
-// ---- 滚动用量统计: 最近 1 / 10 / 50 次请求的 ch(缓存命中率) 与 ts(速度) ----
-// 每次请求完成时输出, 值个数按历史请求数: 1 次显示 1 值 / 2-10 次显示 2 值 / >=11 次显示 3 值
-// 波段色按逗号分段, 逗号跟随其后的数值一起着色 (如 "ts:30/s"、",40/s"、",50/s")
+// ---- 用量统计 ----
+// 1) 滚动统计: 最近 1 / 10 / 50 次请求的 ch(缓存命中率) 与 ts(速度), 每次请求完成时输出,
+//    值个数按历史请求数: 1 次显示 1 值 / 2-10 次显示 2 值 / >=11 次显示 3 值, 波段色按逗号分段
+// 2) TOD/ALL: 按天累计与进程累计, 每 STATS_EVERY 个请求打印 (环境变量 CMC_STATS_EVERY 可调, 默认 10),
+//    跨天打印上日汇总; 当天启动时 TOD 与 ALL 一致, 省略 ALL
+const STATS_EVERY = parseInt(process.env.CMC_STATS_EVERY || "10", 10);
 const RECENT_N = 50;
-const stats = { recent: [] };
+const dayKey = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const fmtNum = (n) =>
+  n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(n);
+const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0 });
+const stats = { day: null, today: zeroAgg(), total: zeroAgg(), recent: [] };
 
 /** 最近 n 个请求的聚合 */
 function winAgg(n) {
@@ -1167,8 +1177,36 @@ function movingStatsStr() {
   return ` ${chParts.join("")} ${tsParts.join("")}`;
 }
 
-/** 记录一条请求到滚动窗口 */
+/** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色) */
+function statsLine(label, agg) {
+  if (!agg || !agg.req) return;
+  const totalIn = agg.in + agg.cr;
+  const pct = totalIn > 0 ? Math.round((agg.cr / totalIn) * 100) : 0;
+  const chStr = cacheSegment("ch:" + (totalIn > 0 ? pct + "%" : "-"), pct);
+  const v = agg.ms > 0 ? agg.out / (agg.ms / 1000) : 0;
+  const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
+  console.log(
+    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr} ${tsStr}`
+  );
+}
+
+/** 打印 TOD/ALL 两行 (当天启动时 TOD 与 ALL 一致, 省略 ALL) */
+function logStats() {
+  statsLine("TOD", stats.today);
+  const same =
+    stats.today.req === stats.total.req &&
+    ["in", "out", "rt", "cr", "cw", "ms"].every((k) => stats.today[k] === stats.total[k]);
+  if (!same) statsLine("ALL", stats.total);
+}
+
+/** 记录一条请求: 滚动窗口 + TOD/ALL 累计 */
 function accumulate(rec) {
+  stats.today.req += 1;
+  stats.total.req += 1;
+  for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
+    stats.today[k] += rec[k];
+    stats.total[k] += rec[k];
+  }
   stats.recent.push(rec);
   if (stats.recent.length > RECENT_N) stats.recent.shift();
 }
@@ -1251,8 +1289,16 @@ const server = http.createServer(async (req, res) => {
       rec.cr = u.cacheRead ?? 0;
       rec.cw = u.cacheWrite ?? 0;
     }
+    // 跨天: 先打印上日 TOD/ALL 汇总, 重置当天
+    const day = dayKey();
+    if (stats.day !== day) {
+      logStats();
+      stats.day = day;
+      stats.today = zeroAgg();
+    }
     accumulate(rec);
     console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(resModelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${movingStatsStr()}`);
+    if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 
   try {

@@ -286,7 +286,7 @@ event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":32,"cache_read_input_tokens":0}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":84,"output_tokens":32,"cache_read_input_tokens":0}}
 
 event: message_stop
 data: {"type":"message_stop"}

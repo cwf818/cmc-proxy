@@ -1078,6 +1078,8 @@ const cYellow = paint(C.yellow);
 const cCyan = paint(C.cyan);
 const cDim = paint(C.dim);
 const cBlue = paint(C.blue);
+const cOrange = paint("\x1b[38;5;208m"); // 256 色橙
+const cBrightGreen = paint("\x1b[92m"); // 亮绿
 
 /** 按 HTTP 状态码着色: 2xx 绿 / 4xx 黄 / 5xx 红 */
 function cStatus(code) {
@@ -1086,6 +1088,16 @@ function cStatus(code) {
   if (code >= 400) return cYellow(s);
   if (code >= 300) return cCyan(s);
   return cGreen(s);
+}
+
+/** 速度波段色: ts tokens/s — <20 红 / 20-39 橙 / 40-59 黄 / 60-79 绿 / >=80 亮绿 */
+function cSpeed(v) {
+  const s = `ts:${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")}/s`;
+  if (v >= 80) return cBrightGreen(s);
+  if (v >= 60) return cGreen(s);
+  if (v >= 40) return cYellow(s);
+  if (v >= 20) return cOrange(s);
+  return cRed(s);
 }
 
 // 日志标签 (前缀着色)
@@ -1103,21 +1115,51 @@ function logTs(ms) {
 // 路由
 // ---------------------------------------------------------------------------
 
-// ---- 用量统计 (进程内按天累计, 每 STATS_EVERY 个请求打印一行 STATS; 可用环境变量 CMC_STATS_EVERY 调整频率) ----
-const STATS_EVERY = parseInt(process.env.CMC_STATS_EVERY || "25", 10);
+// ---- 用量统计: Last10 滚动窗口 / Today 按天 / Total 进程累计 ----
+// 每 STATS_EVERY 个请求打印三行 (环境变量 CMC_STATS_EVERY 可调, 默认 10)
+const STATS_EVERY = parseInt(process.env.CMC_STATS_EVERY || "10", 10);
+const LAST10_N = 10;
 const dayKey = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 const fmtNum = (n) =>
   n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(n);
-const stats = { day: null, req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0 };
-function logStats(day) {
-  if (!stats.req) return;
-  const avg = stats.ms > 0 ? (stats.out / (stats.ms / 1000)).toFixed(1) : "-";
+const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0 });
+const stats = { day: null, today: zeroAgg(), total: zeroAgg(), last10: [] };
+
+/** 打印一行统计 (字段全用冒号; ch=平均缓存命中率 cr/(in+cr)) */
+function statsLine(label, agg) {
+  if (!agg || !agg.req) return;
+  const totalIn = agg.in + agg.cr;
+  const ch = totalIn > 0 ? Math.round((agg.cr / totalIn) * 100) + "%" : "-";
+  const avg = agg.ms > 0 ? (agg.out / (agg.ms / 1000)).toFixed(1) + "/s" : "-";
   console.log(
-    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${day} req=${stats.req} in=${fmtNum(stats.in)} out=${fmtNum(stats.out)} rt=${fmtNum(stats.rt)} cr=${fmtNum(stats.cr)} cw=${fmtNum(stats.cw)} avg_ts=${avg}/s`
+    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ch:${ch} avg_ts:${avg}`
   );
+}
+
+/** 打印三行统计: Last10 / Today / Total */
+function logStats() {
+  const l10 = { req: stats.last10.length };
+  for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
+    l10[k] = stats.last10.reduce((a, x) => a + (x[k] || 0), 0);
+  }
+  statsLine("Last10", l10);
+  statsLine("Today", stats.today);
+  statsLine("Total", stats.total);
+}
+
+/** 累计一条请求记录到三个维度 */
+function accumulate(rec) {
+  stats.today.req += 1;
+  stats.total.req += 1;
+  for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
+    stats.today[k] += rec[k];
+    stats.total[k] += rec[k];
+  }
+  stats.last10.push(rec);
+  if (stats.last10.length > LAST10_N) stats.last10.shift();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1178,6 +1220,7 @@ const server = http.createServer(async (req, res) => {
     const u = req._cmdc && req._cmdc.usage;
     let usageStr = "";
     let tsStr = "";
+    const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms };
     if (u) {
       const parts = [];
       if (u.input != null) parts.push(`in:${u.input}`);
@@ -1186,28 +1229,24 @@ const server = http.createServer(async (req, res) => {
       if (u.cacheRead != null) parts.push(`cr:${u.cacheRead}`);
       if (u.cacheWrite != null) parts.push(`cw:${u.cacheWrite}`);
       if (parts.length) usageStr = ` ${cGreen(parts.join(" "))}`;
-      // 速度: 输出 tokens / 秒 (含上游推理耗时)
-      if (u.output != null && ms >= 200) tsStr = ` ${cGreen(`ts=${(u.output / (ms / 1000)).toFixed(1)}/s`)}`;
+      rec.in = u.input ?? 0;
+      rec.out = u.output ?? 0;
+      rec.rt = u.reasoning ?? 0;
+      rec.cr = u.cacheRead ?? 0;
+      rec.cw = u.cacheWrite ?? 0;
+      // 速度: ts=out/took (tokens/s), 波段色: 红<20 橙20-39 黄40-59 绿60-79 亮绿>=80
+      if (u.output != null && ms >= 200) tsStr = ` ${cSpeed(u.output / (ms / 1000))}`;
     }
-    // 统计累计 (按天)
+    // 统计累计
     const day = dayKey();
     if (stats.day !== day) {
-      logStats(stats.day); // 跨天: 先打印上日汇总
+      logStats(); // 跨天: 先打印汇总
       stats.day = day;
-      stats.req = 0;
-      stats.in = stats.out = stats.rt = stats.cr = stats.cw = stats.ms = 0;
+      stats.today = zeroAgg();
     }
-    stats.req += 1;
-    if (u) {
-      stats.in += u.input ?? 0;
-      stats.out += u.output ?? 0;
-      stats.rt += u.reasoning ?? 0;
-      stats.cr += u.cacheRead ?? 0;
-      stats.cw += u.cacheWrite ?? 0;
-    }
-    stats.ms += ms;
+    accumulate(rec);
     console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(modelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${tsStr}`);
-    if (stats.req % STATS_EVERY === 0) logStats(day);
+    if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 
   try {

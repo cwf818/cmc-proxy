@@ -179,8 +179,10 @@ function normalizeUsage(u) {
   if (u.cache_read_input_tokens !== undefined) out.cacheRead = u.cache_read_input_tokens; // Anthropic
   if (u.cache_creation_input_tokens !== undefined) out.cacheWrite = u.cache_creation_input_tokens;
   if (cd.reasoning_tokens !== undefined) out.reasoning = cd.reasoning_tokens; // OpenAI (DeepSeek 思考量)
-  // in = in - cr: 扣掉缓存命中的部分, 剩余才是按原价计费的输入
-  if (out.input != null && out.cacheRead != null) out.input = Math.max(0, out.input - out.cacheRead);
+  // in = in - cr: 扣掉缓存命中的部分, 剩余才是按原价计费的输入; 仅当 in > cr 才减 (避免异常数据把 in 归零)
+  if (out.input != null && out.cacheRead != null) {
+    out.input = out.input > out.cacheRead ? out.input - out.cacheRead : out.input;
+  }
   return out;
 }
 
@@ -360,6 +362,8 @@ function openAIToAnthropic(obj, requestedModel) {
   }
   const u = obj.usage || {};
   const pd = u.prompt_tokens_details || {};
+  const pt = u.prompt_tokens ?? 0;
+  const ct = pd.cached_tokens ?? 0;
   return {
     id: obj.id || `msg_${Date.now()}`,
     type: "message",
@@ -369,8 +373,8 @@ function openAIToAnthropic(obj, requestedModel) {
     stop_reason: mapStopReason(choice.finish_reason),
     stop_sequence: null,
     usage: {
-      // input_tokens 为净输入 (总输入 - 缓存命中), 与日志 in=in-cr 保持一致; 命中量由 cache_read_input_tokens 单独返回
-      input_tokens: Math.max(0, (u.prompt_tokens ?? 0) - (pd.cached_tokens ?? 0)),
+      // input_tokens 为净输入 (仅当 in > cr 才减, 避免异常数据归零), 与日志 in=in-cr 保持一致; 命中量由 cache_read_input_tokens 单独返回
+      input_tokens: pt > ct ? pt - ct : pt,
       output_tokens: u.completion_tokens ?? 0,
       ...(pd.cached_tokens !== undefined ? { cache_read_input_tokens: pd.cached_tokens } : {}),
       ...(pd.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: pd.cache_creation_input_tokens } : {}),
@@ -404,8 +408,11 @@ class StreamConverter {
     this.rawUsage = json.usage;
     const u = json.usage;
     const pd = u.prompt_tokens_details || {};
-    // input_tokens 存净输入 (总输入 - 缓存命中), 与日志 in=in-cr 及非流式 openAIToAnthropic 保持一致
-    if (u.prompt_tokens != null) this.usage.input_tokens = Math.max(0, u.prompt_tokens - (pd.cached_tokens ?? 0));
+    // input_tokens 存净输入 (仅当 in > cr 才减, 避免异常数据归零), 与日志 in=in-cr 及非流式 openAIToAnthropic 保持一致
+    if (u.prompt_tokens != null) {
+      const ct = pd.cached_tokens ?? 0;
+      this.usage.input_tokens = u.prompt_tokens > ct ? u.prompt_tokens - ct : u.prompt_tokens;
+    }
     if (u.completion_tokens != null) this.usage.output_tokens = u.completion_tokens;
     if (pd.cached_tokens !== undefined) this.cacheRead = pd.cached_tokens;
     if (pd.cache_creation_input_tokens !== undefined) this.cacheCreation = pd.cache_creation_input_tokens;

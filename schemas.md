@@ -257,7 +257,7 @@ User-Agent: claude-cli/2.0.0
 | `finish_reason:"tool_calls"` | `stop_reason:"tool_use"` |
 | `finish_reason:"length"` | `stop_reason:"max_tokens"` |
 | `finish_reason:"stop"/"end_turn"` | `stop_reason:"end_turn"` |
-| `usage.prompt_tokens` | `usage.input_tokens`（**净输入** = max(0, prompt_tokens − cached_tokens)，与日志 in=in-cr 一致） |
+| `usage.prompt_tokens` | `usage.input_tokens`（**净输入** = in > cr ? in − cr : in，即仅当总输入大于缓存命中才减，与日志 in=in-cr 一致） |
 | `usage.completion_tokens` | `usage.output_tokens` |
 | `prompt_tokens_details.cached_tokens` | `usage.cache_read_input_tokens` |
 | `prompt_tokens_details.cache_creation_input_tokens` | `usage.cache_creation_input_tokens` |
@@ -488,7 +488,7 @@ data: [DONE]
 | Local Response（Responses） | `input_tokens`、`output_tokens`、`total_tokens` |
 | 访问日志（RES 行） | `in`（**净输入** = 总输入 − 缓存命中）、`out`、`rt`（reasoning，已含在 out 内）、`cr`（缓存读）、`cw`（缓存写） |
 
-解析逻辑见 `normalizeUsage()`：`in = in - cr`（防负），`rt` 取自 `completion_tokens_details.reasoning_tokens`。
+解析逻辑见 `normalizeUsage()`：`in = in > cr ? in - cr : in`（仅当 in > cr 才减，异常数据保留原值），`rt` 取自 `completion_tokens_details.reasoning_tokens`。
 
 ---
 

@@ -1091,25 +1091,23 @@ function cStatus(code) {
   return cGreen(s);
 }
 
-/** 速度波段色: ts tokens/s — <20 红 / 20-39 橙 / 40-59 黄 / 60-79 绿 / >=80 亮绿 */
-function cSpeed(v) {
-  const s = `ts:${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")}/s`;
-  if (v >= 80) return cBrightGreen(s);
-  if (v >= 60) return cGreen(s);
-  if (v >= 40) return cYellow(s);
-  if (v >= 20) return cOrange(s);
-  return cRed(s);
+/** 速度波段色: <20 红 / 20-39 橙 / 40-59 黄 / 60-79 绿 / >=80 亮绿 (text 为整段含前缀/逗号, v 为数值) */
+function speedSegment(text, v) {
+  if (v >= 80) return cBrightGreen(text);
+  if (v >= 60) return cGreen(text);
+  if (v >= 40) return cYellow(text);
+  if (v >= 20) return cOrange(text);
+  return cRed(text);
 }
 
-/** 缓存命中率波段色: ch% — <60 红 / 60-79 橙 / 80-89 黄 / 90-94 绿 / 95-97 亮绿 / >=98 亮青 */
-function cCacheHit(pct) {
-  const s = pct + "%";
-  if (pct >= 98) return cBrightCyan(s);
-  if (pct >= 95) return cBrightGreen(s);
-  if (pct >= 90) return cGreen(s);
-  if (pct >= 80) return cYellow(s);
-  if (pct >= 60) return cOrange(s);
-  return cRed(s);
+/** 缓存命中率波段色: <60 红 / 60-79 橙 / 80-89 黄 / 90-94 绿 / 95-97 亮绿 / >=98 亮青 (text 为整段含前缀/逗号, pct 为数值) */
+function cacheSegment(text, pct) {
+  if (pct >= 98) return cBrightCyan(text);
+  if (pct >= 95) return cBrightGreen(text);
+  if (pct >= 90) return cGreen(text);
+  if (pct >= 80) return cYellow(text);
+  if (pct >= 60) return cOrange(text);
+  return cRed(text);
 }
 
 // 日志标签 (前缀着色)
@@ -1127,55 +1125,52 @@ function logTs(ms) {
 // 路由
 // ---------------------------------------------------------------------------
 
-// ---- 用量统计: Last10 滚动窗口 / Today 按天 / Total 进程累计 ----
-// 每 STATS_EVERY 个请求打印三行 (环境变量 CMC_STATS_EVERY 可调, 默认 10)
-const STATS_EVERY = parseInt(process.env.CMC_STATS_EVERY || "10", 10);
-const LAST10_N = 10;
-const dayKey = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-};
-const fmtNum = (n) =>
-  n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(n);
-const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0 });
-const stats = { day: null, today: zeroAgg(), total: zeroAgg(), last10: [] };
+// ---- 滚动用量统计: 最近 1 / 10 / 50 次请求的 ch(缓存命中率) 与 ts(速度) ----
+// 每次请求完成时输出, 值个数按历史请求数: 1 次显示 1 值 / 2-10 次显示 2 值 / >=11 次显示 3 值
+// 波段色按逗号分段, 逗号跟随其后的数值一起着色 (如 "ts:30/s"、",40/s"、",50/s")
+const RECENT_N = 50;
+const stats = { recent: [] };
 
-/** 打印一行统计 (字段全用冒号; ch=平均缓存命中率 cr/(in+cr), ch 与 ts 用波段色) */
-function statsLine(label, agg) {
-  if (!agg || !agg.req) return;
-  const totalIn = agg.in + agg.cr;
-  const chStr = totalIn > 0 ? cCacheHit(Math.round((agg.cr / totalIn) * 100)) : "-";
-  const tsStr = agg.ms > 0 ? cSpeed(agg.out / (agg.ms / 1000)) : "-";
-  console.log(
-    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ch:${chStr} ${tsStr}`
-  );
-}
-
-/** 打印三行统计: Last10 / Today / Total */
-/** 打印统计行: L10(最近10) / TOD(当天) / ALL(进程累计); 当天启动时 TOD 与 ALL 一致, 省略 ALL */
-function logStats() {
-  const l10 = { req: stats.last10.length };
-  for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
-    l10[k] = stats.last10.reduce((a, x) => a + (x[k] || 0), 0);
+/** 最近 n 个请求的聚合 */
+function winAgg(n) {
+  const slice = stats.recent.slice(-n);
+  const agg = { in: 0, out: 0, cr: 0, ms: 0 };
+  for (const r of slice) {
+    agg.in += r.in;
+    agg.out += r.out;
+    agg.cr += r.cr;
+    agg.ms += r.ms;
   }
-  statsLine("L10", l10);
-  statsLine("TOD", stats.today);
-  const same =
-    stats.today.req === stats.total.req &&
-    ["in", "out", "rt", "cr", "cw", "ms"].every((k) => stats.today[k] === stats.total[k]);
-  if (!same) statsLine("ALL", stats.total);
+  return agg;
 }
 
-/** 累计一条请求记录到三个维度 */
+/** 速度数字格式化: 整数去 .0 */
+const fmtSpeed = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, ""));
+
+/** 生成滚动统计串: "ch:56%,98%,99% ts:33/s,40/s,50/s" (ch 与 ts 各自波段色, 逗号分段着色) */
+function movingStatsStr() {
+  const n = stats.recent.length;
+  const levels = n >= 11 ? [1, 10, 50] : n >= 2 ? [1, 10] : [1];
+  const chParts = levels.map((win, i) => {
+    const w = winAgg(win);
+    const totalIn = w.in + w.cr;
+    const pct = totalIn > 0 ? Math.round((w.cr / totalIn) * 100) : 0;
+    const text = (i === 0 ? "ch:" : ",") + (totalIn > 0 ? pct + "%" : "-");
+    return cacheSegment(text, pct);
+  });
+  const tsParts = levels.map((win, i) => {
+    const w = winAgg(win);
+    const v = w.ms > 0 ? w.out / (w.ms / 1000) : 0;
+    const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
+    return speedSegment(text, v);
+  });
+  return ` ${chParts.join("")} ${tsParts.join("")}`;
+}
+
+/** 记录一条请求到滚动窗口 */
 function accumulate(rec) {
-  stats.today.req += 1;
-  stats.total.req += 1;
-  for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
-    stats.today[k] += rec[k];
-    stats.total[k] += rec[k];
-  }
-  stats.last10.push(rec);
-  if (stats.last10.length > LAST10_N) stats.last10.shift();
+  stats.recent.push(rec);
+  if (stats.recent.length > RECENT_N) stats.recent.shift();
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1241,7 +1236,6 @@ const server = http.createServer(async (req, res) => {
     // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
     const u = req._cmdc && req._cmdc.usage;
     let usageStr = "";
-    let tsStr = "";
     const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms };
     if (u) {
       const parts = [];
@@ -1256,19 +1250,9 @@ const server = http.createServer(async (req, res) => {
       rec.rt = u.reasoning ?? 0;
       rec.cr = u.cacheRead ?? 0;
       rec.cw = u.cacheWrite ?? 0;
-      // 速度: ts=out/took (tokens/s), 波段色: 红<20 橙20-39 黄40-59 绿60-79 亮绿>=80
-      if (u.output != null && ms >= 200) tsStr = ` ${cSpeed(u.output / (ms / 1000))}`;
-    }
-    // 统计累计
-    const day = dayKey();
-    if (stats.day !== day) {
-      logStats(); // 跨天: 先打印汇总
-      stats.day = day;
-      stats.today = zeroAgg();
     }
     accumulate(rec);
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(resModelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${tsStr}`);
-    if (stats.total.req % STATS_EVERY === 0) logStats();
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(resModelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${movingStatsStr()}`);
   });
 
   try {

@@ -5,10 +5,19 @@
   "upstream": "https://api.commandcode.ai/provider",
   "apiKey": "",
 
-  "_默认模型说明": "GOAT 订阅实测可用: deepseek/deepseek-v4-flash(默认) / deepseek/deepseek-v4-pro / gpt-5.6-sol / moonshotai/Kimi-K2.7-Code / moonshotai/Kimi-K3 / zai-org/GLM-5.2 / Qwen/Qwen3.8-Max / Qwen/Qwen3.7-Flash / MiniMaxAI/MiniMax-M3 / xai/grok-4.6 / xiaomi/mimo-v2.5-pro / tencent/hy3-paid。Claude 全系与 GPT-5.5 及以下需 Pro/Provider 计划。",
-  "defaultModel": "deepseek/deepseek-v4-flash",
+  "_默认模型说明": "defaultModels 为数组, 第一个模型作为默认模型。出错后按顺序逐个 fallback: 首个模型连续失败 3 次切换, 后续模型失败 1 次即切换(不重试), 全部轮完循环回到第一个。列表可调整顺序, 模型 id 见 /v1/models 接口。",
+  "defaultModels": [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
+    "z-ai/glm-5.3-flash",
+    "Qwen/Qwen3.8-27B",
+    "xiaomi/mimo-v2.5"
+  ],
 
-  "_模型映射说明": "key 是客户端请求的模型名, value 是实际转发到上游的模型名。未命中映射表且上游目录中不存在(含无前缀名匹配)的模型, 会 fallback 到 defaultModel。",
+  "_回退开关说明": "fallback: true 开启多模型轮换(默认); false 关闭, 始终只用 defaultModels 的第一个模型。",
+  "fallback": true,
+
+  "_模型映射说明": "key 是客户端请求的模型名, value 是实际转发到上游的模型名。未命中映射表且上游目录中不存在(含无前缀名匹配)的模型, 会 fallback 到 defaultModels 当前活动模型。",
   "modelMap": {
     "claude-sonnet-4-6": "deepseek/deepseek-v4-flash",
     "claude-sonnet-4-5": "deepseek/deepseek-v4-flash",
@@ -38,6 +47,8 @@
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.5",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "google/gemini-3.6-flash"
   ]
 }

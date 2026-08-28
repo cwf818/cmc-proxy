@@ -4,7 +4,8 @@
 
 - 零第三方依赖，仅需 Node.js ≥ 18（内置 `fetch`/`ReadableStream`）
 - 同时提供 **OpenAI 兼容**（`/v1/chat/completions`，供 Codex）与 **Anthropic 兼容**（`/v1/messages`，供 Claude Code）端点
-- 内置 **Anthropic ↔ OpenAI 协议转换**：GOAT 订阅不含任何 Claude 模型，Claude Code 的请求会自动转换格式并映射到你配置的模型上（默认 `gpt-5.6-sol`），流式 + 工具调用全链路支持
+- 内置 **Anthropic ↔ OpenAI 协议转换**：GOAT 订阅不含任何 Claude 模型，Claude Code 的请求会自动转换格式并映射到你配置的模型上（默认 `deepseek/deepseek-v4-flash`），流式 + 工具调用全链路支持
+- 内置 **多模型轮换 fallback**：`defaultModels` 数组按序轮换，首个模型连续失败 3 次自动切换下一个，后续模型失败 1 次即切换（不重试），全部轮完循环回第一个；可用 `fallback` 开关关闭
 - 支持流式 SSE 透传、token 用量上报、模型列表过滤
 
 ## 文件说明
@@ -12,11 +13,31 @@
 ```
 cmc-proxy/
 ├── proxy.js        # 主程序（反代 + 协议转换）
-├── config.json     # 配置：端口、API Key、模型映射
+├── config.json     # 配置：端口、API Key、模型映射（gitignore，不入库）
+├── config.example.json  # 配置模板
+├── build.js        # 构建脚本：导出 release 版本
 ├── start.bat       # Windows 启动脚本
 ├── start.sh        # macOS/Linux 启动脚本
+├── schemas.md      # 四阶段数据格式与样例参考（Local/Upstream 请求与响应）
+├── release/        # build 产物（gitignore，由 build.js 生成）
 └── README.md
 ```
+
+## 构建 Release
+
+`release/` 目录是构建产物（已 gitignore），由 `build.js` 生成，不要手动编辑：
+
+```bash
+node build.js                  # 导出到 release/，版本号自动取 git tag/commit
+node build.js --version v1.0.1 # 指定版本号
+node build.js --out dist       # 自定义输出目录
+```
+
+产物包含 `proxy.js`、`config.example.json`、`start.bat`、`start.sh`、`README.md` 与 `VERSION.txt`（版本 / 构建时间 / git commit / 文件校验和）。**不含 `config.json`**（含私有 apiKey）。拿到 release 后：
+
+1. 复制 `config.example.json` 为 `config.json`；
+2. 填入你的 apiKey，按需调整端口 / 模型映射；
+3. `start.bat`（Windows）或 `./start.sh`（macOS/Linux）启动。
 
 ## 快速开始
 
@@ -43,7 +64,7 @@ Claude Code 走 Anthropic 协议。设置环境变量后启动 `claude`：
 # Windows (PowerShell)
 $env:ANTHROPIC_BASE_URL="http://localhost:5411"
 $env:ANTHROPIC_AUTH_TOKEN="sk-local-any-value"
-# 不设置 ANTHROPIC_MODEL 时使用默认模型 deepseek/deepseek-v4-flash
+# 不设置 ANTHROPIC_MODEL 时使用默认模型（defaultModels 首个，出错自动轮换）
 claude
 
 # macOS / Linux
@@ -93,11 +114,15 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 | 模型 ID | 说明 |
 |---|---|
-| `deepseek/deepseek-v4-flash` | **默认模型**，DeepSeek V4，速度快性价比高 |
+| `deepseek/deepseek-v4-flash` | **默认模型**，DeepSeek V4 Flash，速度快性价比高 |
+| `deepseek/deepseek-v4-flash-vision-exp` | DeepSeek V4 Flash Vision（实验版，支持视觉） |
 | `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro |
+| `z-ai/glm-5.3-flash` | 智谱 GLM-5.3 Flash |
+| `Qwen/Qwen3.8-27B` | 阿里 Qwen 3.8 27B |
+| `xiaomi/mimo-v2.5` | 小米 MiMo V2.5 |
 | `gpt-5.6-sol` | GPT 编码/智能体能力强，Codex 系 |
 | `moonshotai/Kimi-K2.7-Code` / `moonshotai/Kimi-K3` | Kimi 编码系 |
-| `zai-org/GLM-5.2` | 智谱 GLM |
+| `zai-org/GLM-5.3` / `zai-org/GLM-5.2` | 智谱 GLM |
 | `Qwen/Qwen3.8-Max` / `Qwen/Qwen3.7-Flash` | 阿里 Qwen |
 | `MiniMaxAI/MiniMax-M3` | MiniMax |
 | `xai/grok-4.6` | Grok |
@@ -105,8 +130,40 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `tencent/hy3-paid` | 腾讯 |
 
 - 完整列表：`curl http://127.0.0.1:5411/v1/models`（已过滤 GOAT 不可用模型，`?raw=1` 看全量）。
-- 换模型：改 `config.json` 的 `defaultModel`，或在 `modelMap` 里把特定模型名映射到目标模型后重启。
+- 换模型：改 `config.json` 的 `defaultModels`（数组，第一个为默认模型），或在 `modelMap` 里把特定模型名映射到目标模型后重启。
 - GOAT 按订阅额度计费，模型实际可用性以上游返回为准。
+
+### 多模型轮换（fallback）
+
+`config.json` 的 `defaultModels` 是**数组**，第一个模型作为默认模型：
+
+```json
+{
+  "fallback": true,
+  "defaultModels": [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
+    "z-ai/glm-5.3-flash",
+    "Qwen/Qwen3.8-27B",
+    "xiaomi/mimo-v2.5"
+  ]
+}
+```
+
+轮换规则（全局生效，跨请求累计）：
+
+1. **首个模型**（`defaultModels[0]`）是默认模型；连续失败 **3 次**后切换到下一个。
+2. **后续 fallback 模型不重试**：失败 **1 次**即切换到下一个。
+3. **循环进行**：列表全部轮完后回到第一个模型，重新累计。
+4. **成功清零**：任一模型请求成功（上游 2xx）即清零其失败计数，避免偶发错误触发切换。
+
+"失败"指上游返回非 2xx（如 `MODEL_NOT_IN_PLAN`、5xx、429）或网络层错误；切换仅影响**下一次**请求使用的默认模型，当前失败请求仍按原样返回错误给客户端。切换时会打印日志：
+
+```
+[cmc-proxy] 模型 deepseek/deepseek-v4-flash 连续失败 3 次, 默认模型切换 → deepseek/deepseek-v4-flash-vision-exp
+```
+
+`fallback: false` 时关闭轮换，始终使用 `defaultModels[0]`。旧配置中的 `defaultModel` 字段仍兼容（视为单元素列表）。
 
 ### 模型匹配规则
 
@@ -114,7 +171,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 1. **显式映射表** `modelMap`：`claude-*`、`gpt-5.x-codex` 等已内置映射。
 2. **上游模型目录匹配**：精确匹配 → 大小写不敏感匹配 → **无前缀名匹配**（如 `deepseek-v4-flash` → `deepseek/deepseek-v4-flash`、`qwen3.8-max` → `Qwen/Qwen3.8-Max`）。
-3. **无任何匹配** → fallback 到 `defaultModel`（`deepseek/deepseek-v4-flash`）。
+3. **无任何匹配** → fallback 到 `defaultModels` 当前活动模型（默认是第一个）。
 
 因此本地客户端（尤其 Claude Code）可以直接用**不带前缀**的模型名，例如 `/model` 输入 `deepseek-v4-flash`、`kimi-k2.7-code` 等，都会被自动映射。
 
@@ -135,13 +192,13 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 
 ## 访问日志
 
-每个请求打印**两行日志**：`REQ` 行记录本地客户端发来的请求，`RES` 行记录外部上游返回的结果，便于对照感知请求与返回：
+每个请求打印**两行日志**：`REQ` 行记录本地客户端发来的请求，`RES` 行记录外部上游返回的结果，便于对照感知请求与返回。时间后跟 **会话编号**（如 `#3`），按 (src:port, ua) 区分本地 agent 进程并自增分配：
 
 ```
-[20:15:55.877] REQ POST /v1/messages src=127.0.0.1 ua=claude-cli/2.0.0 model=deepseek-v4-flash→deepseek/deepseek-v4-flash stream=1
-[20:15:58.232] RES 200 POST /v1/messages model=deepseek-v4-flash→deepseek/deepseek-v4-flash took=2.35s out=1736B
-[20:15:58.822] REQ POST /v1/chat/completions src=127.0.0.1 ua=codex/1.0.0 model=gpt-5.6-sol stream=0
-[20:16:00.510] RES 200 POST /v1/chat/completions model=gpt-5.6-sol took=1.69s out=567B
+[20:15:55.877]#3 REQ POST /v1/messages src=127.0.0.1:54321 ua=claude-cli/2.0.0 model=deepseek-v4-flash stream=1 body=186.5KB
+[20:15:58.232]#3 200 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ch:56%,98%,99% ts:241.3/s
+[20:15:58.822]#5 REQ POST /v1/chat/completions src=127.0.0.1:48721 ua=codex/1.0.0 model=gpt-5.6-sol stream=0 body=88B
+[20:16:00.510]#5 200 POST /v1/chat/completions took=1.69s out=567B in:987 out:45 cr:0 cw:0 gap:10 ch:40%,89%,95% ts:26.6/s
 ```
 
 字段说明：
@@ -149,13 +206,60 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 | 字段 | 含义 |
 |---|---|
 | `REQ` / `RES` | 本地请求到达 / 外部返回完成 |
+| `#编号`（时间后） | 会话编号：**优先按 `x-claude-code-session-id`**（Claude Code 每个会话唯一的 UUID）区分本地 agent 会话，跨连接稳定；无该头的客户端（Codex、curl 等）回退按 `src:端口 + ua` 近似区分。仅 model 类请求（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`）计入会话，非 model 请求（健康检查等）无编号 |
 | `status` / `method` / `path` | HTTP 状态码、方法与路径（`RES` 行含状态码） |
-| `src` | 客户端 IP（仅 `REQ` 行） |
+| `src` | 客户端 IP:源端口（仅 `REQ` 行；端口用于区分同 ua 的不同进程/连接） |
 | `ua` | 客户端 User-Agent（`claude-cli/*` 即 Claude Code，`codex/*` 即 Codex） |
-| `model` | 请求模型 → 实际转发的上游模型（`→` 表示发生了模型映射） |
+| `model` | 仅 `REQ` 行显示**本地请求的模型名**（如 `deepseek-v4-flash`）；`RES` 行只在**实际转发的模型名与本地名不同**时显示转发名（如 `deepseek/deepseek-v4-flash`），字符串相同时省略 —— 两行对照即知映射关系。**按模型名字符串哈希着色**：同模型恒同色、不同模型尽量异色，扫日志时可按颜色快速归类模型 |
 | `stream` | 是否为流式请求（1 流式 / 0 非流式，仅 `REQ` 行） |
+| `body` | 请求体大小（仅 `REQ` 行；用于区分两条请求是否完全相同：工具循环的请求体会递增，客户端重试的请求体一致） |
 | `took` | 总耗时（含上游推理时间，仅 `RES` 行） |
 | `out` | 响应输出字节数（仅 `RES` 行） |
+| `in:` / `out:` | 输入 / 输出 tokens。**`in:` 为净输入**（已扣除缓存命中部分，即按原价计费的量；流式与非流式、转换与透传路径均解析；上游未返回时缺省） |
+| `rt:` | 思考 tokens（`reasoning_tokens`，DeepSeek 系常见，已包含在 `out:` 中，仅上游返回时出现） |
+| `cr:` / `cw:` | 缓存读取（`cached_tokens`） / 缓存写入（`cache_creation_input_tokens`） tokens，命中缓存可大幅省钱。`in:` + `cr:` = 总输入 |
+| `gap:` | **低缓存间隔**：仅当本次缓存命中率 `cr ÷ (in + cr)` < 50% 时输出，值为本次与**该会话最近一次**低缓存命中请求的**请求序号差**（会话内序号只对有 usage 的请求递增，与 `ch` 统计同口径）。会话内**首次**低缓存只记录基准、不输出 `gap` |
+| `ts:` | 生成速度：`输出 tokens ÷ 总耗时`（含上游推理；仅 `RES` 行、上游返回 usage 且耗时 ≥200ms 时出现）。按速度**波段着色**：<20 红 / 20–39 橙 / 40–59 黄 / 60–79 绿 / ≥80 亮绿 |
+
+> 流式请求上游默认不返回 usage，需请求体带 `stream_options: {"include_usage": true}` —— Claude Code / Codex 转换路径已自动带上；直接调用 `/v1/chat/completions` 的客户端需自行加该参数才能在日志中看到用量。
+
+### 用量统计
+
+**1. 滚动统计（每次请求输出）**
+
+每次请求完成时，在 `RES` 行末尾追加**最近 1 / 10 / 50 次请求**的缓存命中率与速度。**仅在本次请求为 200 且解析到 usage（输出 `in:/out:/rt:/cr:/cw:`）时追加**，无 usage 的请求（如健康检查、未返回用量的透传）不显示：
+
+```
+[20:16:30.000]#3 200 POST /v1/messages took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 gap:10 ch:56%,98%,99% ts:33/s,40/s,50/s
+```
+
+- 值个数随历史请求数变化：**1 次显示 1 值 → 2–10 次显示 2 值 → ≥11 次显示 3 值**
+- 每个值对应滚动窗口：第 1 个 = 最近 1 次，第 2 个 = 最近 10 次，第 3 个 = 最近 50 次（仅计入有 usage 的请求）
+- `gap:` 出现在 `ch` 之前：仅当本次缓存命中率（即 `ch` 第 1 个值）< 50% 时输出，值为与同会话最近一次低缓存命中请求的序号差（首次低缓存只记录基准、不输出）
+
+| 字段 | 含义 |
+|---|---|
+| `gap` | 两次 `cachehit < 50%` 请求的**序号差**（会话内、仅计有 usage 的请求），如 `gap:10` 表示距上一次低缓存命中间隔了 10 次有效请求。红色高亮，便于快速定位低缓存频率 |
+| `ch` | 缓存命中率 = `cr ÷ (in + cr)`，**波段色**（与 ts 同 5 档结构）：<60 红 / 60–79 橙 / 80–89 黄 / 90–94 绿 / ≥95 亮绿 |
+| `ts` | 生成速度（tokens/s），**波段色**：<20 红 / 20–39 橙 / 40–59 黄 / 60–79 绿 / ≥80 亮绿 |
+
+> 波段色按逗号分段：逗号跟随其后的数值一起着色（如 `ts:33/s`、`,40/s`、`,50/s` 各自独立着色）。
+
+**2. TOD / ALL 累计（每 10 个请求打印）**
+
+```
+[20:16:30.000] STATS TOD req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
+[20:16:30.000] STATS ALL req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% ts:210.1/s
+```
+
+| 行 | 范围 | 说明 |
+|---|---|---|
+| `TOD` | 当天累计（按自然日） | 跨天自动先打印上日汇总 |
+| `ALL` | 进程启动以来累计 | **当天启动时与 TOD 一致，自动省略** |
+
+- 字段含义与滚动统计相同；数字超 1K/1M 自动缩写
+- 打印频率可用环境变量 `CMC_STATS_EVERY` 调整（默认 10）
+- 统计为内存态，进程重启后清零
 
 ## 常见问题
 
@@ -165,7 +269,7 @@ Get-NetTCPConnection -LocalPort 5411 -State Listen | Stop-Process
 ```
 或改 `config.json` 的 `port`。
 
-**请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用，换 `defaultModel` 或映射到可用模型。
+**请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用。此错误会计入轮换失败次数，连续达阈值后自动切换到 `defaultModels` 中的下一个模型；也可以手动调整 `defaultModels` 或 `modelMap` 映射到可用模型。
 
 **想用真正的 Claude 模型** — 需要升级 Pro/Provider 计划；升级后在 `modelMap` 中把 `claude-*` 映射为真实 Claude 模型名（如 `claude-sonnet-4-6`）即可直连上游 `/messages`。
 

@@ -1067,6 +1067,7 @@ const C = {
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   blue: "\x1b[34m",
+  magenta: "\x1b[35m",
   cyan: "\x1b[36m",
   dim: "\x1b[2m",
 };
@@ -1076,10 +1077,21 @@ const cRed = paint(C.red);
 const cGreen = paint(C.green);
 const cYellow = paint(C.yellow);
 const cCyan = paint(C.cyan);
+const cMagenta = paint(C.magenta);
 const cDim = paint(C.dim);
 const cBlue = paint(C.blue);
 const cOrange = paint("\x1b[38;5;208m"); // 256 色橙
 const cBrightGreen = paint("\x1b[92m"); // 亮绿
+
+/** 字符串哈希 (djb2 变体), 用于 model 名 -> 颜色映射 */
+function hashCode(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) >>> 0;
+  return h;
+}
+/** model 块颜色: 按模型字符串哈希到一组高辨识度颜色 —— 同模型恒同色, 不同模型尽量异色 */
+const MODEL_COLORS = [cCyan, cMagenta, cYellow, cGreen, cBlue, cOrange, cBrightGreen];
+const modelColor = (name) => MODEL_COLORS[hashCode(name) % MODEL_COLORS.length];
 
 /** 按 HTTP 状态码着色: 2xx 绿 / 4xx 黄 / 5xx 红 */
 function cStatus(code) {
@@ -1211,6 +1223,27 @@ function accumulate(rec, trackRolling) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 会话跟踪 (按本地 agent 进程区分, 自增编号)
+// ---------------------------------------------------------------------------
+// 会话 key 优先用 x-claude-code-session-id (Claude Code 每会话唯一 UUID, 跨连接稳定),
+// 无该头时回退 src:port + ua (Codex/curl 等, 靠 TCP 源端口近似区分进程);
+// 每个会话维护:
+//   id              —— 自增会话编号 (日志时间后显示 #id, 如 [08:28:48.943]#22)
+//   seq             —— 请求序号 (仅对解析到 usage 的请求递增, 与 ch 滚动统计同口径)
+//   lastLowCacheSeq —— 最近一次 cachehit<50% 的请求序号 (用于计算 gap)
+const MODEL_PATHS = ["/v1/messages", "/v1/chat/completions", "/v1/responses"];
+const sessions = new Map();
+let nextSessionId = 1;
+function getSession(key) {
+  let s = sessions.get(key);
+  if (!s) {
+    s = { id: nextSessionId++, seq: 0, lastLowCacheSeq: null };
+    sessions.set(key, s);
+  }
+  return s;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = url.pathname;
@@ -1219,18 +1252,29 @@ const server = http.createServer(async (req, res) => {
   const startAt = Date.now();
   const srcIp = req.socket.remoteAddress || "-";
   req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false, usage: null, bodyBytes: 0 };
+  // 会话归属: 仅 model 类请求计入会话, 自增编号。
+  // 会话 key 优先级:
+  //   1) x-claude-code-session-id —— Claude Code 每个会话唯一的 UUID (如 6bc792ae-...),
+  //      跨连接稳定, 可精确区分两个 Claude Code 进程/会话窗口
+  //   2) 回退 src:remotePort + User-Agent —— Codex / curl 等无该头, 用 TCP 源端口近似区分
+  const ccSessionId = req.headers["x-claude-code-session-id"];
+  const sessionKey = ccSessionId
+    ? `cc:${ccSessionId}`
+    : `${srcIp}:${req.socket.remotePort || "-"}|${req.headers["user-agent"] || "-"}`;
+  // 注意: 放在闭包变量而非 req._cmdc —— 路由分支会重建 req._cmdc, 直接赋值会丢失 session
+  const session = MODEL_PATHS.includes(pathname) ? getSession(sessionKey) : null;
   let outBytes = 0;
   const uaShort = () => (req.headers["user-agent"] || "-").slice(0, 48);
-  // REQ 行: 只显示本地请求的模型名 (前半), 映射关系留给 RES 行对照
+  // REQ 行: 只显示本地请求的模型名 (前半), 映射关系留给 RES 行对照; 颜色按模型名哈希
   const reqModelPart = () => {
     const c = req._cmdc;
-    return c && c.model ? ` model=${c.model}` : "";
+    return c && c.model ? modelColor(c.model)(` model=${c.model}`) : "";
   };
-  // RES 行: 只显示实际转发的模型名 (后半); 与本地请求名完全相同(字符串相等)时省略
+  // RES 行: 只显示实际转发的模型名 (后半); 与本地请求名完全相同(字符串相等)时省略; 颜色按模型名哈希
   const resModelPart = () => {
     const c = req._cmdc;
     if (!c || !c.mapped || c.mapped === c.model) return "";
-    return ` model=${c.mapped}`;
+    return modelColor(c.mapped)(` model=${c.mapped}`);
   };
   const streamPart = () => {
     const c = req._cmdc;
@@ -1242,10 +1286,27 @@ const server = http.createServer(async (req, res) => {
     const bb = req._cmdc.bodyBytes;
     return bb ? ` body=${fmtBytes(bb)}` : "";
   };
+  // 会话编号标签: 非 model 请求无会话, 返回空串
+  const sessTag = () => {
+    return session ? `#${session.id}` : "";
+  };
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
-    console.log(`${cDim(`[${logTs(startAt)}]`)} ${cCyan("REQ")} ${req.method} ${pathname} src=${srcIp} ua=${uaShort()}${cYellow(reqModelPart())}${streamPart()}${cDim(bodyPart())}`);
+    console.log(`${cDim(`[${logTs(startAt)}]${sessTag()}`)} ${cCyan("REQ")} ${req.method} ${pathname} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${reqModelPart()}${streamPart()}${cDim(bodyPart())}`);
+    // CMC_DEBUG_PAYLOAD=1: 打印本地请求完整请求头与 body 原文 (排查会话标识等)
+    if (process.env.CMC_DEBUG_PAYLOAD === "1") {
+      const headers = {};
+      for (const [k, v] of Object.entries(req.headers)) headers[k] = v;
+      console.log(`[payload] ${req.method} ${pathname} headers=${JSON.stringify(headers)}`);
+      const raw = req._cmdc.rawBody || "";
+      try {
+        const keys = Object.keys(JSON.parse(raw));
+        console.log(`[payload] bodyKeys=${keys.join(",")}`);
+      } catch { /* 非 JSON 则跳过 */ }
+      const MAX = 8000;
+      console.log(`[payload] body(${Buffer.byteLength(raw)}B)=${raw.length > MAX ? raw.slice(0, MAX) + `...[截断 显示${MAX}B/共${raw.length}B]` : raw}`);
+    }
   };
   {
     const origWrite = res.write.bind(res);
@@ -1282,7 +1343,7 @@ const server = http.createServer(async (req, res) => {
       if (u.reasoning != null) parts.push(`rt:${u.reasoning}`);
       if (u.cacheRead != null) parts.push(`cr:${u.cacheRead}`);
       if (u.cacheWrite != null) parts.push(`cw:${u.cacheWrite}`);
-      if (parts.length) usageStr = ` ${cGreen(parts.join(" "))}`;
+      if (parts.length) usageStr = ` ${parts.join(" ")}`;
       rec.in = u.input ?? 0;
       rec.out = u.output ?? 0;
       rec.rt = u.reasoning ?? 0;
@@ -1297,15 +1358,27 @@ const server = http.createServer(async (req, res) => {
       stats.today = zeroAgg();
     }
     accumulate(rec, !!usageStr);
+    // 会话请求序号: 仅对有 usage 的请求递增 (与 ch 滚动统计同口径)。
+    // cachehit<50% 时计算与最近一次低缓存命中请求的序号差 gap, 输出在 ch 前 (首次低缓存只记录基准, 不输出 gap)
+    let gapStr = "";
+    if (usageStr && session) {
+      session.seq += 1;
+      const totalIn = rec.in + rec.cr;
+      const pct = totalIn > 0 ? Math.round((rec.cr / totalIn) * 100) : 0;
+      if (pct < 50) {
+        if (session.lastLowCacheSeq != null) gapStr = ` ${cRed(`gap:${session.seq - session.lastLowCacheSeq}`)}`;
+        session.lastLowCacheSeq = session.seq;
+      }
+    }
     // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加
     const movingStr = usageStr ? movingStatsStr() : "";
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${cYellow(resModelPart())} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${movingStr}`);
+    console.log(`${cDim(`[${logTs(Date.now())}]${sessTag()}`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 
   try {
     // 非模型类 body 路径 (GET 等): 立即打印本地请求日志
-    const isModelBodyPath = pathname === "/v1/messages" || pathname === "/v1/chat/completions" || pathname === "/v1/responses";
+    const isModelBodyPath = MODEL_PATHS.includes(pathname);
     if (!isModelBodyPath) logReq();
 
     // 健康检查
@@ -1348,6 +1421,7 @@ const server = http.createServer(async (req, res) => {
       const isStream = !!body.stream;
       req._cmdc = { model: requested, mapped, stream: isStream };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
+      req._cmdc.rawBody = bodyRaw || "";
       logReq();
 
       if (useAnthropicEndpoint) {
@@ -1438,6 +1512,7 @@ const server = http.createServer(async (req, res) => {
       if (body.model) body.model = resolveModel(body.model);
       req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
+      req._cmdc.rawBody = bodyRaw || "";
       logReq();
       const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
         method: "POST",
@@ -1459,6 +1534,7 @@ const server = http.createServer(async (req, res) => {
       const isStream = !!body.stream;
       req._cmdc = { model: requested, mapped, stream: isStream };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
+      req._cmdc.rawBody = bodyRaw || "";
       logReq();
 
       const chatReq = responsesToChatRequest(body);

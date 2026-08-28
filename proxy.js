@@ -33,7 +33,8 @@ function loadConfig() {
     host: "127.0.0.1",
     upstream: "https://api.commandcode.ai/provider",
     apiKey: "",
-    defaultModel: "gpt-5.6-sol",
+    fallback: true,
+    defaultModels: ["deepseek/deepseek-v4-flash"],
     modelMap: {},
     blockedModels: [],
   };
@@ -61,17 +62,56 @@ if (!API_KEY) {
 // 模型解析
 // ---------------------------------------------------------------------------
 const modelMap = config.modelMap || {};
-const DEFAULT_MODEL = config.defaultModel || "deepseek/deepseek-v4-flash";
+
+// ---- 多模型轮换 (defaultModels, 数组格式) ----
+// 第一个模型作为默认模型; 出错达阈值后逐个 fallback, 后续模型不重试(失败 1 次即切换), 循环进行。
+// 兼容旧配置: 仅配置 defaultModel 时自动视为单元素数组。
+const defaultModels = (Array.isArray(config.defaultModels) && config.defaultModels.length)
+  ? config.defaultModels
+  : [config.defaultModel || "deepseek/deepseek-v4-flash"];
+
+// fallback 开关: 默认开启; 关闭时永远使用 defaultModels[0], 不做任何切换
+const FALLBACK_ENABLED = config.fallback !== false;
+
+// 轮换状态 (全局, 跨请求): 当前活动模型下标 + 失败计数
+let activeModelIdx = 0;
+let activeModelFails = 0;
+const FIRST_FAIL_LIMIT = 3; // 第一个(默认)模型: 连续失败 3 次后切换
+const OTHER_FAIL_LIMIT = 1; // fallback 模型: 失败 1 次即切换, 不重试
+
+/** 当前应使用的默认模型 (初始为列表第一个) */
+function currentDefaultModel() {
+  return defaultModels[activeModelIdx % defaultModels.length];
+}
+
+/** 一次请求失败时调用: 达到阈值则切到下一个模型并返回 true (列表轮完回到第一个, 循环进行) */
+function onRequestFail() {
+  if (!FALLBACK_ENABLED || defaultModels.length < 2) return false;
+  const limit = activeModelIdx === 0 ? FIRST_FAIL_LIMIT : OTHER_FAIL_LIMIT;
+  activeModelFails += 1;
+  if (activeModelFails < limit) return false;
+  const from = defaultModels[activeModelIdx];
+  activeModelIdx = (activeModelIdx + 1) % defaultModels.length;
+  activeModelFails = 0;
+  const to = defaultModels[activeModelIdx];
+  console.warn(TAGW, `模型 ${from} 连续失败 ${limit} 次, 默认模型切换 → ${to}${activeModelIdx === 0 ? " (已循环回到第一个)" : ""}`);
+  return true;
+}
+
+/** 一次请求成功时调用: 清零当前模型失败计数 */
+function onRequestOk() {
+  activeModelFails = 0;
+}
 
 /**
  * 模型解析 helper:
  *   1. modelMap 显式映射优先
  *   2. 上游模型目录匹配: 精确 / 去前缀(无前缀名) / 大小写不敏感
  *      例: deepseek-v4-flash -> deepseek/deepseek-v4-flash, qwen3.8-max -> Qwen/Qwen3.8-Max
- *   3. 无任何匹配 -> fallback 到默认模型 (defaultModel)
+ *   3. 无任何匹配 -> fallback 到当前默认模型 (defaultModels 轮换指针)
  */
 function resolveModel(requested) {
-  if (!requested) return DEFAULT_MODEL;
+  if (!requested) return currentDefaultModel();
 
   // 1. 显式映射表
   if (modelMap[requested]) return modelMap[requested];
@@ -90,8 +130,8 @@ function resolveModel(requested) {
     }
   }
 
-  // 3. 无匹配 -> 默认模型 (GOAT 无 Claude 模型, claude-* 也会落到这里)
-  return DEFAULT_MODEL;
+  // 3. 无匹配 -> 当前默认模型 (GOAT 无 Claude 模型, claude-* 也会落到这里)
+  return currentDefaultModel();
 }
 
 /** 判断某模型是否需要走 Anthropic /messages 端点 (Claude 系) */
@@ -1008,6 +1048,25 @@ function buildUpstreamHeaders(req, extra) {
 }
 
 /**
+ * 发起上游请求并统一处理模型轮换计数:
+ *   - fetch 网络层抛错 / 上游返回非 2xx → 计一次失败 (onRequestFail, 达到阈值自动切换默认模型)
+ *   - 上游 2xx → 清零失败计数 (onRequestOk)
+ * 调用方无需重复计数; 网络抛错时原样向上抛, 由调用方返回 502。
+ */
+async function upstreamFetch(url, init) {
+  let r;
+  try {
+    r = await fetch(url, init);
+  } catch (e) {
+    onRequestFail();
+    throw e;
+  }
+  if (!r.ok) onRequestFail();
+  else onRequestOk();
+  return r;
+}
+
+/**
  * 通用透传: 把上游响应(含流式)转发给客户端。
  * opts.collectUsage 存在时, 顺带从响应中提取 usage 对象 (流式扫描 SSE 事件, 非流式解析 JSON),
  * 不改变转发语义, 仅用于访问日志输出。
@@ -1415,7 +1474,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/v1/messages" && req.method === "POST") {
       const bodyRaw = await readBody(req);
       const body = JSON.parse(bodyRaw || "{}");
-      const requested = body.model || DEFAULT_MODEL;
+      const requested = body.model || currentDefaultModel();
       const mapped = resolveModel(requested);
       const useAnthropicEndpoint = isClaudeModel(mapped);
       const isStream = !!body.stream;
@@ -1427,30 +1486,52 @@ const server = http.createServer(async (req, res) => {
       if (useAnthropicEndpoint) {
         // Claude 模型 -> 直接走上游 /messages
         body.model = mapped;
-        const up = await fetch(`${UPSTREAM}/v1/messages`, {
-          method: "POST",
-          headers: buildUpstreamHeaders(req, {
-            "Content-Type": "application/json",
-            "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
-          }),
-          body: JSON.stringify(body),
-        });
+        let up;
+        try {
+          up = await upstreamFetch(`${UPSTREAM}/v1/messages`, {
+            method: "POST",
+            headers: buildUpstreamHeaders(req, {
+              "Content-Type": "application/json",
+              "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
+            }),
+            body: JSON.stringify(body),
+          });
+        } catch (e) {
+          console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + e.message } }));
+          return;
+        }
+        if (!up.ok) {
+          // upstreamFetch 已计失败并可能切换默认模型
+          await passThrough(res, up);
+          return;
+        }
         await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); } });
         return;
       }
 
       // 非 Claude 模型 -> Anthropic -> OpenAI 协议转换
       const oaiReq = anthropicToOpenAIRequest(body);
-      const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
-        method: "POST",
-        headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
-        body: JSON.stringify(oaiReq),
-      });
+      let up;
+      try {
+        up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
+          method: "POST",
+          headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
+          body: JSON.stringify(oaiReq),
+        });
+      } catch (e) {
+        console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + e.message } }));
+        return;
+      }
 
       if (!isStream) {
         // 非流式: 整体转换
         const text = await up.text();
         if (!up.ok) {
+          // upstreamFetch 已计失败并可能切换默认模型
           res.writeHead(up.status, { "Content-Type": up.headers.get("content-type") || "application/json" });
           res.end(text);
           return;
@@ -1508,17 +1589,26 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/v1/chat/completions" && req.method === "POST") {
       const bodyRaw = await readBody(req);
       const body = JSON.parse(bodyRaw || "{}");
-      const requested = body.model || DEFAULT_MODEL;
+      const requested = body.model || currentDefaultModel();
       if (body.model) body.model = resolveModel(body.model);
       req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
       logReq();
-      const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
-        method: "POST",
-        headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
-        body: JSON.stringify(body),
-      });
+      let up;
+      try {
+        up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
+          method: "POST",
+          headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
+          body: JSON.stringify(body),
+        });
+      } catch (e) {
+        console.warn(TAGW, `上游请求失败 (${body.model}): ${e.message}`);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "上游请求失败: " + e.message, type: "api_error" } }));
+        return;
+      }
+      // upstreamFetch 已处理失败/成功计数 (非 2xx 已计失败并可能切换默认模型)
       await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); } });
       return;
     }
@@ -1529,7 +1619,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/v1/responses" && req.method === "POST") {
       const bodyRaw = await readBody(req);
       const body = JSON.parse(bodyRaw || "{}");
-      const requested = body.model || DEFAULT_MODEL;
+      const requested = body.model || currentDefaultModel();
       const mapped = resolveModel(requested);
       const isStream = !!body.stream;
       req._cmdc = { model: requested, mapped, stream: isStream };
@@ -1538,15 +1628,24 @@ const server = http.createServer(async (req, res) => {
       logReq();
 
       const chatReq = responsesToChatRequest(body);
-      const up = await fetch(`${UPSTREAM}/v1/chat/completions`, {
-        method: "POST",
-        headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
-        body: JSON.stringify(chatReq),
-      });
+      let up;
+      try {
+        up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
+          method: "POST",
+          headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
+          body: JSON.stringify(chatReq),
+        });
+      } catch (e) {
+        console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "上游请求失败: " + e.message, type: "api_error" } }));
+        return;
+      }
 
       if (!isStream) {
         const text = await up.text();
         if (!up.ok) {
+          // upstreamFetch 已计失败并可能切换默认模型
           res.writeHead(up.status, { "Content-Type": up.headers.get("content-type") || "application/json" });
           res.end(text);
           return;
@@ -1633,7 +1732,8 @@ server.listen(PORT, HOST, () => {
   console.log(cBlue("  cmc-proxy 已启动"));
   console.log(cBlue(`  监听地址   : http://${HOST}:${PORT}`));
   console.log(cBlue(`  上游端点   : ${UPSTREAM}`));
-  console.log(cBlue(`  默认模型   : ${DEFAULT_MODEL}`));
+  console.log(cBlue(`  默认模型   : ${currentDefaultModel()}  (轮换列表: ${defaultModels.join(" → ")})`));
+  console.log(cBlue(`  模型回退   : ${FALLBACK_ENABLED ? `开启 (首个模型失败 ${FIRST_FAIL_LIMIT} 次后逐一切换, 后续模型失败 ${OTHER_FAIL_LIMIT} 次即切换, 循环)` : "关闭 (始终使用第一个模型)"}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
   console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));

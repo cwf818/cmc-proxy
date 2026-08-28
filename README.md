@@ -4,7 +4,8 @@
 
 - 零第三方依赖，仅需 Node.js ≥ 18（内置 `fetch`/`ReadableStream`）
 - 同时提供 **OpenAI 兼容**（`/v1/chat/completions`，供 Codex）与 **Anthropic 兼容**（`/v1/messages`，供 Claude Code）端点
-- 内置 **Anthropic ↔ OpenAI 协议转换**：GOAT 订阅不含任何 Claude 模型，Claude Code 的请求会自动转换格式并映射到你配置的模型上（默认 `gpt-5.6-sol`），流式 + 工具调用全链路支持
+- 内置 **Anthropic ↔ OpenAI 协议转换**：GOAT 订阅不含任何 Claude 模型，Claude Code 的请求会自动转换格式并映射到你配置的模型上（默认 `deepseek/deepseek-v4-flash`），流式 + 工具调用全链路支持
+- 内置 **多模型轮换 fallback**：`defaultModels` 数组按序轮换，首个模型连续失败 3 次自动切换下一个，后续模型失败 1 次即切换（不重试），全部轮完循环回第一个；可用 `fallback` 开关关闭
 - 支持流式 SSE 透传、token 用量上报、模型列表过滤
 
 ## 文件说明
@@ -63,7 +64,7 @@ Claude Code 走 Anthropic 协议。设置环境变量后启动 `claude`：
 # Windows (PowerShell)
 $env:ANTHROPIC_BASE_URL="http://localhost:5411"
 $env:ANTHROPIC_AUTH_TOKEN="sk-local-any-value"
-# 不设置 ANTHROPIC_MODEL 时使用默认模型 deepseek/deepseek-v4-flash
+# 不设置 ANTHROPIC_MODEL 时使用默认模型（defaultModels 首个，出错自动轮换）
 claude
 
 # macOS / Linux
@@ -113,11 +114,15 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 | 模型 ID | 说明 |
 |---|---|
-| `deepseek/deepseek-v4-flash` | **默认模型**，DeepSeek V4，速度快性价比高 |
+| `deepseek/deepseek-v4-flash` | **默认模型**，DeepSeek V4 Flash，速度快性价比高 |
+| `deepseek/deepseek-v4-flash-vision-exp` | DeepSeek V4 Flash Vision（实验版，支持视觉） |
 | `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro |
+| `z-ai/glm-5.3-flash` | 智谱 GLM-5.3 Flash |
+| `Qwen/Qwen3.8-27B` | 阿里 Qwen 3.8 27B |
+| `xiaomi/mimo-v2.5` | 小米 MiMo V2.5 |
 | `gpt-5.6-sol` | GPT 编码/智能体能力强，Codex 系 |
 | `moonshotai/Kimi-K2.7-Code` / `moonshotai/Kimi-K3` | Kimi 编码系 |
-| `zai-org/GLM-5.2` | 智谱 GLM |
+| `zai-org/GLM-5.3` / `zai-org/GLM-5.2` | 智谱 GLM |
 | `Qwen/Qwen3.8-Max` / `Qwen/Qwen3.7-Flash` | 阿里 Qwen |
 | `MiniMaxAI/MiniMax-M3` | MiniMax |
 | `xai/grok-4.6` | Grok |
@@ -125,8 +130,40 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `tencent/hy3-paid` | 腾讯 |
 
 - 完整列表：`curl http://127.0.0.1:5411/v1/models`（已过滤 GOAT 不可用模型，`?raw=1` 看全量）。
-- 换模型：改 `config.json` 的 `defaultModel`，或在 `modelMap` 里把特定模型名映射到目标模型后重启。
+- 换模型：改 `config.json` 的 `defaultModels`（数组，第一个为默认模型），或在 `modelMap` 里把特定模型名映射到目标模型后重启。
 - GOAT 按订阅额度计费，模型实际可用性以上游返回为准。
+
+### 多模型轮换（fallback）
+
+`config.json` 的 `defaultModels` 是**数组**，第一个模型作为默认模型：
+
+```json
+{
+  "fallback": true,
+  "defaultModels": [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
+    "z-ai/glm-5.3-flash",
+    "Qwen/Qwen3.8-27B",
+    "xiaomi/mimo-v2.5"
+  ]
+}
+```
+
+轮换规则（全局生效，跨请求累计）：
+
+1. **首个模型**（`defaultModels[0]`）是默认模型；连续失败 **3 次**后切换到下一个。
+2. **后续 fallback 模型不重试**：失败 **1 次**即切换到下一个。
+3. **循环进行**：列表全部轮完后回到第一个模型，重新累计。
+4. **成功清零**：任一模型请求成功（上游 2xx）即清零其失败计数，避免偶发错误触发切换。
+
+"失败"指上游返回非 2xx（如 `MODEL_NOT_IN_PLAN`、5xx、429）或网络层错误；切换仅影响**下一次**请求使用的默认模型，当前失败请求仍按原样返回错误给客户端。切换时会打印日志：
+
+```
+[cmc-proxy] 模型 deepseek/deepseek-v4-flash 连续失败 3 次, 默认模型切换 → deepseek/deepseek-v4-flash-vision-exp
+```
+
+`fallback: false` 时关闭轮换，始终使用 `defaultModels[0]`。旧配置中的 `defaultModel` 字段仍兼容（视为单元素列表）。
 
 ### 模型匹配规则
 
@@ -134,7 +171,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 1. **显式映射表** `modelMap`：`claude-*`、`gpt-5.x-codex` 等已内置映射。
 2. **上游模型目录匹配**：精确匹配 → 大小写不敏感匹配 → **无前缀名匹配**（如 `deepseek-v4-flash` → `deepseek/deepseek-v4-flash`、`qwen3.8-max` → `Qwen/Qwen3.8-Max`）。
-3. **无任何匹配** → fallback 到 `defaultModel`（`deepseek/deepseek-v4-flash`）。
+3. **无任何匹配** → fallback 到 `defaultModels` 当前活动模型（默认是第一个）。
 
 因此本地客户端（尤其 Claude Code）可以直接用**不带前缀**的模型名，例如 `/model` 输入 `deepseek-v4-flash`、`kimi-k2.7-code` 等，都会被自动映射。
 
@@ -232,7 +269,7 @@ Get-NetTCPConnection -LocalPort 5411 -State Listen | Stop-Process
 ```
 或改 `config.json` 的 `port`。
 
-**请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用，换 `defaultModel` 或映射到可用模型。
+**请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用。此错误会计入轮换失败次数，连续达阈值后自动切换到 `defaultModels` 中的下一个模型；也可以手动调整 `defaultModels` 或 `modelMap` 映射到可用模型。
 
 **想用真正的 Claude 模型** — 需要升级 Pro/Provider 计划；升级后在 `modelMap` 中把 `claude-*` 映射为真实 Claude 模型名（如 `claude-sonnet-4-6`）即可直连上游 `/messages`。
 

@@ -20,7 +20,7 @@
 ```
 
 所有路径都会做两件统一的事：
-1. **模型映射**：`body.model` 经 `resolveModel()` 解析（显式映射表 → 上游目录匹配 → fallback 默认 `deepseek/deepseek-v4-flash`）
+1. **模型映射**：`body.model` 经 `resolveModel()` 解析（显式映射表 → 上游目录匹配 → fallback 默认 `defaultModels` 当前活动模型；数组首个为默认，首个连续失败 3 次后逐一切换、后续模型失败 1 次即切换、循环进行，`fallback:false` 可关闭）
 2. **Key 注入**：`buildUpstreamHeaders()` 强制写入 `Authorization: Bearer <apiKey>`（覆盖客户端传的任何值），并保留客户端的 `x-api-key`
 
 另外非流式转换路径与透传路径都会解析上游响应中的 `usage` 输出到访问日志（见 §5）。

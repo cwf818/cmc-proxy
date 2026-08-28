@@ -1,5 +1,9 @@
 # cmc-proxy — commandcode GOAT 订阅本地反代网关
 
+![version](https://img.shields.io/badge/version-v1.1.0-blue)
+![stars](https://img.shields.io/github/stars/cwf818/cmc-proxy)
+![issues](https://img.shields.io/github/issues/cwf818/cmc-proxy)
+
 把 commandcode 的 Provider API 反代到本机 `127.0.0.1:5411`，让本地 **Claude Code** 和 **Codex** 直接接入你的 GOAT 订阅。
 
 - 零第三方依赖，仅需 Node.js ≥ 18（内置 `fetch`/`ReadableStream`）

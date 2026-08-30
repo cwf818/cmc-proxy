@@ -1610,7 +1610,7 @@ async function pumpConvertedStream(up, conv, res, tag, onDone) {
 // ---------------------------------------------------------------------------
 // 用量统计
 // ---------------------------------------------------------------------------
-// 1) 滚动统计: ch 只输出按会话累计的缓存命中率, ts(速度)仍按最近 1 / 10 / 50 次请求滚动统计;
+// 1) 滚动统计: ch 只输出按会话累计的缓存命中率, ts(速度=(输出+思考)tokens/s)按最近 1 / 10 / 50 次请求滚动统计;
 //    每次请求完成时输出, ts 值个数按历史请求数: 1 次显示 1 值 / 2-10 次显示 2 值 / >=11 次显示 3 值
 // 2) 当前次 ch 不直接输出, 仅在 <50% 时输出 gap (与上次低命中请求的序号差)
 // 2) TOD/ALL: 按天累计与进程累计, 每 STATS_EVERY 个请求打印 (环境变量 CMC_STATS_EVERY 可调, 默认 10),
@@ -1629,10 +1629,11 @@ const stats = { day: null, today: zeroAgg(), total: zeroAgg(), recent: [] };
 /** 最近 n 个请求的聚合 */
 function winAgg(n) {
   const slice = stats.recent.slice(-n);
-  const agg = { in: 0, out: 0, cr: 0, ms: 0 };
+  const agg = { in: 0, out: 0, rt: 0, cr: 0, ms: 0 };
   for (const r of slice) {
     agg.in += r.in;
     agg.out += r.out;
+    agg.rt += r.rt;
     agg.cr += r.cr;
     agg.ms += r.ms;
   }
@@ -1654,7 +1655,8 @@ function movingStatsStr(session) {
   const levels = n >= 11 ? [1, 10, 50] : n >= 2 ? [1, 10] : [1];
   const tsParts = levels.map((win, i) => {
     const w = winAgg(win);
-    const v = w.ms > 0 ? w.out / (w.ms / 1000) : 0;
+    // 生成 tokens = 输出 out + 思考 rt
+    const v = w.ms > 0 ? (w.out + w.rt) / (w.ms / 1000) : 0;
     const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
     return speedSegment(text, v);
   });
@@ -1667,7 +1669,8 @@ function statsLine(label, agg) {
   const totalIn = agg.in + agg.cr;
   const pct = totalIn > 0 ? Math.round((agg.cr / totalIn) * 100) : 0;
   const chStr = cacheSegment("ch:" + (totalIn > 0 ? pct + "%" : "-"), pct);
-  const v = agg.ms > 0 ? agg.out / (agg.ms / 1000) : 0;
+  // 生成 tokens = 输出 out + 思考 rt
+  const v = agg.ms > 0 ? (agg.out + agg.rt) / (agg.ms / 1000) : 0;
   const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
   console.log(
     `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr} ${tsStr}`

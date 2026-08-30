@@ -930,6 +930,7 @@ function responsesInputToChatMessages(input) {
       // 我们发给模型时的参数形态保持一致 (前缀稳定)
       pushToolCallToMessages(messages, {
         id: item.call_id || item.id || `call_local_${messages.length}`,
+        type: "function",
         function: {
           name: item.name || "unknown",
           arguments: JSON.stringify({ input: typeof item.input === "string" ? item.input : stringifyMaybeJSON(item.input ?? "") }),
@@ -951,6 +952,7 @@ function responsesInputToChatMessages(input) {
       // codex 本地执行的延迟工具发现调用 (arguments 为对象)
       pushToolCallToMessages(messages, {
         id: item.call_id || item.id || `call_local_${messages.length}`,
+        type: "function",
         function: { name: "tool_search", arguments: stringifyMaybeJSON(item.arguments ?? {}) },
       });
       continue;
@@ -1516,8 +1518,9 @@ async function pumpConvertedStream(up, conv, res, tag) {
 // ---------------------------------------------------------------------------
 // 用量统计
 // ---------------------------------------------------------------------------
-// 1) 滚动统计: 最近 1 / 10 / 50 次请求的 ch(缓存命中率) 与 ts(速度), 每次请求完成时输出,
-//    值个数按历史请求数: 1 次显示 1 值 / 2-10 次显示 2 值 / >=11 次显示 3 值, 波段色按逗号分段
+// 1) 滚动统计: ch 只输出按会话累计的缓存命中率, ts(速度)仍按最近 1 / 10 / 50 次请求滚动统计;
+//    每次请求完成时输出, ts 值个数按历史请求数: 1 次显示 1 值 / 2-10 次显示 2 值 / >=11 次显示 3 值
+// 2) 当前次 ch 不直接输出, 仅在 <50% 时输出 gap (与上次低命中请求的序号差)
 // 2) TOD/ALL: 按天累计与进程累计, 每 STATS_EVERY 个请求打印 (环境变量 CMC_STATS_EVERY 可调, 默认 10),
 //    跨天打印上日汇总; 当天启动时 TOD 与 ALL 一致, 省略 ALL
 const STATS_EVERY = parseInt(process.env.CMC_STATS_EVERY || "10", 10);
@@ -1547,24 +1550,23 @@ function winAgg(n) {
 /** 速度数字格式化: 整数去 .0 */
 const fmtSpeed = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, ""));
 
-/** 生成滚动统计串: "ch:56%,98%,99% ts:33/s,40/s,50/s" (ch 与 ts 各自波段色, 逗号分段着色) */
-function movingStatsStr() {
+/** 生成滚动统计串: "ch:87% ts:33/s,40/s,50/s" (ch 为会话累计, ts 为滚动窗口, 各自波段色) */
+function movingStatsStr(session) {
+  // ch: 按会话累计 (session.in / session.cr), 无会话时退化为当前次
+  const chIn = session ? session.in : 0;
+  const chCr = session ? session.cr : 0;
+  const chTotal = chIn + chCr;
+  const chPct = chTotal > 0 ? Math.round((chCr / chTotal) * 100) : 0;
+  const chStr = cacheSegment("ch:" + (chTotal > 0 ? chPct + "%" : "-"), chPct);
   const n = stats.recent.length;
   const levels = n >= 11 ? [1, 10, 50] : n >= 2 ? [1, 10] : [1];
-  const chParts = levels.map((win, i) => {
-    const w = winAgg(win);
-    const totalIn = w.in + w.cr;
-    const pct = totalIn > 0 ? Math.round((w.cr / totalIn) * 100) : 0;
-    const text = (i === 0 ? "ch:" : ",") + (totalIn > 0 ? pct + "%" : "-");
-    return cacheSegment(text, pct);
-  });
   const tsParts = levels.map((win, i) => {
     const w = winAgg(win);
     const v = w.ms > 0 ? w.out / (w.ms / 1000) : 0;
     const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
     return speedSegment(text, v);
   });
-  return ` ${chParts.join("")} ${tsParts.join("")}`;
+  return ` ${chStr} ${tsParts.join("")}`;
 }
 
 /** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色) */
@@ -1614,15 +1616,16 @@ function accumulate(rec, trackRolling) {
 //   4) src:port + ua —— curl 等无会话头的客户端, 靠 TCP 源端口近似区分
 // 每个会话维护:
 //   id              —— 自增会话编号 (日志时间后显示 #id, 如 [08:28:48.943]#22)
-//   seq             —— 请求序号 (仅对解析到 usage 的请求递增, 与 ch 滚动统计同口径)
+//   seq             —— 请求序号 (仅对解析到 usage 的请求递增, 与 ch 统计同口径)
 //   lastLowCacheSeq —— 最近一次 cachehit<50% 的请求序号 (用于计算 gap)
+//   in / cr         —— 会话累计净输入 / 缓存读 (仅计有 usage 的请求), 用于输出会话累计 ch
 const MODEL_PATHS = ["/v1/messages", "/v1/chat/completions", "/v1/responses"];
 const sessions = new Map();
 let nextSessionId = 1;
 function getSession(key) {
   let s = sessions.get(key);
   if (!s) {
-    s = { id: nextSessionId++, seq: 0, lastLowCacheSeq: null };
+    s = { id: nextSessionId++, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0 };
     sessions.set(key, s);
   }
   return s;
@@ -1791,11 +1794,14 @@ const server = http.createServer(async (req, res) => {
       stats.today = zeroAgg();
     }
     accumulate(rec, !!usageStr);
-    // 会话请求序号: 仅对有 usage 的请求递增 (与 ch 滚动统计同口径)。
-    // cachehit<50% 时计算与最近一次低缓存命中请求的序号差 gap, 输出在 ch 前 (首次低缓存只记录基准, 不输出 gap)
+    // 会话请求序号: 仅对有 usage 的请求递增 (与 ch 统计同口径)。
+    // 会话累计 in/cr 用于 ch 输出; 当前次 cachehit<50% 时计算与最近一次低缓存命中请求的
+    // 序号差 gap, 输出在 ch 前 (首次低缓存只记录基准, 不输出 gap)
     let gapStr = "";
     if (usageStr && session) {
       session.seq += 1;
+      session.in += rec.in;
+      session.cr += rec.cr;
       const totalIn = rec.in + rec.cr;
       const pct = totalIn > 0 ? Math.round((rec.cr / totalIn) * 100) : 0;
       if (pct < 50) {
@@ -1804,7 +1810,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
     // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加
-    const movingStr = usageStr ? movingStatsStr() : "";
+    const movingStr = usageStr ? movingStatsStr(session) : "";
     console.log(`${cDim(`[${logTs(Date.now())}]${sessTag()}`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });

@@ -45,6 +45,10 @@
  *      - {"type":"namespace"} 工具组展开为独立工具;
  *      - 历史条目 custom_tool_call / custom_tool_call_output / tool_search_call /
  *        tool_search_output 双向映射, 修复 freeform 工具调用历史丢失。
+ *   7. 轮换计数按模型归属: 客户端显式请求其他模型 (如 blockedModels 中的 gpt-5.6-luna
+ *      被上游 403) 的失败不再记到当前默认模型头上触发无谓轮换; blocked 模型转发时
+ *      打印一次性告警; additional_tools 历史条目 (codex 内联的附加工具定义) 合并进
+ *      请求 tools 并按名去重。
  */
 "use strict";
 
@@ -86,7 +90,13 @@ const TAGI = cBlue("[cmc-proxy]");
 // 配置加载 (与旧版完全兼容; 新增可选项见文件头注释)
 // ---------------------------------------------------------------------------
 const ROOT = __dirname;
-const configPath = path.join(ROOT, "config.json");
+const args = process.argv.slice(2);
+function argVal(name, def) {
+  const i = args.indexOf(name);
+  return i >= 0 && args[i + 1] ? args[i + 1] : def;
+}
+// --config 支持相对 (相对 proxy 脚本目录) 与绝对路径, 默认同目录 config.json
+const configPath = path.resolve(ROOT, argVal("--config", "config.json"));
 
 function loadConfig() {
   if (fs.existsSync(configPath)) {
@@ -102,12 +112,6 @@ function loadConfig() {
     modelMap: {},
     blockedModels: [],
   };
-}
-
-const args = process.argv.slice(2);
-function argVal(name, def) {
-  const i = args.indexOf(name);
-  return i >= 0 && args[i + 1] ? args[i + 1] : def;
 }
 
 const config = loadConfig();
@@ -152,9 +156,12 @@ function currentDefaultModel() {
   return defaultModels[activeModelIdx % defaultModels.length];
 }
 
-/** 一次请求失败时调用: 达到阈值则切到下一个模型并返回 true (列表轮完回到第一个, 循环进行) */
-function onRequestFail() {
+/** 一次请求失败时调用: 达到阈值则切到下一个模型并返回 true (列表轮完回到第一个, 循环进行)。
+ *  仅统计当前默认模型自身的失败: 客户端显式请求其他模型 (如 blockedModels 中的
+ *  gpt-5.6-luna 被上游 403) 时, 失败不记到默认模型头上, 避免触发无谓轮换 */
+function onRequestFail(failedModel) {
   if (!FALLBACK_ENABLED || defaultModels.length < 2) return false;
+  if (failedModel && failedModel !== defaultModels[activeModelIdx]) return false;
   const limit = activeModelIdx === 0 ? FIRST_FAIL_LIMIT : OTHER_FAIL_LIMIT;
   activeModelFails += 1;
   if (activeModelFails < limit) return false;
@@ -166,8 +173,9 @@ function onRequestFail() {
   return true;
 }
 
-/** 一次请求成功时调用: 清零当前模型失败计数 */
-function onRequestOk() {
+/** 一次请求成功时调用: 清零当前模型失败计数 (仅当成功的就是当前默认模型) */
+function onRequestOk(okModel) {
+  if (okModel && okModel !== defaultModels[activeModelIdx]) return;
   activeModelFails = 0;
 }
 
@@ -831,12 +839,15 @@ function responsesUserBlocksToParts(blocks) {
 
 function responsesInputToChatMessages(input) {
   const messages = [];
+  // codex 0.150 alpha 会把附加工具定义 (deferred 工具加载结果等) 以 additional_tools
+  // 条目内联在对话历史中, 收集后合并进请求 tools (见 responsesToChatRequest)
+  const additionalTools = [];
   // input 可以是字符串
   if (typeof input === "string") {
     if (input) messages.push({ role: "user", content: input });
-    return messages;
+    return { messages, additionalTools };
   }
-  if (!Array.isArray(input)) return messages;
+  if (!Array.isArray(input)) return { messages, additionalTools };
 
   for (const item of input) {
     if (!item || typeof item !== "object") {
@@ -845,6 +856,11 @@ function responsesInputToChatMessages(input) {
       continue;
     }
     const type = item.type || (item.role ? "message" : "");
+
+    if (type === "additional_tools" && Array.isArray(item.tools)) {
+      additionalTools.push(...item.tools);
+      continue;
+    }
 
     if (type === "message" || (!type && item.role)) {
       const role = item.role;
@@ -963,7 +979,7 @@ function responsesInputToChatMessages(input) {
 
     if (type) warnSkippedItemType(type); // local_shell_call / computer_call 等保留类型
   }
-  return messages;
+  return { messages, additionalTools };
 }
 
 /** 把 Responses 请求体转换为 chat/completions 请求体 */
@@ -971,7 +987,8 @@ function responsesToChatRequest(body, sessionKey) {
   const mapped = resolveModel(body.model);
   const messages = [];
   if (body.instructions) messages.push({ role: "system", content: body.instructions });
-  messages.push(...responsesInputToChatMessages(body.input));
+  const { messages: inputMessages, additionalTools } = responsesInputToChatMessages(body.input);
+  messages.push(...inputMessages);
   const req = { model: mapped, messages, stream: !!body.stream };
   // 钳制 max_output_tokens 到最小 16 (部分上游模型要求, 如 gpt-5.6-sol)
   if (body.max_output_tokens != null) req.max_tokens = Math.max(16, body.max_output_tokens);
@@ -982,15 +999,17 @@ function responsesToChatRequest(body, sessionKey) {
   }
   // 本请求中被转为 function 的 freeform(custom) 工具名集合, 回传时还原 custom_tool_call
   const customToolNames = new Set();
-  if (body.tools && Array.isArray(body.tools) && body.tools.length) {
-    const chatTools = [];
-    const convertTool = (t) => {
+  const addedToolNames = new Set();
+  const chatTools = [];
+  const convertTool = (t) => {
       if (!t || typeof t !== "object") return;
       if (t.type === "custom" && t.name) {
         // freeform/custom 工具 (如 apply_patch grammar): chat/completions 无对应概念,
         // 统一转成 {"input": "<原文>"} 单参数 function, 回传时还原 custom_tool_call
         // (codex 的 apply_patch handler 只接受 Custom payload, 收到 function_call 直接报错)
         customToolNames.add(t.name);
+        if (addedToolNames.has(t.name)) return; // 按名去重: 顶层定义优先
+        addedToolNames.add(t.name);
         chatTools.push({
           type: "function",
           function: {
@@ -1010,6 +1029,8 @@ function responsesToChatRequest(body, sessionKey) {
       if (t.type === "tool_search") {
         // nameless 延迟工具发现工具: codex 对 FunctionCall 名为 tool_search 的调用走本地
         // 执行器, 转成同名 function 即可打通 deferred 工具加载
+        if (addedToolNames.has("tool_search")) return;
+        addedToolNames.add("tool_search");
         chatTools.push({
           type: "function",
           function: {
@@ -1037,6 +1058,8 @@ function responsesToChatRequest(body, sessionKey) {
         warnSkippedToolType(t.type || "unknown");
         return;
       }
+      if (addedToolNames.has(fn.name)) return;
+      addedToolNames.add(fn.name);
       chatTools.push({
         type: "function",
         function: {
@@ -1045,10 +1068,13 @@ function responsesToChatRequest(body, sessionKey) {
           parameters: fn.parameters || { type: "object", properties: {} },
         },
       });
-    };
+  };
+  if (body.tools && Array.isArray(body.tools) && body.tools.length) {
     for (const t of body.tools) convertTool(t);
-    if (chatTools.length) req.tools = chatTools;
   }
+  // 历史中内联的附加工具定义 (additional_tools 条目): 合并进 tools, 按名去重
+  for (const t of additionalTools) convertTool(t);
+  if (chatTools.length) req.tools = chatTools;
   if (body.tool_choice && typeof body.tool_choice === "object" && body.tool_choice.type === "function") {
     const choiceName = body.tool_choice.name || (body.tool_choice.function && body.tool_choice.function.name);
     if (choiceName) req.tool_choice = { type: "function", function: { name: choiceName } };
@@ -1382,22 +1408,30 @@ function buildUpstreamHeaders(req, extra) {
 }
 
 /**
- * 发起上游请求并统一处理模型轮换计数:
- *   - fetch 网络层抛错 / 上游返回非 2xx → 计一次失败 (onRequestFail, 达到阈值自动切换默认模型)
- *   - 上游 2xx → 清零失败计数 (onRequestOk)
+ * 发起上游请求并统一处理模型轮换计数 (计数按模型归属, 见 onRequestFail/onRequestOk):
+ *   - fetch 网络层抛错 / 上游返回非 2xx → onRequestFail(requestedModel)
+ *   - 上游 2xx → onRequestOk(requestedModel)
  * 调用方无需重复计数; 网络抛错时原样向上抛, 由调用方返回 502。
  */
-async function upstreamFetch(url, init) {
+async function upstreamFetch(url, init, requestedModel) {
+  if (requestedModel && blockedSet.has(requestedModel)) warnBlockedModel(requestedModel);
   let r;
   try {
     r = await fetch(url, init);
   } catch (e) {
-    onRequestFail();
+    onRequestFail(requestedModel);
     throw e;
   }
-  if (!r.ok) onRequestFail();
-  else onRequestOk();
+  if (!r.ok) onRequestFail(requestedModel);
+  else onRequestOk(requestedModel);
   return r;
+}
+
+const blockedModelWarned = new Set();
+function warnBlockedModel(model) {
+  if (blockedModelWarned.has(model)) return;
+  blockedModelWarned.add(model);
+  console.warn(TAGW, `模型 ${model} 在 config.blockedModels 中 (订阅计划不可用), 仍按原样转发, 上游可能返回 403; 如需改走其他模型可在 config.modelMap 中映射`);
 }
 
 /**
@@ -1835,7 +1869,7 @@ const server = http.createServer(async (req, res) => {
               "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
             }),
             body: JSON.stringify(body),
-          });
+          }, mapped);
         } catch (e) {
           console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
           res.writeHead(502, { "Content-Type": "application/json" });
@@ -1859,7 +1893,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(oaiReq),
-        });
+        }, mapped);
       } catch (e) {
         console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
         res.writeHead(502, { "Content-Type": "application/json" });
@@ -1918,7 +1952,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(body),
-        });
+        }, body.model);
       } catch (e) {
         console.warn(TAGW, `上游请求失败 (${body.model}): ${e.message}`);
         res.writeHead(502, { "Content-Type": "application/json" });
@@ -1951,7 +1985,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(chatReq),
-        });
+        }, mapped);
       } catch (e) {
         console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
         res.writeHead(502, { "Content-Type": "application/json" });

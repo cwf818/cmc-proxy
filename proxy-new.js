@@ -32,6 +32,9 @@
  *      文本+工具混合输出时两个块共用 index 0; 新版统一自增分配。
  *   4. Responses 响应 usage 补全 input_tokens_details.cached_tokens /
  *      output_tokens_details.reasoning_tokens, Codex 侧缓存/思考量可见。
+ *   5. 会话跟踪升级: Codex 优先读 session-id (兼容旧版 session_id) / thread-id 请求头
+ *      作为会话标识, 同一 codex 会话跨 TCP 重连不再分裂编号, 与缓存亲和使用同一稳定标识;
+ *      curl 等无会话头客户端仍回退 src:port + ua。
  */
 "use strict";
 
@@ -1403,8 +1406,12 @@ function accumulate(rec, trackRolling) {
 // ---------------------------------------------------------------------------
 // 会话跟踪 (按本地 agent 进程区分, 自增编号)
 // ---------------------------------------------------------------------------
-// 会话 key 优先用 x-claude-code-session-id (Claude Code 每会话唯一 UUID, 跨连接稳定),
-// 无该头时回退 src:port + ua (Codex/curl 等, 靠 TCP 源端口近似区分);
+// 会话 key 优先级 (稳定标识优先, 端口回退仅作最后兜底):
+//   1) x-claude-code-session-id —— Claude Code 每会话唯一 UUID, 跨连接稳定
+//   2) session-id (兼容旧版 session_id 下划线头名) —— Codex v0.147+ 每请求携带,
+//      进程生命周期内稳定的 UUID; 同一 codex 会话跨 TCP 重连不会分裂
+//   3) thread-id —— Codex 对话线程标识, codex resume 恢复后仍保持不变
+//   4) src:port + ua —— curl 等无会话头的客户端, 靠 TCP 源端口近似区分
 // 每个会话维护:
 //   id              —— 自增会话编号 (日志时间后显示 #id, 如 [08:28:48.943]#22)
 //   seq             —— 请求序号 (仅对解析到 usage 的请求递增, 与 ch 滚动统计同口径)
@@ -1474,15 +1481,19 @@ const server = http.createServer(async (req, res) => {
   const startAt = Date.now();
   const srcIp = req.socket.remoteAddress || "-";
   req._cmdc = { model: null, mapped: null, stream: null, reqLogged: false, usage: null, bodyBytes: 0 };
-  // 会话归属: 仅 model 类请求计入会话, 自增编号。
-  // 会话 key 优先级:
-  //   1) x-claude-code-session-id —— Claude Code 每个会话唯一的 UUID (如 6bc792ae-...),
-  //      跨连接稳定, 可精确区分两个 Claude Code 进程/会话窗口
-  //   2) 回退 src:remotePort + User-Agent —— Codex / curl 等无该头, 用 TCP 源端口近似区分
+  // 会话归属: 仅 model 类请求计入会话, 自增编号。会话 key 按稳定标识优先级判定,
+  // 见上方 MODEL_PATHS 附近的注释; Codex 的 session-id/thread-id 与其请求体
+  // prompt_cache_key 同源, 会话编号因此与缓存亲和使用同一稳定标识
   const ccSessionId = req.headers["x-claude-code-session-id"];
+  const cxCodexSession = req.headers["session-id"] || req.headers["session_id"]; // 兼容旧版下划线头名
+  const cxThreadId = req.headers["thread-id"];
   const sessionKey = ccSessionId
     ? `cc:${ccSessionId}`
-    : `${srcIp}:${req.socket.remotePort || "-"}|${req.headers["user-agent"] || "-"}`;
+    : cxCodexSession
+      ? `cx:${cxCodexSession}`
+      : cxThreadId
+        ? `cx:thread:${cxThreadId}`
+        : `${srcIp}:${req.socket.remotePort || "-"}|${req.headers["user-agent"] || "-"}`;
   // 注意: 放在闭包变量而非 req._cmdc —— 路由分支会重建 req._cmdc, 直接赋值会丢失 session
   const session = MODEL_PATHS.includes(pathname) ? getSession(sessionKey) : null;
   let outBytes = 0;

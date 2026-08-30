@@ -12,7 +12,7 @@
 - 内置 **多模型轮换 fallback**：`defaultModels` 数组按序轮换，首个模型连续失败 3 次自动切换下一个，后续模型失败 1 次即切换（不重试），全部轮完循环回第一个；计数按模型归属（显式请求其他模型的失败不计入轮换）；可用 `fallback` 开关关闭
 - **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源
 - **Codex 新协议全兼容**：`custom`（apply_patch freeform）/ `tool_search`（延迟工具发现）/ `namespace` 工具组 / 顶层 `function_call` 历史等新形态全链路支持
-- 支持流式 SSE 透传、token 用量上报、模型列表过滤、可选请求落盘（`fulllog`）
+- 支持流式 SSE 透传、token 用量上报、模型列表过滤、分级请求落盘（环境变量 `CMC_LOGGING_FILE`）
 
 ## 文件说明
 
@@ -191,7 +191,7 @@ DeepSeek 等上游的前缀缓存要求**同会话请求的消息前缀逐字节
 | `stabilizeCounters` | `true` | 文本中 `<total_tokens>N tokens left</total_tokens>` 计数就近取整到 100 万（`14977212` → `15000000`），使回溯改写前后字节一致；作为剥离的兜底（防计数出现在其他位置） |
 | `cacheControlPassthrough` | `true` | Anthropic `cache_control` 标记透传为 OpenAI content part（对支持显式缓存的后端生效，已验证不影响本上游的缓存键） |
 | `cacheAffinity` | `true` | 按会话注入稳定 `user` / `prompt_cache_key`（Claude Code 取会话 UUID，Codex 透传其自带值），便于上游按会话做缓存路由 |
-| `fulllog` | `false` | 请求落盘：把每个模型类请求的客户端原始 body 与实际转发上游的 body 追加写入 `fulllog.log`（值为字符串时作为自定义路径），对照排查转换/缓存问题；日志会持续增长，注意清理 |
+| `CMC_LOGGING_FILE`（环境变量） | 未设置 | 请求落盘分级：`0`/未设置 关闭；`1` 严重事件（上游失败/超时、客户端中途断开）；`2` 1 + 前缀分叉时落盘该请求（client/upstream 双 body）；`3` 全部模型类请求。写入 `fulllog.log`，分叉/失败条目带标注；日志会持续增长，注意清理 |
 | `serializeSessionRequests` | `true` | 同会话上游请求**串行发送**：CC 的会话标题探测请求（4KB，自动起名）与主请求毫秒级并发到达时，中转侧出现过主请求长时间无响应头悬挂；串行化规避并发，排队中的请求若客户端断开会立即出队 |
 | `firstByteTimeout` | `120000` | 上游超过该毫秒数未返回响应头时主动中止并返回 502（`0` 关闭）。替代 undici 隐性的 300s 黑盒超时，悬挂请求 2 分钟内可见明确错误 |
 
@@ -299,7 +299,7 @@ Get-NetTCPConnection -LocalPort 5411 -State Listen | Stop-Process
 
 **流式输出卡住** — 检查网络到 `api.commandcode.ai` 的连通性；可设 `CMC_DEBUG=1` 启动查看上游原始流。
 
-**缓存命中率低** — 看 `RES` 行的 `pfx~` 标记与分叉预览：`pfx~1`/`pfx~2` 等早期消息分叉说明客户端在改写历史（升级 Claude Code 版本后常见）；`pfx~tools` 工具定义变化；无标记但 `cr` 仍低则多为上游/中转侧行为。可用 `fulllog: true` 落盘请求对照排查；相关开关见「缓存优化」章节。
+**缓存命中率低** — 看 `RES` 行的 `pfx~` 标记与分叉预览：`pfx~1`/`pfx~2` 等早期消息分叉说明客户端在改写历史（升级 Claude Code 版本后常见）；`pfx~tools` 工具定义变化；无标记但 `cr` 仍低则多为上游/中转侧行为。可设 `CMC_LOGGING_FILE=2` 落盘分叉请求对照排查（`3` 为全部请求）；相关开关见「缓存优化」章节。
 
 ## 安全提醒
 

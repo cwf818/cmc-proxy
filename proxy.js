@@ -138,16 +138,18 @@ const STRIP_SYSTEM_REMINDERS = config.stripSystemReminders !== false; // 剥离 
 const SERIALIZE_SESSION = config.serializeSessionRequests !== false; // 同会话上游请求串行化
 const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout || "120000", 10); // 上游响应头超时 ms (0=关闭)
 
-// fulllog: 请求落盘 (config.fulllog=true 开启, 写 ROOT/fulllog.log; 值为字符串时作为日志路径)。
-// 每个模型类请求记录两份 body: 客户端原始请求 + 实际转发上游的请求, 便于对照排查转换/缓存问题
-const FULLLOG_PATH = config.fulllog
-  ? (typeof config.fulllog === "string" ? path.resolve(ROOT, config.fulllog) : path.join(ROOT, "fulllog.log"))
-  : null;
+// 请求落盘分级 (环境变量 CMC_LOGGING_FILE, 未设置或 0 = 关闭):
+//   1 = 严重事件落盘 (上游请求失败/超时、客户端中途断开 ABT)
+//   2 = 1 + 前缀分叉时落盘该请求 (client/upstream 双 body, 便于定位分叉来源)
+//   3 = 全部模型类请求落盘 (原 config.fulllog=true 行为)
+// 文件固定为 ROOT/fulllog.log (已在 .gitignore)
+const LOG_LEVEL = Math.max(0, parseInt(process.env.CMC_LOGGING_FILE || "0", 10) || 0);
+const FULLLOG_PATH = LOG_LEVEL > 0 ? path.join(ROOT, "fulllog.log") : null;
 let fulllogChain = Promise.resolve();
-function fulllogDump(req, pathname, session, entries) {
+function fulllogDump(req, pathname, session, entries, note) {
   if (!FULLLOG_PATH) return;
   const ts = new Date().toISOString();
-  const head = `\n[${ts}]#${session ? session.id : "-"} ${req.method} ${pathname} src=${req.socket.remotePort || "-"}\n`;
+  const head = `\n[${ts}]#${session ? session.id : "-"} ${req.method} ${pathname} src=${req.socket.remotePort || "-"}${note ? ` [${note}]` : ""}\n`;
   const body = entries
     .filter(([, text]) => text != null)
     .map(([label, text]) => `---- ${label} (${Buffer.byteLength(text)}B) ----\n${text}\n`)
@@ -156,6 +158,16 @@ function fulllogDump(req, pathname, session, entries) {
   fulllogChain = fulllogChain
     .then(() => fs.promises.appendFile(FULLLOG_PATH, head + body))
     .catch((e) => console.error(TAGE, "fulllog 写入失败:", e.message));
+}
+/** 请求落盘判断: 3=全部; 2=仅前缀分叉的请求 */
+function shouldDumpRequest(pfxMark) {
+  return LOG_LEVEL >= 3 || (LOG_LEVEL >= 2 && !!pfxMark);
+}
+/** 严重事件落盘 (level>=1): 上游失败/超时、客户端断开等, 附请求双 body 便于定位 */
+function logSevere(req, pathname, session, message) {
+  if (LOG_LEVEL < 1) return;
+  const c = req._cmdc || {};
+  fulllogDump(req, pathname, session, [["client", c.rawBody], ["upstream", c.upstreamBody]], message);
 }
 
 if (!API_KEY) {
@@ -1946,12 +1958,16 @@ const server = http.createServer(async (req, res) => {
   res.on("close", () => {
     if (resFinished) return;
     upstreamAbort.abort(upstreamError("客户端断开", { clientAbort: true }));
-    console.warn(cRed(`[cmc-proxy]${sessTag()} ABT ${req.method} ${pathname} 客户端断开 (已等待 ${((Date.now() - startAt) / 1000).toFixed(1)}s, 未收到完整响应)`));
+    const waited = ((Date.now() - startAt) / 1000).toFixed(1);
+    logSevere(req, pathname, session, `客户端断开 (已等待 ${waited}s, 未收到完整响应)`);
+    console.warn(cRed(`[cmc-proxy]${sessTag()} ABT ${req.method} ${pathname} 客户端断开 (已等待 ${waited}s, 未收到完整响应)`));
   });
   // 上游请求异常收尾: 客户端断开时 socket 已死, 只记日志不写响应 (写必抛)
   const upstreamFail = (e) => {
-    if (e.clientAbort) console.warn(cDim(`[cmc-proxy]${sessTag()} 客户端断开, 放弃上游请求`));
-    else console.warn(TAGW, `上游请求失败: ${e.message}`);
+    const msg = e.clientAbort ? "客户端断开, 放弃上游请求" : `上游请求失败: ${e.message}`;
+    logSevere(req, pathname, session, msg);
+    if (e.clientAbort) console.warn(cDim(`[cmc-proxy]${sessTag()} ${msg}`));
+    else console.warn(TAGW, msg);
   };
   res.on("finish", () => {
     resFinished = true;
@@ -2062,7 +2078,9 @@ const server = http.createServer(async (req, res) => {
       if (useAnthropicEndpoint) {
         // Claude 模型 -> 直接走上游 /messages
         body.model = mapped;
-        if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(body)]]);
+        const upstreamBodyJson = JSON.stringify(body);
+        req._cmdc.upstreamBody = upstreamBodyJson;
+        if (LOG_LEVEL >= 3) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]]);
         const releaseUp = await acquireSessionLock(session);
         req._cmdc.releaseUp = releaseUp;
         let up;
@@ -2094,9 +2112,13 @@ const server = http.createServer(async (req, res) => {
 
       // 非 Claude 模型 -> Anthropic -> OpenAI 协议转换
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
-      if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(oaiReq)]]);
-      const oaiParams = { ...oaiReq, messages: undefined };
-      req._cmdc.pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""), JSON.stringify(oaiParams));
+      const upstreamBodyJson = JSON.stringify(oaiReq);
+      req._cmdc.upstreamBody = upstreamBodyJson;
+      const pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""), JSON.stringify({ ...oaiReq, messages: undefined }));
+      req._cmdc.pfx = pfx;
+      if (shouldDumpRequest(pfx.mark)) {
+        fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]], pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined);
+      }
       const releaseUp = await acquireSessionLock(session);
       req._cmdc.releaseUp = releaseUp;
       let up;
@@ -2161,7 +2183,9 @@ const server = http.createServer(async (req, res) => {
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
       logReq();
-      if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(body)]]);
+      const upstreamBodyJson = JSON.stringify(body);
+      req._cmdc.upstreamBody = upstreamBodyJson;
+      if (LOG_LEVEL >= 3) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]]);
       const releaseUp = await acquireSessionLock(session);
         req._cmdc.releaseUp = releaseUp;
       let up;
@@ -2199,9 +2223,13 @@ const server = http.createServer(async (req, res) => {
       logReq();
 
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
-      if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(chatReq)]]);
-      const chatParams = { ...chatReq, messages: undefined };
-      req._cmdc.pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify(chatParams));
+      const upstreamBodyJson = JSON.stringify(chatReq);
+      req._cmdc.upstreamBody = upstreamBodyJson;
+      const pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify({ ...chatReq, messages: undefined }));
+      req._cmdc.pfx = pfx;
+      if (shouldDumpRequest(pfx.mark)) {
+        fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]], pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined);
+      }
       const releaseUp = await acquireSessionLock(session);
         req._cmdc.releaseUp = releaseUp;
       let up;

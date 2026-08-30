@@ -212,13 +212,13 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 
 ## 访问日志
 
-每个请求打印**两行日志**：`REQ` 行记录本地客户端发来的请求，`RES` 行记录外部上游返回的结果，便于对照感知请求与返回。时间后跟 **会话编号**（如 `#3`），按稳定会话标识区分本地 agent 进程并自增分配；`REQ` / 状态码后跟 **请求编号**（如 `REQ#3` 与 `200#3`），为该会话内自增的请求计数器，两行编号相同即同一请求的请求与响应：
+每个请求打印**两行日志**：`REQ` 行记录本地客户端发来的请求，`RES` 行记录外部上游返回的结果，便于对照感知请求与返回。时间后跟 **`#S会话R请求` 标签**（如 `#S1R10` = 1 号会话的第 10 个请求），按稳定会话标识区分本地 agent 进程并自增分配；REQ 与 RES 两行标签相同即同一请求的请求与响应。**标签按会话哈希着色**（REQ 行的 `REQ` 字样同色），同会话恒同色、不同会话尽量异色，扫日志时可按颜色快速归并同一会话的请求：
 
 ```
-[20:15:55.877]#3 REQ#1 POST /v1/messages src=127.0.0.1:54321 ua=claude-cli/2.0.0 model=deepseek-v4-flash stream=1 body=186.5KB
-[20:15:58.232]#3 200#1 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ch:87% ts:241.3/s
-[20:15:58.822]#5 REQ#7 POST /v1/chat/completions src=127.0.0.1:48721 ua=codex/1.0.0 model=gpt-5.6-sol stream=0 body=88B
-[20:16:00.510]#5 200#7 POST /v1/chat/completions took=1.69s out=567B in:987 out:45 cr:0 cw:0 gap:10 ch:40% ts:26.6/s
+[20:15:55.877] #S3R1 REQ POST /v1/messages model=deepseek-v4-flash src=127.0.0.1:54321 ua=claude-cli/2.0.0 stream=1 body=186.5KB
+[20:15:58.232] #S3R1 200 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ch:87% ts:241.3/s
+[20:15:58.822] #S5R7 REQ POST /v1/chat/completions model=gpt-5.6-sol src=127.0.0.1:48721 ua=codex/1.0.0 stream=0 body=88B
+[20:16:00.510] #S5R7 200 POST /v1/chat/completions took=1.69s out=567B in:987 out:45 cr:0 cw:0 gap:10 ch:40% ts:26.6/s
 ```
 
 字段说明：
@@ -226,8 +226,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  协议转换 + �
 | 字段 | 含义 |
 |---|---|
 | `REQ` / `RES` | 本地请求到达 / 外部返回完成 |
-| `#编号`（时间后） | 会话编号：**优先按 `x-claude-code-session-id`**（Claude Code 每个会话唯一的 UUID）→ **`session-id`**（Codex 0.147+ 每请求携带，兼容旧版 `session_id` 下划线头名）→ **`thread-id`**（Codex 对话线程，`codex resume` 后不变）→ 回退 `src:端口 + ua` 近似区分。同一会话跨 TCP 重连不换号。仅 model 类请求（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`）计入会话，非 model 请求（健康检查等）无编号 |
-| `#编号`（REQ/状态码后） | 请求编号：会话内自增的请求计数器，`REQ#3` 与 `200#3` 即同一请求的请求行与响应行，用于在并发/交错日志中配对 REQ 与 RES |
+| `#S会话R请求` | 标签 = **会话编号 + 请求编号**（如 `#S1R10`）。会话编号**优先按 `x-claude-code-session-id`**（Claude Code 每个会话唯一的 UUID）→ **`session-id`**（Codex 0.147+ 每请求携带，兼容旧版 `session_id` 下划线头名）→ **`thread-id`**（Codex 对话线程，`codex resume` 后不变）→ 回退 `src:端口 + ua` 近似区分，同一会话跨 TCP 重连不换号；请求编号为会话内自增的请求计数器，两行编号相同即同一请求的请求行与响应行，用于在并发/交错日志中配对 REQ 与 RES。仅 model 类请求（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`）计入会话，非 model 请求（健康检查等）无标签 |
 | `status` / `method` / `path` | HTTP 状态码、方法与路径（`RES` 行含状态码） |
 | `src` | 客户端 IP:源端口（仅 `REQ` 行；端口用于区分同 ua 的不同进程/连接） |
 | `ua` | 客户端 User-Agent（`claude-cli/*` 即 Claude Code，`codex/*` 即 Codex） |

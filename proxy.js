@@ -1733,9 +1733,10 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
 //   3) thread-id —— Codex 对话线程标识, codex resume 恢复后仍保持不变
 //   4) src:port + ua —— curl 等无会话头的客户端, 靠 TCP 源端口近似区分
 // 每个会话维护:
-//   id              —— 自增会话编号 (日志时间后显示 #id, 如 [08:28:48.943]#22)
+//   id              —— 自增会话编号 (与 reqSeq 组成日志标签 #S{id}R{reqSeq}, 如 #S1R10;
+//                      标签按会话 key 哈希配色, 同会话恒同色)
 //   reqSeq          —— 请求编号计数器 (每个 model 请求到达时递增, REQ/RES 行成对输出,
-//                      如 REQ#3 与 200#3 表示同一请求; 与 seq 不同, 不要求有 usage)
+//                      如 #S1R10 表示 1 号会话的第 10 个请求; 不要求有 usage)
 //   seq             —— 请求序号 (仅对解析到 usage 的请求递增, 与 ch 统计同口径)
 //   lastLowCacheSeq —— 最近一次 cachehit<50% 的请求序号 (用于计算 gap)
 //   in / cr         —— 会话累计净输入 / 缓存读 (仅计有 usage 的请求), 用于输出会话累计 ch
@@ -1745,7 +1746,7 @@ let nextSessionId = 1;
 function getSession(key) {
   let s = sessions.get(key);
   if (!s) {
-    s = { id: nextSessionId++, reqSeq: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null };
+    s = { id: nextSessionId++, key, reqSeq: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null };
     sessions.set(key, s);
   }
   return s;
@@ -1765,6 +1766,8 @@ function hashCode(str) {
 /** model 块颜色: 按模型字符串哈希到一组高辨识度颜色 —— 同模型恒同色, 不同模型尽量异色 */
 const MODEL_COLORS = [cCyan, cMagenta, cYellow, cGreen, cBlue, cOrange, cBrightGreen];
 const modelColor = (name) => MODEL_COLORS[hashCode(name) % MODEL_COLORS.length];
+/** 会话标签颜色: 按会话 key 哈希配色 —— 同会话恒同色, 不同会话尽量异色 (与 model 配色同色板) */
+const sessionColor = (key) => MODEL_COLORS[hashCode(key) % MODEL_COLORS.length];
 
 /** 按 HTTP 状态码着色: 2xx 绿 / 4xx 黄 / 5xx 红 */
 function cStatus(code) {
@@ -1845,14 +1848,16 @@ const server = http.createServer(async (req, res) => {
     const bb = req._cmdc.bodyBytes;
     return bb ? ` body=${fmtBytes(bb)}` : "";
   };
-  // 会话编号标签: 非 model 请求无会话, 返回空串
+  // 会话+请求编号标签: 如 #S1R10 = 1 号会话的第 10 个请求; 非 model 请求无会话, 返回空串
   const sessTag = () => {
-    return session ? `#${session.id}` : "";
+    return session ? `#S${session.id}R${reqNo}` : "";
   };
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
-    console.log(`${cDim(`[${logTs(startAt)}]${sessTag()}`)} ${cCyan(`REQ${reqNo != null ? `#${reqNo}` : ""}`)} ${req.method} ${pathname} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${reqModelPart()}${streamPart()}${cDim(bodyPart())}`);
+    // 标签 #S{id}R{req} 与 REQ 同色 (按会话 key 哈希配色); model 提前到 src 之前, 扫日志先看模型
+    const tag = sessTag();
+    console.log(`${cDim(`[${logTs(startAt)}]`)} ${tag ? sessionColor(sessionKey)(`${tag} REQ`) : cCyan("REQ")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${cDim(bodyPart())}`);
     // CMC_DEBUG_PAYLOAD=1: 打印本地请求完整请求头与 body 原文 (排查会话标识等)
     if (process.env.CMC_DEBUG_PAYLOAD === "1") {
       const headers = {};
@@ -1938,9 +1943,10 @@ const server = http.createServer(async (req, res) => {
     const pfx = (req._cmdc && req._cmdc.pfx) || { mark: "", detail: "" };
     const pfxMark = pfx.mark ? ` ${cRed(pfx.mark)}` : "";
     if (pfx.detail) console.warn(cRed(`[cmc-proxy] ${sessTag()} 前缀分叉: ${pfx.detail}`));
-    // 状态码与请求编号同色输出 (200#3), 与 cStatus 同一波段色
     const stFn = res.statusCode >= 500 ? cRed : res.statusCode >= 400 ? cYellow : res.statusCode >= 300 ? cCyan : cGreen;
-    console.log(`${cDim(`[${logTs(Date.now())}]${sessTag()}`)} ${stFn(`${res.statusCode}${reqNo != null ? `#${reqNo}` : ""}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${pfxMark}${movingStr}`);
+    // 标签 #S{id}R{req} 按会话哈希配色; 状态码保持原波段色
+    const tag = sessTag();
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${tag ? `${sessionColor(sessionKey)(tag)} ` : ""}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 

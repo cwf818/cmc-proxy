@@ -1786,7 +1786,7 @@ let nextSessionId = 1;
 function getSession(key) {
   let s = sessions.get(key);
   if (!s) {
-    s = { id: nextSessionId++, reqSeq: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null };
+    s = { id: nextSessionId++, reqSeq: 0, pending: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null };
     sessions.set(key, s);
   }
   return s;
@@ -1906,6 +1906,7 @@ const server = http.createServer(async (req, res) => {
     return bb ? ` body=${fmtBytes(bb)}` : "";
   };
   // 会话+请求编号标签: 如 S1#10 = 1 号会话的第 10 个请求; 非 model 请求无会话, 返回空串
+  let willQueue = false; // 本请求到达时同会话已有在途请求, RES 前的 REQ 行标 *
   const sessTag = () => {
     return session ? `S${session.id}#${reqNo}` : "";
   };
@@ -1914,7 +1915,7 @@ const server = http.createServer(async (req, res) => {
     req._cmdc.reqLogged = true;
     // 标签 S{id}#{req} 按请求轮转取色, REQ 恒为青色; model 提前到 src 之前, 扫日志先看模型
     const tag = sessTag();
-    console.log(`${cDim(`[${logTs(startAt)}]`)} ${tag ? `${tagColor(tag)} ` : ""}${cCyan("REQ")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${cDim(bodyPart())}`);
+    console.log(`${cDim(`[${logTs(startAt)}]`)} ${tag ? `${tagColor(tag)} ` : ""}${cCyan("REQ") + (willQueue ? cRed("*") : "")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${cDim(bodyPart())}`);
     // CMC_DEBUG_PAYLOAD=1: 打印本地请求完整请求头与 body 原文 (排查会话标识等)
     if (process.env.CMC_DEBUG_PAYLOAD === "1") {
       const headers = {};
@@ -1971,12 +1972,17 @@ const server = http.createServer(async (req, res) => {
   };
   res.on("finish", () => {
     resFinished = true;
-    const ms = Date.now() - startAt;
+    // took 以真正发往上游的时刻起算 (排队等待单列 qwait), 对齐 provider 侧的 API 耗时
+    const dispatchAt = req._cmdc && req._cmdc.dispatchAt;
+    const ms = dispatchAt ? Date.now() - dispatchAt : Date.now() - startAt;
+    const qwaitMs = dispatchAt ? dispatchAt - startAt : 0;
+    const qwaitStr = qwaitMs > 500 ? ` ${cMagenta(`qwait:${(qwaitMs / 1000).toFixed(1)}s`)}` : "";
     const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
     // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
     const u = req._cmdc && req._cmdc.usage;
     let usageStr = "";
     const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms };
+    rec.ms = ms; // 统计口径与 took 一致: 仅计发往上游之后的耗时 (排队等待单列 qwait)
     if (u) {
       const parts = [];
       if (u.input != null) parts.push(`in:${u.input}`);
@@ -2023,7 +2029,7 @@ const server = http.createServer(async (req, res) => {
     const stFn = res.statusCode >= 500 ? cRed : res.statusCode >= 400 ? cYellow : res.statusCode >= 300 ? cCyan : cGreen;
     // 标签 S{id}#{req} 用该请求闭包捕获的颜色 (与 REQ 行同色); 状态码保持原波段色
     const tag = sessTag();
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${tag ? `${tagColor(tag)} ` : ""}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${pfxMark}${movingStr}`);
+    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${tag ? `${tagColor(tag)} ` : ""}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 
@@ -2073,6 +2079,8 @@ const server = http.createServer(async (req, res) => {
       req._cmdc = { model: requested, mapped, stream: isStream };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
+      willQueue = !!(session && (session.pending || 0) > 0);
+      if (session) session.pending = (session.pending || 0) + 1;
       logReq();
 
       if (useAnthropicEndpoint) {
@@ -2081,7 +2089,15 @@ const server = http.createServer(async (req, res) => {
         const upstreamBodyJson = JSON.stringify(body);
         req._cmdc.upstreamBody = upstreamBodyJson;
         if (LOG_LEVEL >= 3) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]]);
-        const releaseUp = await acquireSessionLock(session);
+        const releaseUp0 = await acquireSessionLock(session);
+        req._cmdc.dispatchAt = Date.now(); // took 从真正发往上游起算, 排队等待单列 qwait
+        let upReleased = false;
+        const releaseUp = () => {
+          if (upReleased) return;
+          upReleased = true;
+          if (session) session.pending = Math.max(0, (session.pending || 0) - 1);
+          releaseUp0();
+        };
         req._cmdc.releaseUp = releaseUp;
         let up;
         try {
@@ -2119,7 +2135,15 @@ const server = http.createServer(async (req, res) => {
       if (shouldDumpRequest(pfx.mark)) {
         fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]], pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined);
       }
-      const releaseUp = await acquireSessionLock(session);
+      const releaseUp0 = await acquireSessionLock(session);
+      req._cmdc.dispatchAt = Date.now(); // took 从真正发往上游起算, 排队等待单列 qwait
+      let upReleased = false;
+      const releaseUp = () => {
+        if (upReleased) return;
+        upReleased = true;
+        if (session) session.pending = Math.max(0, (session.pending || 0) - 1);
+        releaseUp0();
+      };
       req._cmdc.releaseUp = releaseUp;
       let up;
       try {
@@ -2182,11 +2206,21 @@ const server = http.createServer(async (req, res) => {
       req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
+      willQueue = !!(session && (session.pending || 0) > 0);
+      if (session) session.pending = (session.pending || 0) + 1;
       logReq();
       const upstreamBodyJson = JSON.stringify(body);
       req._cmdc.upstreamBody = upstreamBodyJson;
       if (LOG_LEVEL >= 3) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]]);
-      const releaseUp = await acquireSessionLock(session);
+      const releaseUp0 = await acquireSessionLock(session);
+        req._cmdc.dispatchAt = Date.now(); // took 从真正发往上游起算, 排队等待单列 qwait
+        let upReleased = false;
+        const releaseUp = () => {
+          if (upReleased) return;
+          upReleased = true;
+          if (session) session.pending = Math.max(0, (session.pending || 0) - 1);
+          releaseUp0();
+        };
         req._cmdc.releaseUp = releaseUp;
       let up;
       try {
@@ -2220,6 +2254,8 @@ const server = http.createServer(async (req, res) => {
       req._cmdc = { model: requested, mapped, stream: isStream };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
+      willQueue = !!(session && (session.pending || 0) > 0);
+      if (session) session.pending = (session.pending || 0) + 1;
       logReq();
 
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
@@ -2230,7 +2266,15 @@ const server = http.createServer(async (req, res) => {
       if (shouldDumpRequest(pfx.mark)) {
         fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]], pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined);
       }
-      const releaseUp = await acquireSessionLock(session);
+      const releaseUp0 = await acquireSessionLock(session);
+        req._cmdc.dispatchAt = Date.now(); // took 从真正发往上游起算, 排队等待单列 qwait
+        let upReleased = false;
+        const releaseUp = () => {
+          if (upReleased) return;
+          upReleased = true;
+          if (session) session.pending = Math.max(0, (session.pending || 0) - 1);
+          releaseUp0();
+        };
         req._cmdc.releaseUp = releaseUp;
       let up;
       try {

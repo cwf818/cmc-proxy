@@ -1615,21 +1615,33 @@ function accumulate(rec, trackRolling) {
 //   - system/tools 变化   -> pfx~tools
 //   - 历史变短 (压缩/重写) -> pfx<本次条数
 const sha1 = (s) => crypto.createHash("sha1").update(s).digest("hex").slice(0, 12);
+// 基线按 tools 哈希分桶: 主请求与并发小探测请求 (不同 tools) 交替到达时互不污染对比基线
+const PFX_BUCKETS_MAX = 4;
 function prefixDivergeMark(session, msgs, toolsJson) {
-  if (!session) return "";
-  const cur = { tools: sha1(toolsJson), msgs: msgs.map((m) => sha1(JSON.stringify(m))) };
-  const prev = session.pfx;
-  session.pfx = cur;
-  if (!prev) return ""; // 首次请求, 无基线
-  if (prev.tools !== cur.tools) return "pfx~tools";
+  if (!session) return { mark: "", detail: "" };
+  const curMsgsJson = msgs.map((m) => JSON.stringify(m));
+  const toolsHash = sha1(toolsJson);
+  if (!session.pfx) session.pfx = new Map();
+  const buckets = session.pfx;
+  const prevMsgs = buckets.get(toolsHash);
+  buckets.set(toolsHash, curMsgsJson);
+  while (buckets.size > PFX_BUCKETS_MAX) buckets.delete(buckets.keys().next().value);
+  if (!prevMsgs) return { mark: "", detail: "" }; // 该 tools 组合首次请求, 无基线
   let i = 0;
-  const common = Math.min(prev.msgs.length, cur.msgs.length);
-  while (i < common && prev.msgs[i] === cur.msgs[i]) i++;
+  const common = Math.min(prevMsgs.length, curMsgsJson.length);
+  while (i < common && prevMsgs[i] === curMsgsJson[i]) i++;
   if (i === common) {
-    if (cur.msgs.length >= prev.msgs.length) return ""; // 纯追加, 健康
-    return `pfx<${cur.msgs.length}`; // 历史变短 (压缩)
+    if (curMsgsJson.length >= prevMsgs.length) return { mark: "", detail: "" }; // 纯追加, 健康
+    return { mark: `pfx<${curMsgsJson.length}`, detail: "历史变短 (压缩/重写)" };
   }
-  return `pfx~${i}`;
+  const role = (j) => {
+    try { const m = JSON.parse(j); return m.role || m.type || "?"; } catch { return "?"; }
+  };
+  const brief = (j) => (j.length > 110 ? j.slice(0, 110) + "…" : j);
+  return {
+    mark: `pfx~${i}`,
+    detail: `消息 ${i} (${role(prevMsgs[i])}) 分叉: 旧 ${brief(prevMsgs[i])} || 新 ${brief(curMsgsJson[i])}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,8 +1850,10 @@ const server = http.createServer(async (req, res) => {
     }
     // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加
     const movingStr = usageStr ? movingStatsStr(session) : "";
-    // 前缀分叉标记: 仅在检测到分叉/压缩时输出 (纯追加为健康状态, 不输出)
-    const pfxMark = req._cmdc && req._cmdc.pfxMark ? ` ${cRed(req._cmdc.pfxMark)}` : "";
+    // 前缀分叉标记: 仅在检测到分叉/压缩时输出 (纯追加为健康状态, 不输出); 分叉内容预览单独成行
+    const pfx = (req._cmdc && req._cmdc.pfx) || { mark: "", detail: "" };
+    const pfxMark = pfx.mark ? ` ${cRed(pfx.mark)}` : "";
+    if (pfx.detail) console.warn(cRed(`[cmc-proxy] ${sessTag()} 前缀分叉: ${pfx.detail}`));
     console.log(`${cDim(`[${logTs(Date.now())}]${sessTag()}`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
@@ -1922,7 +1936,7 @@ const server = http.createServer(async (req, res) => {
 
       // 非 Claude 模型 -> Anthropic -> OpenAI 协议转换
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
-      req._cmdc.pfxMark = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""));
+      req._cmdc.pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""));
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
@@ -2015,7 +2029,7 @@ const server = http.createServer(async (req, res) => {
       logReq();
 
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
-      req._cmdc.pfxMark = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""));
+      req._cmdc.pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""));
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {

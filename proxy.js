@@ -135,6 +135,8 @@ const CC_PASSTHROUGH = config.cacheControlPassthrough !== false; // Anthropic ca
 const CACHE_AFFINITY = config.cacheAffinity !== false; // 按会话注入 user / prompt_cache_key
 const STABILIZE_COUNTERS = config.stabilizeCounters !== false; // 易变配额计数器取整, 稳定前缀缓存
 const STRIP_SYSTEM_REMINDERS = config.stripSystemReminders !== false; // 剥离 history 中注入的 system 提醒消息
+const SERIALIZE_SESSION = config.serializeSessionRequests !== false; // 同会话上游请求串行化
+const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout || "120000", 10); // 上游响应头超时 ms (0=关闭)
 
 // fulllog: 请求落盘 (config.fulllog=true 开启, 写 ROOT/fulllog.log; 值为字符串时作为日志路径)。
 // 每个模型类请求记录两份 body: 客户端原始请求 + 实际转发上游的请求, 便于对照排查转换/缓存问题
@@ -1480,15 +1482,36 @@ function buildUpstreamHeaders(req, extra) {
  *   - fetch 网络层抛错 / 上游返回非 2xx → onRequestFail(requestedModel)
  *   - 上游 2xx → onRequestOk(requestedModel)
  * 调用方无需重复计数; 网络抛错时原样向上抛, 由调用方返回 502。
+ * signal: 与客户端断开联动的中止信号 (客户端断开 → 中止上游等待, 不计失败);
+ * FIRST_BYTE_TIMEOUT: 上游超过该时长未返回响应头时主动中止 (替代 undici 黑盒 300s)。
  */
-async function upstreamFetch(url, init, requestedModel) {
+function upstreamError(message, opts = {}) {
+  return Object.assign(new Error(message), opts);
+}
+
+async function upstreamFetch(url, init, requestedModel, signal) {
   if (requestedModel && blockedSet.has(requestedModel)) warnBlockedModel(requestedModel);
+  const ac = new AbortController();
+  const onOuterAbort = () => ac.abort(signal.reason);
+  if (signal) {
+    if (signal.aborted) ac.abort(signal.reason);
+    else signal.addEventListener("abort", () => ac.abort(signal.reason), { once: true });
+  }
+  const guard = FIRST_BYTE_TIMEOUT > 0
+    ? setTimeout(() => ac.abort(upstreamError(`上游 ${Math.round(FIRST_BYTE_TIMEOUT / 1000)}s 未返回响应头`, { firstByteTimeout: true })), FIRST_BYTE_TIMEOUT)
+    : null;
   let r;
   try {
-    r = await fetch(url, init);
+    r = await fetch(url, { ...init, signal: ac.signal });
   } catch (e) {
+    // 客户端主动断开不算上游失败, 不计轮换; 让调用方按 clientAbort 静默收尾
+    if (signal?.aborted && !e.firstByteTimeout) {
+      throw upstreamError("客户端已断开, 终止上游请求", { clientAbort: true });
+    }
     onRequestFail(requestedModel);
     throw e;
+  } finally {
+    if (guard) clearTimeout(guard);
   }
   if (!r.ok) onRequestFail(requestedModel);
   else onRequestOk(requestedModel);
@@ -1509,6 +1532,7 @@ function warnBlockedModel(model) {
  */
 async function passThrough(res, upstreamResp, opts) {
   const collectUsage = opts && opts.collectUsage;
+  const onDone = opts && opts.onDone;
   const hdrs = upstreamResp.headers || {};
   // Node fetch 的 headers 是 Headers 实例 (支持 .get), 也可能是普通对象, 兼容两者
   const ctype = typeof hdrs.get === "function" ? hdrs.get("content-type") : hdrs["content-type"];
@@ -1550,11 +1574,12 @@ async function passThrough(res, upstreamResp, opts) {
       }
     }
   }
+  if (onDone) onDone();
   res.end();
 }
 
-/** 转换路径共用的上游流消费 + SSE 转换 + usage 收集 */
-async function pumpConvertedStream(up, conv, res, tag) {
+/** 转换路径共用的上游流消费 + SSE 转换 + usage 收集 (onDone: 上游流结束/中断后回调, 用于释放会话锁) */
+async function pumpConvertedStream(up, conv, res, tag, onDone) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -1578,6 +1603,7 @@ async function pumpConvertedStream(up, conv, res, tag) {
   } catch (e) {
     console.warn(TAGW, `${tag} 收尾 SSE 失败:`, e.message);
   }
+  if (onDone) onDone();
   res.end();
 }
 
@@ -1751,6 +1777,19 @@ function getSession(key) {
   return s;
 }
 
+// 同会话上游请求串行化: CC 的探测请求 (会话标题生成) 与主请求毫秒级并发到达,
+// 中转侧曾出现主请求 300s 无响应头悬挂; 同会话改为排队发送规避并发
+// (config.serializeSessionRequests, 默认开)。排队中的请求若客户端断开,
+// 会经由 abort 信号立即失败出队, 不会占用队列。release 幂等, 可多处调用。
+function acquireSessionLock(session) {
+  if (!session || !SERIALIZE_SESSION) return Promise.resolve(() => {});
+  const prev = session.lock || Promise.resolve();
+  let release;
+  const gate = new Promise((r) => (release = r));
+  session.lock = prev.then(() => gate);
+  return prev.then(() => release);
+}
+
 function logTs(ms) {
   const d = new Date(ms);
   return `${d.toLocaleTimeString("zh-CN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
@@ -1896,7 +1935,23 @@ const server = http.createServer(async (req, res) => {
       return origEnd(...args);
     };
   }
+  // 客户端断开联动: 断开即中止上游等待 (避免上游悬挂时黑等到 undici 300s 超时),
+  // 并保证每个请求都有终态日志 (ABT 行), 不再出现 REQ 之后凭空消失的请求
+  const upstreamAbort = new AbortController();
+  let resFinished = false;
+  res.on("error", () => {});
+  res.on("close", () => {
+    if (resFinished) return;
+    upstreamAbort.abort(upstreamError("客户端断开", { clientAbort: true }));
+    console.warn(cRed(`[cmc-proxy]${sessTag()} ABT ${req.method} ${pathname} 客户端断开 (已等待 ${((Date.now() - startAt) / 1000).toFixed(1)}s, 未收到完整响应)`));
+  });
+  // 上游请求异常收尾: 客户端断开时 socket 已死, 只记日志不写响应 (写必抛)
+  const upstreamFail = (e) => {
+    if (e.clientAbort) console.warn(cDim(`[cmc-proxy]${sessTag()} 客户端断开, 放弃上游请求`));
+    else console.warn(TAGW, `上游请求失败: ${e.message}`);
+  };
   res.on("finish", () => {
+    resFinished = true;
     const ms = Date.now() - startAt;
     const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
     // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
@@ -2005,6 +2060,8 @@ const server = http.createServer(async (req, res) => {
         // Claude 模型 -> 直接走上游 /messages
         body.model = mapped;
         if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(body)]]);
+        const releaseUp = await acquireSessionLock(session);
+        req._cmdc.releaseUp = releaseUp;
         let up;
         try {
           up = await upstreamFetch(`${UPSTREAM}/v1/messages`, {
@@ -2014,19 +2071,21 @@ const server = http.createServer(async (req, res) => {
               "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
             }),
             body: JSON.stringify(body),
-          }, mapped);
+          }, mapped, upstreamAbort.signal);
         } catch (e) {
-          console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
+          releaseUp();
+          upstreamFail(e);
+          if (e.clientAbort) return;
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + e.message } }));
           return;
         }
         if (!up.ok) {
           // upstreamFetch 已计失败并可能切换默认模型
-          await passThrough(res, up);
+          await passThrough(res, up, { onDone: releaseUp });
           return;
         }
-        await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); } });
+        await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); }, onDone: releaseUp });
         return;
       }
 
@@ -2035,15 +2094,19 @@ const server = http.createServer(async (req, res) => {
       if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(oaiReq)]]);
       const oaiParams = { ...oaiReq, messages: undefined };
       req._cmdc.pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""), JSON.stringify(oaiParams));
+      const releaseUp = await acquireSessionLock(session);
+      req._cmdc.releaseUp = releaseUp;
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(oaiReq),
-        }, mapped);
+        }, mapped, upstreamAbort.signal);
       } catch (e) {
-        console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
+        releaseUp();
+        upstreamFail(e);
+        if (e.clientAbort) return;
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + e.message } }));
         return;
@@ -2052,6 +2115,7 @@ const server = http.createServer(async (req, res) => {
       if (!isStream) {
         // 非流式: 整体转换
         const text = await up.text();
+        releaseUp();
         if (!up.ok) {
           // upstreamFetch 已计失败并可能切换默认模型
           res.writeHead(up.status, { "Content-Type": up.headers.get("content-type") || "application/json" });
@@ -2079,7 +2143,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const conv = new StreamConverter(requested, estimateInputTokens(body));
-      await pumpConvertedStream(up, conv, res, "messages");
+      await pumpConvertedStream(up, conv, res, "messages", releaseUp);
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
       return;
     }
@@ -2095,21 +2159,25 @@ const server = http.createServer(async (req, res) => {
       req._cmdc.rawBody = bodyRaw || "";
       logReq();
       if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(body)]]);
+      const releaseUp = await acquireSessionLock(session);
+        req._cmdc.releaseUp = releaseUp;
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(body),
-        }, body.model);
+        }, body.model, upstreamAbort.signal);
       } catch (e) {
-        console.warn(TAGW, `上游请求失败 (${body.model}): ${e.message}`);
+        releaseUp();
+        upstreamFail(e);
+        if (e.clientAbort) return;
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "上游请求失败: " + e.message, type: "api_error" } }));
         return;
       }
       // upstreamFetch 已处理失败/成功计数 (非 2xx 已计失败并可能切换默认模型)
-      await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); } });
+      await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); }, onDone: releaseUp });
       return;
     }
 
@@ -2131,15 +2199,19 @@ const server = http.createServer(async (req, res) => {
       if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(chatReq)]]);
       const chatParams = { ...chatReq, messages: undefined };
       req._cmdc.pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify(chatParams));
+      const releaseUp = await acquireSessionLock(session);
+        req._cmdc.releaseUp = releaseUp;
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(chatReq),
-        }, mapped);
+        }, mapped, upstreamAbort.signal);
       } catch (e) {
-        console.warn(TAGW, `上游请求失败 (${mapped}): ${e.message}`);
+        releaseUp();
+        upstreamFail(e);
+        if (e.clientAbort) return;
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "上游请求失败: " + e.message, type: "api_error" } }));
         return;
@@ -2147,6 +2219,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!isStream) {
         const text = await up.text();
+        releaseUp();
         if (!up.ok) {
           // upstreamFetch 已计失败并可能切换默认模型
           res.writeHead(up.status, { "Content-Type": up.headers.get("content-type") || "application/json" });
@@ -2173,7 +2246,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body), customToolNames);
-      await pumpConvertedStream(up, conv, res, "responses");
+      await pumpConvertedStream(up, conv, res, "responses", releaseUp);
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
       return;
     }
@@ -2196,6 +2269,8 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: `Not found: ${pathname}`, type: "invalid_request_error" } }));
   } catch (e) {
+    // 兜底释放会话锁 (正常路径已在各分支释放; release 幂等, 重复调用无副作用)
+    if (req._cmdc && req._cmdc.releaseUp) req._cmdc.releaseUp();
     console.error(TAGE, "处理请求出错:", e.message);
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });

@@ -4,7 +4,6 @@
   "host": "127.0.0.1",
   "upstream": "https://api.commandcode.ai/provider",
   "apiKey": "",
-
   "_默认模型说明": "defaultModels 为数组, 第一个模型作为默认模型。出错后按顺序逐个 fallback: 首个模型连续失败 3 次切换, 后续模型失败 1 次即切换(不重试), 全部轮完循环回到第一个。列表可调整顺序, 模型 id 见 /v1/models 接口。",
   "defaultModels": [
     "deepseek/deepseek-v4-flash",
@@ -13,13 +12,10 @@
     "Qwen/Qwen3.8-27B",
     "xiaomi/mimo-v2.5"
   ],
-
   "_回退开关说明": "fallback: true 开启多模型轮换(默认); false 关闭, 始终只用 defaultModels 的第一个模型。",
   "fallback": true,
-
   "_fulllog说明": "fulllog: true 把每个模型类请求的客户端原始 body 与实际转发上游的 body 落盘到 proxy 目录 fulllog.log (值为字符串时作为自定义路径), 便于对照排查转换/缓存问题; false (默认) 关闭。日志会持续增长, 注意定期清理。",
   "fulllog": false,
-
   "_模型映射说明": "key 是客户端请求的模型名, value 是实际转发到上游的模型名。未命中映射表且上游目录中不存在(含无前缀名匹配)的模型, 会 fallback 到 defaultModels 当前活动模型。",
   "modelMap": {
     "claude-sonnet-4-6": "deepseek/deepseek-v4-flash",
@@ -37,7 +33,6 @@
     "gpt-5.2-codex": "gpt-5.6-sol",
     "gpt-5.1-codex": "gpt-5.6-sol"
   },
-
   "_屏蔽说明": "这些模型在 GOAT 计划下不可用, 从 /v1/models 列表中隐藏, 避免客户端误选。",
   "blockedModels": [
     "claude-sonnet-4-6",
@@ -53,5 +48,9 @@
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "google/gemini-3.6-flash"
-  ]
+  ],
+  "_串行化说明": "serializeSessionRequests: 同一会话的上游请求串行发送 (默认 true)。CC 的会话标题探测请求与主请求毫秒级并发时, 中转侧曾出现主请求 300s 无响应头悬挂; 串行化规避并发。排队中的请求若客户端断开会立即出队。",
+  "serializeSessionRequests": true,
+  "_首字节超时说明": "firstByteTimeout: 上游超过该毫秒数未返回响应头时主动中止并返回 502 (0=关闭, 兜底 undici 的 300s)。默认 120000。",
+  "firstByteTimeout": 120000
 }

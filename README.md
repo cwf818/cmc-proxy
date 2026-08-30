@@ -192,6 +192,8 @@ DeepSeek 等上游的前缀缓存要求**同会话请求的消息前缀逐字节
 | `cacheControlPassthrough` | `true` | Anthropic `cache_control` 标记透传为 OpenAI content part（对支持显式缓存的后端生效，已验证不影响本上游的缓存键） |
 | `cacheAffinity` | `true` | 按会话注入稳定 `user` / `prompt_cache_key`（Claude Code 取会话 UUID，Codex 透传其自带值），便于上游按会话做缓存路由 |
 | `fulllog` | `false` | 请求落盘：把每个模型类请求的客户端原始 body 与实际转发上游的 body 追加写入 `fulllog.log`（值为字符串时作为自定义路径），对照排查转换/缓存问题；日志会持续增长，注意清理 |
+| `serializeSessionRequests` | `true` | 同会话上游请求**串行发送**：CC 的会话标题探测请求（4KB，自动起名）与主请求毫秒级并发到达时，中转侧出现过主请求长时间无响应头悬挂；串行化规避并发，排队中的请求若客户端断开会立即出队 |
+| `firstByteTimeout` | `120000` | 上游超过该毫秒数未返回响应头时主动中止并返回 502（`0` 关闭）。替代 undici 隐性的 300s 黑盒超时，悬挂请求 2 分钟内可见明确错误 |
 
 配套的**前缀分叉探测**：RES 行在检测到与该会话上一次请求相比前缀发生变化时输出红色标记——`pfx~N`（第 N 条消息变化，索引含 system）、`pfx~tools`（工具定义变化）、`pfx~params`（顶层参数变化，附字段名）、`pfx<N`（历史变短，压缩）；纯追加（健康）不输出。同时打印一行分叉内容预览（新旧 JSON 各截 110 字符），可直接看出客户端改写了什么。前缀纯追加时同会话缓存应稳定在 95%+；若出现 `pfx~` 标记即该位置之后本轮必然后缀缓存失效。
 

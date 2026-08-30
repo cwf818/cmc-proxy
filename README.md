@@ -9,7 +9,7 @@
 - 零第三方依赖，仅需 Node.js ≥ 18（内置 `fetch`/`ReadableStream`）
 - 同时提供 **OpenAI 兼容**（`/v1/chat/completions`，供 Codex）与 **Anthropic 兼容**（`/v1/messages`，供 Claude Code）端点
 - 内置 **Anthropic ↔ OpenAI 协议转换**：GOAT 订阅不含任何 Claude 模型，Claude Code 的请求会自动转换格式并映射到你配置的模型上（默认 `deepseek/deepseek-v4-flash`），流式 + 工具调用全链路支持
-- 内置 **多模型轮换 fallback**：`defaultModels` 数组按序轮换，首个模型连续失败 3 次自动切换下一个，后续模型失败 1 次即切换（不重试），全部轮完循环回第一个；计数按模型归属（显式请求其他模型的失败不计入轮换）；可用 `fallback` 开关关闭
+- 内置 **多模型轮换**：`defaultModels` 数组按序轮换，首个模型连续失败 3 次自动切换下一个，后续模型失败 1 次即切换（不重试），全部轮完循环回第一个；计数按模型归属（显式请求其他模型的失败不计入轮换）；仅配置一个模型即钉死不轮换（替代旧 `fallback: false`，该参数已移除）
 - **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源
 - **Codex 新协议全兼容**：`custom`（apply_patch freeform）/ `tool_search`（延迟工具发现）/ `namespace` 工具组 / 顶层 `function_call` 历史等新形态全链路支持
 - 支持流式 SSE 透传、token 用量上报、模型列表过滤、分级请求落盘（环境变量 `CMC_LOGGING_FILE`）
@@ -139,13 +139,12 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 - 换模型：改 `config.json` 的 `defaultModels`（数组，第一个为默认模型），或在 `modelMap` 里把特定模型名映射到目标模型后重启。
 - GOAT 按订阅额度计费，模型实际可用性以上游返回为准。
 
-### 多模型轮换（fallback）
+### 多模型轮换（阈值模式）
 
 `config.json` 的 `defaultModels` 是**数组**，第一个模型作为默认模型：
 
 ```json
 {
-  "fallback": true,
   "defaultModels": [
     "deepseek/deepseek-v4-flash",
     "deepseek/deepseek-v4-flash-vision-exp",
@@ -169,7 +168,30 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 [cmc-proxy] 模型 deepseek/deepseek-v4-flash 连续失败 3 次, 默认模型切换 → deepseek/deepseek-v4-flash-vision-exp
 ```
 
-`fallback: false` 时关闭轮换，始终使用 `defaultModels[0]`。旧配置中的 `defaultModel` 字段仍兼容（视为单元素列表）。
+只配置**一个**模型时即钉死单模型、完全不轮换（旧配置的 `fallback: false` 参数已移除，钉死语义由单元素列表表达；残留的 `fallback: false` 启动时会提示迁移）。旧配置中的 `defaultModel` 字段仍兼容（视为单元素列表）。
+
+### 失败即时轮换（switchOnFail）
+
+上面的阈值轮换是"事后补救"：当次失败请求原样返回，只影响下一次请求的默认模型。`config.json` 的 `switchOnFail: true` 切换为"就地补救"——**单次请求内**失败即按列表逐个换模型重试，直到成功或试完：
+
+```json
+{
+  "switchOnFail": true
+}
+```
+
+开启后的精确语义（`proxy.js` 的 `upstreamFetchRotate`）：
+
+1. **重试起点**：先试"解析后的模型"——`modelMap` 显式映射优先级不变，映射后的模型按映射后对待；客户端显式指定的模型仍第一个试（尊重显式意图，包括 `blockedModels` 中的模型）。
+2. **候选序列**：起点失败后按 `defaultModels` 列表顺序逐个重试，与起点重复的模型自动去重；起点不在列表中（如映射到 `gpt-5.6-sol`）时，先试它一次再轮完整列表。
+3. **哪些失败才轮换**：仅限"换模型重试有意义"的失败——403/404/408/429/5xx 与网络层错误（含首字节超时）。400/401/413/422 等（请求体非法、key 无效、body 超限）换任何模型结果都一样，不轮换、直接透传，避免一个失败放大成 N 个。
+4. **成功即停**：任一候选返回 2xx 即用该响应继续原有流程（流式转换/透传）。
+5. **全部试完**：把**最后一次**尝试的上游响应（状态码 + body）或错误透传给客户端，客户端看到的是真实收尾结果；同时打印每次尝试的轮换日志（含 `S3#1` 会话标签与尝试序号）。
+6. **指针归属**：发生过 fallback 且最终成功时，默认模型指针（`activeModelIdx`）跟到成功的模型上，后续默认请求直接绕开已死模型；全部试完仍失败则指针不动。客户端显式指定且一次成功的请求不动指针。
+7. **边界**：重试仅覆盖**响应头阶段**的失败（拿到响应头之后、向客户端写任何字节之前，重试是安全的）；**中途断流不可重试**（字节已发出）。客户端主动断开立即终止重试循环。
+8. **与阈值轮换的关系**：开启后原有的"连续失败 3 次/1 次切换"阈值逻辑不再参与判定（每次失败当场就换，无需计数），仅保留成功清零等辅助语义；两种模式的轮换范围都由 `defaultModels` 决定，仅一个模型时都不轮换。
+
+**代价须知**：最坏耗时 ≈ 候选数 × 各自的首字节超时（`firstByteTimeout`，默认 120s），且全程持有会话串行锁，同会话后续请求会排队——5 个模型的配置最坏可拖数分钟。通常配较小的 `firstByteTimeout`（如 15~30s）使用。
 
 ### 模型匹配规则
 

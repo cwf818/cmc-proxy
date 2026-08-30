@@ -58,6 +58,13 @@
  *   9. stripSystemReminders (默认 true): 整条剥离 history 中注入的 system 提醒
  *      (配额计数/任务催促), 提示性内容不影响编码能力; fulllog 开关: 把客户端原始
  *      请求与转发上游的请求落盘 (ROOT/fulllog.log, 值为字符串时自定义路径)。
+ *  10. switchOnFail (默认 false): 失败即时轮换。开启后单次请求内上游失败 (仅限 403/404/408/
+ *      429/5xx 与网络层错误; 400/401/413 等换模型无济于事的不轮换) 即按 defaultModels 顺序
+ *      逐个重试 (解析后的模型优先, 显式映射优先级不变, 去重), 直到 2xx 成功或全部试完后把
+ *      最后一次上游响应/错误透传给客户端; 轮换成功后默认模型指针跟到成功的模型。关闭时保持
+ *      阈值轮换逻辑不变。defaultModels 仅一个模型时两种模式都不轮换; 旧 fallback 参数已移除,
+ *      其 false 语义 (钉死单模型) 由仅配置一个 defaultModels 表达。重试仅覆盖响应头阶段,
+ *      中途断流不可重试。
  */
 "use strict";
 
@@ -117,7 +124,8 @@ function loadConfig() {
     host: "127.0.0.1",
     upstream: "https://api.commandcode.ai/provider",
     apiKey: "",
-    fallback: true,
+    switchOnFail: false,
+    defaultModels: ["deepseek/deepseek-v4-flash"],
     defaultModels: ["deepseek/deepseek-v4-flash"],
     modelMap: {},
     blockedModels: [],
@@ -188,8 +196,14 @@ const defaultModels = (Array.isArray(config.defaultModels) && config.defaultMode
   ? config.defaultModels
   : [config.defaultModel || "deepseek/deepseek-v4-flash"];
 
-// fallback 开关: 默认开启; 关闭时永远使用 defaultModels[0], 不做任何切换
-const FALLBACK_ENABLED = config.fallback !== false;
+// 失败即时轮换 (默认关闭): 开启后单次请求内失败即按 defaultModels 逐个重试, 直到成功或试完;
+// 关闭时保持阈值轮换逻辑 (连续失败 N 次仅切换下一次请求的默认模型, 当次失败原样返回)。
+// defaultModels 仅一个模型时两种模式都不轮换。旧配置的 fallback 参数已移除: 其 false 语义
+// (钉死单模型) 由"仅配置一个 defaultModels"表达, 残留的 fallback:false 会在启动时提示迁移。
+const SWITCH_ON_FAIL = config.switchOnFail === true;
+if (config.fallback === false) {
+  console.warn(TAGW, `配置中的 fallback 参数已移除: 钉死单模型的语义请只保留 defaultModels 中的一个模型; 当前列表有 ${defaultModels.length} 个模型, 将按${SWITCH_ON_FAIL ? "switchOnFail 即时轮换" : "阈值轮换"}处理`);
+}
 
 // 轮换状态 (全局, 跨请求): 当前活动模型下标 + 失败计数
 let activeModelIdx = 0;
@@ -206,7 +220,7 @@ function currentDefaultModel() {
  *  仅统计当前默认模型自身的失败: 客户端显式请求其他模型 (如 blockedModels 中的
  *  gpt-5.6-luna 被上游 403) 时, 失败不记到默认模型头上, 避免触发无谓轮换 */
 function onRequestFail(failedModel) {
-  if (!FALLBACK_ENABLED || defaultModels.length < 2) return false;
+  if (defaultModels.length < 2) return false;
   if (failedModel && failedModel !== defaultModels[activeModelIdx]) return false;
   const limit = activeModelIdx === 0 ? FIRST_FAIL_LIMIT : OTHER_FAIL_LIMIT;
   activeModelFails += 1;
@@ -1501,8 +1515,8 @@ function upstreamError(message, opts = {}) {
   return Object.assign(new Error(message), opts);
 }
 
-async function upstreamFetch(url, init, requestedModel, signal) {
-  if (requestedModel && blockedSet.has(requestedModel)) warnBlockedModel(requestedModel);
+/** 底层单次上游请求: 带客户端断开联动与首字节超时看门狗, 不做任何计数/轮换 */
+async function rawUpstreamFetch(url, init, signal) {
   const ac = new AbortController();
   const onOuterAbort = () => ac.abort(signal.reason);
   if (signal) {
@@ -1512,9 +1526,18 @@ async function upstreamFetch(url, init, requestedModel, signal) {
   const guard = FIRST_BYTE_TIMEOUT > 0
     ? setTimeout(() => ac.abort(upstreamError(`上游 ${Math.round(FIRST_BYTE_TIMEOUT / 1000)}s 未返回响应头`, { firstByteTimeout: true })), FIRST_BYTE_TIMEOUT)
     : null;
+  try {
+    return await fetch(url, { ...init, signal: ac.signal });
+  } finally {
+    if (guard) clearTimeout(guard);
+  }
+}
+
+async function upstreamFetch(url, init, requestedModel, signal) {
+  if (requestedModel && blockedSet.has(requestedModel)) warnBlockedModel(requestedModel);
   let r;
   try {
-    r = await fetch(url, { ...init, signal: ac.signal });
+    r = await rawUpstreamFetch(url, init, signal);
   } catch (e) {
     // 客户端主动断开不算上游失败, 不计轮换; 让调用方按 clientAbort 静默收尾
     if (signal?.aborted && !e.firstByteTimeout) {
@@ -1522,12 +1545,92 @@ async function upstreamFetch(url, init, requestedModel, signal) {
     }
     onRequestFail(requestedModel);
     throw e;
-  } finally {
-    if (guard) clearTimeout(guard);
   }
   if (!r.ok) onRequestFail(requestedModel);
   else onRequestOk(requestedModel);
   return r;
+}
+
+/** switchOnFail 视为"换模型重试有意义"的上游状态码; 400/401/413/422 等换模型无济于事, 不轮换 */
+const ROTATE_STATUSES = new Set([403, 404, 408, 429, 500, 502, 503, 504]);
+
+/** switchOnFail: 轮换成功后把默认模型指针落到最终成功的模型上 (仅列表内模型), 使后续默认请求直接绕开已死模型 */
+function settleRotatePointer(model) {
+  const idx = defaultModels.indexOf(model);
+  if (idx < 0) return;
+  if (idx === activeModelIdx) { activeModelFails = 0; return; }
+  const from = defaultModels[activeModelIdx];
+  activeModelIdx = idx;
+  activeModelFails = 0;
+  console.warn(TAGI, `switchOnFail: 默认模型指针 ${from} → ${model}`);
+}
+
+/**
+ * 上游请求统一入口 (四个转发路径共用)。
+ * switchOnFail=false: 与 upstreamFetch 完全一致 (阈值轮换计数, 当次失败原样返回)。
+ * switchOnFail=true: 单次请求内失败即时轮换 —— 先试解析后的模型 (modelMap 显式映射优先级不变),
+ * 失败 (仅限 ROTATE_STATUSES 与网络层错误) 后按 defaultModels 列表顺序逐个重试 (去重),
+ * 直到某次 2xx 成功, 或全部试完后把最后一次上游响应/错误透传给调用方。
+ * hooks.onModel(finalModel): 轮换后回调实际使用的模型, 供 RES 行 model= 展示。
+ * 注意: 重试仅覆盖响应头阶段的失败; 中途断流时字节已发往客户端, 无法重试 (与现状一致)。
+ */
+async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
+  const { sessTag, onModel } = hooks;
+  if (!SWITCH_ON_FAIL) {
+    const r = await upstreamFetch(url, init, firstModel, signal);
+    if (onModel) onModel(firstModel);
+    return r;
+  }
+  if (firstModel && blockedSet.has(firstModel)) warnBlockedModel(firstModel);
+  // 候选序列: 解析后的模型优先 (尊重客户端显式意图), 再按 defaultModels 顺序补全, 去重
+  const candidates = [];
+  const seen = new Set();
+  const add = (m) => { if (m && !seen.has(m)) { seen.add(m); candidates.push(m); } };
+  add(firstModel);
+  for (const m of defaultModels) add(m);
+  const pfx = sessTag ? `${sessTag()} ` : "";
+  // 每次尝试按候选模型重写 JSON body 的 model 字段 (轮换不能只换计数名, 上游实际收到的模型必须跟着变)
+  const attemptInit = (model) => {
+    if (typeof init.body !== "string") return init;
+    try {
+      const obj = JSON.parse(init.body);
+      obj.model = model;
+      return { ...init, body: JSON.stringify(obj) };
+    } catch {
+      return init;
+    }
+  };
+  for (let i = 0; i < candidates.length; i++) {
+    const model = candidates[i];
+    const next = i + 1 < candidates.length ? candidates[i + 1] : null;
+    try {
+      const r = await rawUpstreamFetch(url, attemptInit(model), signal);
+      if (r.ok) {
+        if (i > 0) settleRotatePointer(model); // 发生过 fallback: 指针跟到成功的模型, 后续默认请求绕开死模型
+        else if (model === defaultModels[activeModelIdx]) activeModelFails = 0;
+        if (onModel) onModel(model);
+        return r;
+      }
+      if (!ROTATE_STATUSES.has(r.status)) {
+        if (onModel) onModel(model);
+        return r; // 400/401/413 等换模型无济于事的失败: 不轮换, 原样透传
+      }
+      if (next) {
+        console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), switchOnFail 轮换 → ${next} (${i + 1}/${candidates.length})`);
+        try { r.body?.cancel(); } catch { /* 丢弃已失败响应 */ }
+        continue;
+      }
+      if (onModel) onModel(model);
+      return r; // 全部候选试完: 透传最后一次上游响应给客户端
+    } catch (e) {
+      if (e.clientAbort) throw e; // 客户端已断开, 立即终止, 不再重试
+      if (next) {
+        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${e.message}, switchOnFail 轮换 → ${next} (${i + 1}/${candidates.length})`);
+        continue;
+      }
+      throw e; // 全部候选试完: 抛最后一次错误, 调用方按 502 收尾
+    }
+  }
 }
 
 const blockedModelWarned = new Set();
@@ -2101,14 +2204,14 @@ const server = http.createServer(async (req, res) => {
         req._cmdc.releaseUp = releaseUp;
         let up;
         try {
-          up = await upstreamFetch(`${UPSTREAM}/v1/messages`, {
+          up = await upstreamFetchRotate(`${UPSTREAM}/v1/messages`, {
             method: "POST",
             headers: buildUpstreamHeaders(req, {
               "Content-Type": "application/json",
               "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
             }),
             body: JSON.stringify(body),
-          }, mapped, upstreamAbort.signal);
+          }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
         } catch (e) {
           releaseUp();
           upstreamFail(e);
@@ -2118,7 +2221,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         if (!up.ok) {
-          // upstreamFetch 已计失败并可能切换默认模型
+          // upstreamFetchRotate 已计失败并可能切换默认模型 (switchOnFail=true 时已就地轮换重试)
           await passThrough(res, up, { onDone: releaseUp });
           return;
         }
@@ -2147,11 +2250,11 @@ const server = http.createServer(async (req, res) => {
       req._cmdc.releaseUp = releaseUp;
       let up;
       try {
-        up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
+        up = await upstreamFetchRotate(`${UPSTREAM}/v1/chat/completions`, {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(oaiReq),
-        }, mapped, upstreamAbort.signal);
+        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2166,7 +2269,7 @@ const server = http.createServer(async (req, res) => {
         const text = await up.text();
         releaseUp();
         if (!up.ok) {
-          // upstreamFetch 已计失败并可能切换默认模型
+          // upstreamFetchRotate 已计失败并可能切换默认模型 (switchOnFail=true 时已就地轮换重试)
           res.writeHead(up.status, { "Content-Type": up.headers.get("content-type") || "application/json" });
           res.end(text);
           return;
@@ -2187,6 +2290,7 @@ const server = http.createServer(async (req, res) => {
       // 流式: 逐 chunk 转换 SSE
       if (!up.ok) {
         const text = await up.text();
+        releaseUp();
         res.writeHead(up.status, { "Content-Type": "application/json" });
         res.end(text);
         return;
@@ -2224,11 +2328,11 @@ const server = http.createServer(async (req, res) => {
         req._cmdc.releaseUp = releaseUp;
       let up;
       try {
-        up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
+        up = await upstreamFetchRotate(`${UPSTREAM}/v1/chat/completions`, {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(body),
-        }, body.model, upstreamAbort.signal);
+        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2278,11 +2382,11 @@ const server = http.createServer(async (req, res) => {
         req._cmdc.releaseUp = releaseUp;
       let up;
       try {
-        up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
+        up = await upstreamFetchRotate(`${UPSTREAM}/v1/chat/completions`, {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(chatReq),
-        }, mapped, upstreamAbort.signal);
+        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2296,7 +2400,7 @@ const server = http.createServer(async (req, res) => {
         const text = await up.text();
         releaseUp();
         if (!up.ok) {
-          // upstreamFetch 已计失败并可能切换默认模型
+          // upstreamFetchRotate 已计失败并可能切换默认模型 (switchOnFail=true 时已就地轮换重试)
           res.writeHead(up.status, { "Content-Type": up.headers.get("content-type") || "application/json" });
           res.end(text);
           return;
@@ -2316,6 +2420,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!up.ok) {
         const text = await up.text();
+        releaseUp();
         res.writeHead(up.status, { "Content-Type": "application/json" });
         res.end(text);
         return;
@@ -2366,7 +2471,7 @@ server.listen(PORT, HOST, () => {
   console.log(cBlue(`  监听地址   : http://${HOST}:${PORT}`));
   console.log(cBlue(`  上游端点   : ${UPSTREAM}`));
   console.log(cBlue(`  默认模型   : ${currentDefaultModel()}  (轮换列表: ${defaultModels.join(" → ")})`));
-  console.log(cBlue(`  模型回退   : ${FALLBACK_ENABLED ? `开启 (首个模型失败 ${FIRST_FAIL_LIMIT} 次后逐一切换, 后续模型失败 ${OTHER_FAIL_LIMIT} 次即切换, 循环)` : "关闭 (始终使用第一个模型)"}`));
+  console.log(cBlue(`  失败即轮换 : ${defaultModels.length < 2 ? "不适用 (defaultModels 仅一个模型, 不轮换)" : SWITCH_ON_FAIL ? "开启 (switchOnFail, 单次请求内失败按 defaultModels 逐个重试, 试完透传)" : "关闭 (阈值轮换: 首个模型连续失败 3 次切换, 后续失败 1 次即切换, 循环)"}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
   console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));

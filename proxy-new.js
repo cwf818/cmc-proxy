@@ -131,6 +131,7 @@ const API_KEY = process.env.CMDC_API_KEY || config.apiKey || "";
 const CC_PASSTHROUGH = config.cacheControlPassthrough !== false; // Anthropic cache_control -> OpenAI content part
 const CACHE_AFFINITY = config.cacheAffinity !== false; // 按会话注入 user / prompt_cache_key
 const STABILIZE_COUNTERS = config.stabilizeCounters !== false; // 易变配额计数器取整, 稳定前缀缓存
+const STRIP_SYSTEM_REMINDERS = config.stripSystemReminders !== false; // 剥离 history 中注入的 system 提醒消息
 
 if (!API_KEY) {
   console.error(TAGE, "错误: 未配置 apiKey。请在 config.json 中填入你的 commandcode API key，");
@@ -450,9 +451,11 @@ function anthropicMessageToOpenAI(msg) {
   }
 
   // system 等其他 role (Claude Code 2.1.251+ 会往 messages 里注入 system 角色的
-  // 上下文提醒, 如 <total_tokens> 配额计数): 提取纯文本, 块数组按 \n\n 拼接 ——
-  // 这样"块数组形态"与"拼接字符串形态"产生相同字节, 客户端两种写法切换不再破坏前缀
+  // 上下文提醒, 如 <total_tokens> 配额计数): 默认整条剥离 —— 纯提示性内容, 每轮
+  // 变化且被回溯改写, 是前缀缓存杀手; 剥离后模型每轮仍能正常编码, CC 下一轮会
+  // 重新注入。config.stripSystemReminders=false 可保留 (保留时提取纯文本)。
   if (role === "system") {
+    if (STRIP_SYSTEM_REMINDERS) return null;
     const text = extractReminderText(msg.content);
     if (text) return { role: "system", content: text };
     return null;
@@ -1656,22 +1659,36 @@ function accumulate(rec, trackRolling) {
 const sha1 = (s) => crypto.createHash("sha1").update(s).digest("hex").slice(0, 12);
 // 基线按 tools 哈希分桶: 主请求与并发小探测请求 (不同 tools) 交替到达时互不污染对比基线
 const PFX_BUCKETS_MAX = 4;
-function prefixDivergeMark(session, msgs, toolsJson) {
+function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
   if (!session) return { mark: "", detail: "" };
   const curMsgsJson = msgs.map((m) => JSON.stringify(m));
   const toolsHash = sha1(toolsJson);
   if (!session.pfx) session.pfx = new Map();
   const buckets = session.pfx;
-  const prevMsgs = buckets.get(toolsHash);
-  buckets.set(toolsHash, curMsgsJson);
+  const prev = buckets.get(toolsHash);
+  buckets.set(toolsHash, { msgs: curMsgsJson, params: paramsJson });
   while (buckets.size > PFX_BUCKETS_MAX) buckets.delete(buckets.keys().next().value);
-  if (!prevMsgs) return { mark: "", detail: "" }; // 该 tools 组合首次请求, 无基线
+  if (!prev) return { mark: "", detail: "" }; // 该 tools 组合首次请求, 无基线
   let i = 0;
-  const common = Math.min(prevMsgs.length, curMsgsJson.length);
-  while (i < common && prevMsgs[i] === curMsgsJson[i]) i++;
+  const common = Math.min(prev.msgs.length, curMsgsJson.length);
+  while (i < common && prev.msgs[i] === curMsgsJson[i]) i++;
   if (i === common) {
-    if (curMsgsJson.length >= prevMsgs.length) return { mark: "", detail: "" }; // 纯追加, 健康
-    return { mark: `pfx<${curMsgsJson.length}`, detail: "历史变短 (压缩/重写)" };
+    if (curMsgsJson.length < prev.msgs.length) {
+      return { mark: `pfx<${curMsgsJson.length}`, detail: "历史变短 (压缩/重写)" };
+    }
+    // 消息纯追加: 再查 messages 之外的顶层参数 (max_tokens/temperature/tool_choice 等)
+    if (prev.params !== paramsJson) {
+      let keys = "";
+      try {
+        const a = JSON.parse(prev.params);
+        const b = JSON.parse(paramsJson);
+        keys = [...new Set([...Object.keys(a), ...Object.keys(b)])]
+          .filter((k) => JSON.stringify(a[k]) !== JSON.stringify(b[k]))
+          .join(",");
+      } catch { keys = "?"; }
+      return { mark: "pfx~params", detail: `顶层参数变化: ${keys || "?"}` };
+    }
+    return { mark: "", detail: "" }; // 纯追加且参数一致, 健康
   }
   const role = (j) => {
     try { const m = JSON.parse(j); return m.role || m.type || "?"; } catch { return "?"; }
@@ -1679,7 +1696,7 @@ function prefixDivergeMark(session, msgs, toolsJson) {
   const brief = (j) => (j.length > 110 ? j.slice(0, 110) + "…" : j);
   return {
     mark: `pfx~${i}`,
-    detail: `消息 ${i} (${role(prevMsgs[i])}) 分叉: 旧 ${brief(prevMsgs[i])} || 新 ${brief(curMsgsJson[i])}`,
+    detail: `消息 ${i} (${role(prev.msgs[i])}) 分叉: 旧 ${brief(prev.msgs[i])} || 新 ${brief(curMsgsJson[i])}`,
   };
 }
 
@@ -1975,7 +1992,8 @@ const server = http.createServer(async (req, res) => {
 
       // 非 Claude 模型 -> Anthropic -> OpenAI 协议转换
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
-      req._cmdc.pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""));
+      const oaiParams = { ...oaiReq, messages: undefined };
+      req._cmdc.pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""), JSON.stringify(oaiParams));
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
@@ -2068,7 +2086,8 @@ const server = http.createServer(async (req, res) => {
       logReq();
 
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
-      req._cmdc.pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""));
+      const chatParams = { ...chatReq, messages: undefined };
+      req._cmdc.pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify(chatParams));
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {

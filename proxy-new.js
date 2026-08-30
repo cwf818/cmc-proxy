@@ -49,6 +49,12 @@
  *      被上游 403) 的失败不再记到当前默认模型头上触发无谓轮换; blocked 模型转发时
  *      打印一次性告警; additional_tools 历史条目 (codex 内联的附加工具定义) 合并进
  *      请求 tools 并按名去重。
+ *   8. 前缀分叉探测器: RES 行 pfx~N/pfx~tools/pfx<N 标记 + 分叉内容预览, 定位缓存
+ *      命中率低的来源。借此确认 Claude Code 2.1.251 注入的 <total_tokens> 配额计数
+ *      会随轮次回溯改写, 是 Claude Code 路径缓存失效的元凶 —— 现将计数就近取整到
+ *      百万 (14977212 -> 15000000) 使前缀字节稳定, config.stabilizeCounters 可关;
+ *      同时修复 messages 内 system 提醒的块数组被 JSON.stringify 成乱码的问题
+ *      (改为文本提取, 块数组与拼接字符串两种客户端形态产生相同字节)。
  */
 "use strict";
 
@@ -124,6 +130,7 @@ const API_KEY = process.env.CMDC_API_KEY || config.apiKey || "";
 // 缓存优化开关 (可选配置, 默认开启; 关闭后回退为最朴素的转换行为)
 const CC_PASSTHROUGH = config.cacheControlPassthrough !== false; // Anthropic cache_control -> OpenAI content part
 const CACHE_AFFINITY = config.cacheAffinity !== false; // 按会话注入 user / prompt_cache_key
+const STABILIZE_COUNTERS = config.stabilizeCounters !== false; // 易变配额计数器取整, 稳定前缀缓存
 
 if (!API_KEY) {
   console.error(TAGE, "错误: 未配置 apiKey。请在 config.json 中填入你的 commandcode API key，");
@@ -361,7 +368,7 @@ function anthropicBlocksToParts(blocks) {
   const parts = [];
   for (const b of blocks) {
     if (b.type === "text" && b.text) {
-      const p = { type: "text", text: b.text };
+      const p = { type: "text", text: stabilizeVolatileText(b.text) };
       if (CC_PASSTHROUGH && b.cache_control) p.cache_control = b.cache_control;
       parts.push(p);
     } else if (b.type === "image") {
@@ -442,8 +449,40 @@ function anthropicMessageToOpenAI(msg) {
     return omsg;
   }
 
-  // system 等其他 role 直接透传
+  // system 等其他 role (Claude Code 2.1.251+ 会往 messages 里注入 system 角色的
+  // 上下文提醒, 如 <total_tokens> 配额计数): 提取纯文本, 块数组按 \n\n 拼接 ——
+  // 这样"块数组形态"与"拼接字符串形态"产生相同字节, 客户端两种写法切换不再破坏前缀
+  if (role === "system") {
+    const text = extractReminderText(msg.content);
+    if (text) return { role: "system", content: text };
+    return null;
+  }
   return { role, content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) };
+}
+
+/**
+ * 易变计数器稳定化: Claude Code 2.1.251 注入的 <total_tokens>N tokens left</total_tokens>
+ * 配额计数每轮回溯改写, 是前缀缓存失效的元凶。将数值就近取整到 100 万
+ * (14977212 -> 15000000), 回溯改写前后字节一致, 语义仅损失粗粒度精度。
+ * 可用 config.stabilizeCounters=false 关闭。
+ */
+const VOLATILE_COUNTER_RE = /(<total_tokens>)(\d+)( tokens left<\/total_tokens>)/g;
+function stabilizeVolatileText(s) {
+  if (!STABILIZE_COUNTERS || typeof s !== "string" || s.indexOf("<total_tokens>") < 0) return s;
+  return s.replace(VOLATILE_COUNTER_RE, (_, p, num, q) => p + Math.round(parseInt(num, 10) / 1e6) * 1e6 + q);
+}
+
+/** system 提醒消息的文本提取: 字符串原样; 块数组取 text 块按 \n\n 拼接 */
+function extractReminderText(content) {
+  if (typeof content === "string") return stabilizeVolatileText(content);
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((b) => b && b.type === "text" && b.text)
+      .map((b) => stabilizeVolatileText(b.text))
+      .join("\n\n");
+    return text || null;
+  }
+  return content == null ? null : String(content);
 }
 
 /** 缓存亲和 user 字段: 仅取稳定的会话标识 (Claude Code 会话 UUID), 无则不注入 */

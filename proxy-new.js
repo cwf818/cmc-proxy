@@ -53,6 +53,7 @@
 "use strict";
 
 const http = require("http");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -1606,6 +1607,32 @@ function accumulate(rec, trackRolling) {
 }
 
 // ---------------------------------------------------------------------------
+// 请求前缀分叉检测 (定位缓存命中率低的来源)
+// ---------------------------------------------------------------------------
+// 对转换后的上游请求逐条消息做哈希, 与该会话上一次请求对比:
+//   - 纯追加 (上次的全部消息与本次一致) -> 健康, 不输出
+//   - 在第 i 条消息处分叉 -> RES 行输出红色 pfx~i (该位置之后本轮必然无法命中前缀缓存)
+//   - system/tools 变化   -> pfx~tools
+//   - 历史变短 (压缩/重写) -> pfx<本次条数
+const sha1 = (s) => crypto.createHash("sha1").update(s).digest("hex").slice(0, 12);
+function prefixDivergeMark(session, msgs, toolsJson) {
+  if (!session) return "";
+  const cur = { tools: sha1(toolsJson), msgs: msgs.map((m) => sha1(JSON.stringify(m))) };
+  const prev = session.pfx;
+  session.pfx = cur;
+  if (!prev) return ""; // 首次请求, 无基线
+  if (prev.tools !== cur.tools) return "pfx~tools";
+  let i = 0;
+  const common = Math.min(prev.msgs.length, cur.msgs.length);
+  while (i < common && prev.msgs[i] === cur.msgs[i]) i++;
+  if (i === common) {
+    if (cur.msgs.length >= prev.msgs.length) return ""; // 纯追加, 健康
+    return `pfx<${cur.msgs.length}`; // 历史变短 (压缩)
+  }
+  return `pfx~${i}`;
+}
+
+// ---------------------------------------------------------------------------
 // 会话跟踪 (按本地 agent 进程区分, 自增编号)
 // ---------------------------------------------------------------------------
 // 会话 key 优先级 (稳定标识优先, 端口回退仅作最后兜底):
@@ -1625,7 +1652,7 @@ let nextSessionId = 1;
 function getSession(key) {
   let s = sessions.get(key);
   if (!s) {
-    s = { id: nextSessionId++, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0 };
+    s = { id: nextSessionId++, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null };
     sessions.set(key, s);
   }
   return s;
@@ -1811,7 +1838,9 @@ const server = http.createServer(async (req, res) => {
     }
     // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加
     const movingStr = usageStr ? movingStatsStr(session) : "";
-    console.log(`${cDim(`[${logTs(Date.now())}]${sessTag()}`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${movingStr}`);
+    // 前缀分叉标记: 仅在检测到分叉/压缩时输出 (纯追加为健康状态, 不输出)
+    const pfxMark = req._cmdc && req._cmdc.pfxMark ? ` ${cRed(req._cmdc.pfxMark)}` : "";
+    console.log(`${cDim(`[${logTs(Date.now())}]${sessTag()}`)} ${cStatus(res.statusCode)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 
@@ -1893,6 +1922,7 @@ const server = http.createServer(async (req, res) => {
 
       // 非 Claude 模型 -> Anthropic -> OpenAI 协议转换
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
+      req._cmdc.pfxMark = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""));
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
@@ -1985,6 +2015,7 @@ const server = http.createServer(async (req, res) => {
       logReq();
 
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
+      req._cmdc.pfxMark = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""));
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {

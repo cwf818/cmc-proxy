@@ -17,6 +17,9 @@
   "_回退开关说明": "fallback: true 开启多模型轮换(默认); false 关闭, 始终只用 defaultModels 的第一个模型。",
   "fallback": true,
 
+  "_fulllog说明": "fulllog: true 把每个模型类请求的客户端原始 body 与实际转发上游的 body 落盘到 proxy 目录 fulllog.log (值为字符串时作为自定义路径), 便于对照排查转换/缓存问题; false (默认) 关闭。日志会持续增长, 注意定期清理。",
+  "fulllog": false,
+
   "_模型映射说明": "key 是客户端请求的模型名, value 是实际转发到上游的模型名。未命中映射表且上游目录中不存在(含无前缀名匹配)的模型, 会 fallback 到 defaultModels 当前活动模型。",
   "modelMap": {
     "claude-sonnet-4-6": "deepseek/deepseek-v4-flash",

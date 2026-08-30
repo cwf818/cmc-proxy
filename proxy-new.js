@@ -55,6 +55,9 @@
  *      百万 (14977212 -> 15000000) 使前缀字节稳定, config.stabilizeCounters 可关;
  *      同时修复 messages 内 system 提醒的块数组被 JSON.stringify 成乱码的问题
  *      (改为文本提取, 块数组与拼接字符串两种客户端形态产生相同字节)。
+ *   9. stripSystemReminders (默认 true): 整条剥离 history 中注入的 system 提醒
+ *      (配额计数/任务催促), 提示性内容不影响编码能力; fulllog 开关: 把客户端原始
+ *      请求与转发上游的请求落盘 (ROOT/fulllog.log, 值为字符串时自定义路径)。
  */
 "use strict";
 
@@ -132,6 +135,26 @@ const CC_PASSTHROUGH = config.cacheControlPassthrough !== false; // Anthropic ca
 const CACHE_AFFINITY = config.cacheAffinity !== false; // 按会话注入 user / prompt_cache_key
 const STABILIZE_COUNTERS = config.stabilizeCounters !== false; // 易变配额计数器取整, 稳定前缀缓存
 const STRIP_SYSTEM_REMINDERS = config.stripSystemReminders !== false; // 剥离 history 中注入的 system 提醒消息
+
+// fulllog: 请求落盘 (config.fulllog=true 开启, 写 ROOT/fulllog.log; 值为字符串时作为日志路径)。
+// 每个模型类请求记录两份 body: 客户端原始请求 + 实际转发上游的请求, 便于对照排查转换/缓存问题
+const FULLLOG_PATH = config.fulllog
+  ? (typeof config.fulllog === "string" ? path.resolve(ROOT, config.fulllog) : path.join(ROOT, "fulllog.log"))
+  : null;
+let fulllogChain = Promise.resolve();
+function fulllogDump(req, pathname, session, entries) {
+  if (!FULLLOG_PATH) return;
+  const ts = new Date().toISOString();
+  const head = `\n[${ts}]#${session ? session.id : "-"} ${req.method} ${pathname} src=${req.socket.remotePort || "-"}\n`;
+  const body = entries
+    .filter(([, text]) => text != null)
+    .map(([label, text]) => `---- ${label} (${Buffer.byteLength(text)}B) ----\n${text}\n`)
+    .join("\n");
+  // 串行追加, 保证写入顺序与到达顺序一致
+  fulllogChain = fulllogChain
+    .then(() => fs.promises.appendFile(FULLLOG_PATH, head + body))
+    .catch((e) => console.error(TAGE, "fulllog 写入失败:", e.message));
+}
 
 if (!API_KEY) {
   console.error(TAGE, "错误: 未配置 apiKey。请在 config.json 中填入你的 commandcode API key，");
@@ -1965,6 +1988,7 @@ const server = http.createServer(async (req, res) => {
       if (useAnthropicEndpoint) {
         // Claude 模型 -> 直接走上游 /messages
         body.model = mapped;
+        if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(body)]]);
         let up;
         try {
           up = await upstreamFetch(`${UPSTREAM}/v1/messages`, {
@@ -1992,6 +2016,7 @@ const server = http.createServer(async (req, res) => {
 
       // 非 Claude 模型 -> Anthropic -> OpenAI 协议转换
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
+      if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(oaiReq)]]);
       const oaiParams = { ...oaiReq, messages: undefined };
       req._cmdc.pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""), JSON.stringify(oaiParams));
       let up;
@@ -2053,6 +2078,7 @@ const server = http.createServer(async (req, res) => {
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
       logReq();
+      if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(body)]]);
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
@@ -2086,6 +2112,7 @@ const server = http.createServer(async (req, res) => {
       logReq();
 
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
+      if (FULLLOG_PATH) fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", JSON.stringify(chatReq)]]);
       const chatParams = { ...chatReq, messages: undefined };
       req._cmdc.pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify(chatParams));
       let up;
@@ -2144,6 +2171,7 @@ const server = http.createServer(async (req, res) => {
       if (method !== "GET" && method !== "HEAD") {
         init.body = await readBody(req);
       }
+      if (FULLLOG_PATH && init.body != null) fulllogDump(req, pathname, null, [["client", init.body], ["upstream", init.body]]);
       const up = await fetch(`${UPSTREAM}${upstreamPath}${url.search}`, init);
       await passThrough(res, up);
       return;

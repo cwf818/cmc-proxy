@@ -4,3 +4,4 @@ proxy.log
 
 # build 产物
 release/
+fulllog.log

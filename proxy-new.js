@@ -35,6 +35,16 @@
  *   5. 会话跟踪升级: Codex 优先读 session-id (兼容旧版 session_id) / thread-id 请求头
  *      作为会话标识, 同一 codex 会话跨 TCP 重连不再分裂编号, 与缓存亲和使用同一稳定标识;
  *      curl 等无会话头客户端仍回退 src:port + ua。
+ *   6. Codex 0.150+ 新工具形态支持 (修复 apply_patch 死循环 / 延迟工具失效):
+ *      - {"type":"custom"} freeform 工具 (apply_patch grammar) -> 转成 {"input": "<原文>"}
+ *        单参数 function 供模型调用, 回传时还原为 custom_tool_call (codex 的 apply_patch
+ *        handler 只接受 Custom payload, 收到 function_call 直接报错导致补丁反复失败);
+ *      - {"type":"tool_search"} (nameless 延迟工具发现) -> 转成同名 function, codex 对
+ *        FunctionCall 名为 tool_search 的调用走本地执行器, 打通 deferred 工具加载;
+ *      - {"type":"web_search"} (nameless) 静默跳过 (链路无服务端执行环境);
+ *      - {"type":"namespace"} 工具组展开为独立工具;
+ *      - 历史条目 custom_tool_call / custom_tool_call_output / tool_search_call /
+ *        tool_search_output 双向映射, 修复 freeform 工具调用历史丢失。
  */
 "use strict";
 
@@ -783,6 +793,25 @@ function warnSkippedItemType(type) {
   console.warn(TAGW, `跳过不支持的 Responses input item 类型: ${type} (历史中该条目不会转发给上游)`);
 }
 
+const skippedToolTypesWarned = new Set();
+
+function warnSkippedToolType(type) {
+  if (skippedToolTypesWarned.has(type)) return;
+  skippedToolTypesWarned.add(type);
+  console.warn(TAGW, `跳过无法转换的工具类型: ${type} (该工具在此链路不可用)`);
+}
+
+/** 追加一条工具调用: 合并进紧邻的前一条 assistant 消息 (连续多个调用自然聚成一条 tool_calls),
+ *  与 chat/completions "assistant(tool_calls) -> tool 结果" 的消息序对齐 */
+function pushToolCallToMessages(messages, call) {
+  const last = messages[messages.length - 1];
+  if (last && last.role === "assistant") {
+    (last.tool_calls = last.tool_calls || []).push(call);
+  } else {
+    messages.push({ role: "assistant", tool_calls: [call] });
+  }
+}
+
 function stringifyMaybeJSON(v) {
   return typeof v === "string" ? v : JSON.stringify(v ?? "");
 }
@@ -859,22 +888,15 @@ function responsesInputToChatMessages(input) {
     }
 
     if (type === "function_call") {
-      // 顶层工具调用: 合并进紧邻的前一条 assistant 消息 (连续多个调用自然聚成一条 tool_calls),
-      // 与 chat/completions "assistant(tool_calls) -> tool 结果" 的消息序对齐
-      const call = {
+      // 顶层工具调用: 合并进紧邻的前一条 assistant 消息
+      pushToolCallToMessages(messages, {
         id: item.call_id || item.id || `call_local_${messages.length}`,
         type: "function",
         function: {
           name: item.name || "unknown",
           arguments: stringifyMaybeJSON(item.arguments ?? {}),
         },
-      };
-      const last = messages[messages.length - 1];
-      if (last && last.role === "assistant") {
-        (last.tool_calls = last.tool_calls || []).push(call);
-      } else {
-        messages.push({ role: "assistant", tool_calls: [call] });
-      }
+      });
       continue;
     }
 
@@ -883,6 +905,51 @@ function responsesInputToChatMessages(input) {
         role: "tool",
         tool_call_id: item.call_id || item.id || "",
         content: stringifyMaybeJSON(item.output),
+      });
+      continue;
+    }
+
+    if (type === "custom_tool_call") {
+      // freeform 工具调用历史: input 为原文 (如补丁文本), 统一包成 {"input": ...} 与
+      // 我们发给模型时的参数形态保持一致 (前缀稳定)
+      pushToolCallToMessages(messages, {
+        id: item.call_id || item.id || `call_local_${messages.length}`,
+        function: {
+          name: item.name || "unknown",
+          arguments: JSON.stringify({ input: typeof item.input === "string" ? item.input : stringifyMaybeJSON(item.input ?? "") }),
+        },
+      });
+      continue;
+    }
+
+    if (type === "custom_tool_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id || item.id || "",
+        content: stringifyMaybeJSON(item.output),
+      });
+      continue;
+    }
+
+    if (type === "tool_search_call") {
+      // codex 本地执行的延迟工具发现调用 (arguments 为对象)
+      pushToolCallToMessages(messages, {
+        id: item.call_id || item.id || `call_local_${messages.length}`,
+        function: { name: "tool_search", arguments: stringifyMaybeJSON(item.arguments ?? {}) },
+      });
+      continue;
+    }
+
+    if (type === "tool_search_output") {
+      // 加载到的 deferred 工具定义 -> 文本化给模型阅读 (中途无法再追加 tools 参数)
+      const tools = Array.isArray(item.tools) ? item.tools : [];
+      const text = tools
+        .map((t) => (t && typeof t === "object" ? JSON.stringify(t) : String(t)))
+        .join("\n");
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id || item.id || "",
+        content: text || "(no tools matched)",
       });
       continue;
     }
@@ -913,28 +980,74 @@ function responsesToChatRequest(body, sessionKey) {
   if (body.parallel_tool_calls === true || body.parallel_tool_calls === false) {
     req.parallel_tool_calls = body.parallel_tool_calls;
   }
+  // 本请求中被转为 function 的 freeform(custom) 工具名集合, 回传时还原 custom_tool_call
+  const customToolNames = new Set();
   if (body.tools && Array.isArray(body.tools) && body.tools.length) {
-    // 兼容两种 tool 结构: Responses 平铺 {type,name,description,parameters}
-    // 与 chat 嵌套 {type,function:{name,description,parameters}}; 无 name 的跳过
-    req.tools = body.tools
-      .map((t) => {
-        const fn = t.function && typeof t.function === "object" ? t.function : t;
-        return {
+    const chatTools = [];
+    const convertTool = (t) => {
+      if (!t || typeof t !== "object") return;
+      if (t.type === "custom" && t.name) {
+        // freeform/custom 工具 (如 apply_patch grammar): chat/completions 无对应概念,
+        // 统一转成 {"input": "<原文>"} 单参数 function, 回传时还原 custom_tool_call
+        // (codex 的 apply_patch handler 只接受 Custom payload, 收到 function_call 直接报错)
+        customToolNames.add(t.name);
+        chatTools.push({
           type: "function",
           function: {
-            name: fn.name,
-            description: fn.description || "",
-            parameters: fn.parameters || { type: "object", properties: {} },
+            name: t.name,
+            description: t.description || "",
+            parameters: {
+              type: "object",
+              properties: {
+                input: { type: "string", description: "The full raw text input for this tool (for patch tools: the complete patch text)." },
+              },
+              required: ["input"],
+            },
           },
-        };
-      })
-      .filter((t) => {
-        if (!t.function.name) {
-          console.warn(TAGW, "跳过无 name 的工具:", JSON.stringify(t.function).slice(0, 120));
-          return false;
-        }
-        return true;
+        });
+        return;
+      }
+      if (t.type === "tool_search") {
+        // nameless 延迟工具发现工具: codex 对 FunctionCall 名为 tool_search 的调用走本地
+        // 执行器, 转成同名 function 即可打通 deferred 工具加载
+        chatTools.push({
+          type: "function",
+          function: {
+            name: "tool_search",
+            description: t.description || "",
+            parameters: (t.parameters && typeof t.parameters === "object")
+              ? t.parameters
+              : { type: "object", properties: { query: { type: "string" }, limit: { type: "number" } }, required: ["query"] },
+          },
+        });
+        return;
+      }
+      if (t.type === "web_search") {
+        // nameless 服务端搜索工具: 中转链路无 OpenAI 服务端执行环境, 静默跳过
+        warnSkippedToolType("web_search");
+        return;
+      }
+      if (t.type === "namespace" && Array.isArray(t.tools)) {
+        // 工具组 (如按 MCP server 分组): 展开为独立工具
+        for (const nt of t.tools) convertTool(nt);
+        return;
+      }
+      const fn = t.function && typeof t.function === "object" ? t.function : t;
+      if (!fn.name) {
+        warnSkippedToolType(t.type || "unknown");
+        return;
+      }
+      chatTools.push({
+        type: "function",
+        function: {
+          name: fn.name,
+          description: fn.description || "",
+          parameters: fn.parameters || { type: "object", properties: {} },
+        },
       });
+    };
+    for (const t of body.tools) convertTool(t);
+    if (chatTools.length) req.tools = chatTools;
   }
   if (body.tool_choice && typeof body.tool_choice === "object" && body.tool_choice.type === "function") {
     const choiceName = body.tool_choice.name || (body.tool_choice.function && body.tool_choice.function.name);
@@ -948,7 +1061,7 @@ function responsesToChatRequest(body, sessionKey) {
     req.prompt_cache_key = body.prompt_cache_key;
     if (body.prompt_cache_key.length <= 64) req.user = body.prompt_cache_key;
   }
-  return req;
+  return { chat: req, customToolNames };
 }
 
 // ---------------------------------------------------------------------------
@@ -968,7 +1081,29 @@ function chatUsageToResponses(u) {
   };
 }
 
-function chatMessageToResponsesOutput(msg) {
+/** 从模型发出的 function arguments 中提取 freeform 工具的原文 input:
+ *  兼容 {"input": "..."} JSON、纯 JSON 字符串、裸补丁文本三种形态;
+ *  并兜底处理模型在 JSON 字符串里直接输出真实换行 (严格 JSON 非法) 的情况 */
+function customInputFromArguments(args) {
+  if (typeof args !== "string") return JSON.stringify(args ?? "");
+  const t = args.trim();
+  try {
+    const parsed = JSON.parse(t);
+    if (typeof parsed === "string") return parsed;
+    if (parsed && typeof parsed === "object" && typeof parsed.input === "string") return parsed.input;
+  } catch { /* 落到宽松解析 */ }
+  const m = t.match(/^\{\s*"input"\s*:\s*"([\s\S]*)"\s*\}$/);
+  if (m) {
+    return m[1]
+      .replace(/\\n/g, "\n")
+      .replace(/\r/g, "")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+  return args;
+}
+
+function chatMessageToResponsesOutput(msg, customToolNames) {
   const output = [];
   if (msg.content) {
     output.push({
@@ -980,23 +1115,36 @@ function chatMessageToResponsesOutput(msg) {
     });
   }
   for (const tc of msg.tool_calls || []) {
-    output.push({
-      type: "function_call",
-      id: makeResponsesId("fc"),
-      status: "completed",
-      call_id: tc.id,
-      name: tc.function.name,
-      arguments: tc.function.arguments || "{}",
-    });
+    if (customToolNames && customToolNames.has(tc.function.name)) {
+      // freeform 工具: 还原为 custom_tool_call (codex 的 apply_patch handler 只接受
+      // ToolPayload::Custom, 收到 function_call 直接报 "unsupported payload")
+      output.push({
+        type: "custom_tool_call",
+        id: makeResponsesId("ctc"),
+        status: "completed",
+        call_id: tc.id,
+        name: tc.function.name,
+        input: customInputFromArguments(tc.function.arguments),
+      });
+    } else {
+      output.push({
+        type: "function_call",
+        id: makeResponsesId("fc"),
+        status: "completed",
+        call_id: tc.id,
+        name: tc.function.name,
+        arguments: tc.function.arguments || "{}",
+      });
+    }
   }
   return output;
 }
 
 /** 非流式: chat.completion -> response 对象 */
-function chatResponseToResponses(obj, requestedModel) {
+function chatResponseToResponses(obj, requestedModel, customToolNames) {
   const choice = obj.choices && obj.choices[0] ? obj.choices[0] : {};
   const msg = choice.message || {};
-  const output = chatMessageToResponsesOutput(msg);
+  const output = chatMessageToResponsesOutput(msg, customToolNames);
   return {
     id: makeResponsesId("resp"),
     object: "response",
@@ -1011,8 +1159,9 @@ function chatResponseToResponses(obj, requestedModel) {
 
 /** 流式: chat SSE chunks -> Responses SSE 事件序列 */
 class ResponsesStreamConverter {
-  constructor(requestedModel, estimateInputTokens = 0) {
+  constructor(requestedModel, estimateInputTokens = 0, customToolNames = null) {
     this.requestedModel = requestedModel;
+    this.customToolNames = customToolNames; // 本请求中转为 function 的 freeform 工具名
     this.resp = {
       id: makeResponsesId("resp"),
       object: "response",
@@ -1117,17 +1266,24 @@ class ResponsesStreamConverter {
         if (tc.function.arguments) st.argsBuf += tc.function.arguments;
       }
       if (!st.item) {
-        st.item = { id: makeResponsesId("fc"), type: "function_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", arguments: "" };
+        st.isCustom = !!(this.customToolNames && st.name && this.customToolNames.has(st.name));
+        st.item = st.isCustom
+          ? { id: makeResponsesId("ctc"), type: "custom_tool_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", input: "" }
+          : { id: makeResponsesId("fc"), type: "function_call", status: "in_progress", call_id: st.callId || `call_${Date.now()}`, name: st.name || "function", arguments: "" };
         st.outputIndex = this.resp.output.length;
         events.push(sseResponses({ type: "response.output_item.added", output_index: st.outputIndex, item: { ...st.item } }));
       }
       if (tc.function && tc.function.arguments) {
-        events.push(sseResponses({
-          type: "response.function_call_arguments.delta",
-          item_id: st.item.id,
-          output_index: st.outputIndex,
-          delta: tc.function.arguments,
-        }));
+        // custom 工具不流式下发 input: 模型产出的是 {"input": ...} JSON 片段, 直接转发
+        // 会污染 codex 的流式补丁解析器 (它期望纯补丁文本), 统一在 output_item.done 补全
+        if (!st.isCustom) {
+          events.push(sseResponses({
+            type: "response.function_call_arguments.delta",
+            item_id: st.item.id,
+            output_index: st.outputIndex,
+            delta: tc.function.arguments,
+          }));
+        }
       }
     }
 
@@ -1164,14 +1320,24 @@ class ResponsesStreamConverter {
 
     for (const st of Object.values(this.toolStates)) {
       if (!st.item) continue;
-      push({ type: "response.function_call_arguments.done", item_id: st.item.id, output_index: st.outputIndex, arguments: st.argsBuf });
-      const doneItem = {
-        ...st.item,
-        status: "completed",
-        call_id: st.callId || st.item.call_id,
-        name: st.name || st.item.name,
-        arguments: st.argsBuf,
-      };
+      const doneItem = st.isCustom
+        ? {
+            ...st.item,
+            status: "completed",
+            call_id: st.callId || st.item.call_id,
+            name: st.name || st.item.name,
+            input: customInputFromArguments(st.argsBuf),
+          }
+        : {
+            ...st.item,
+            status: "completed",
+            call_id: st.callId || st.item.call_id,
+            name: st.name || st.item.name,
+            arguments: st.argsBuf,
+          };
+      if (!st.isCustom) {
+        push({ type: "response.function_call_arguments.done", item_id: st.item.id, output_index: st.outputIndex, arguments: st.argsBuf });
+      }
       push({ type: "response.output_item.done", output_index: st.outputIndex, item: doneItem });
       this.resp.output.push(doneItem);
     }
@@ -1778,7 +1944,7 @@ const server = http.createServer(async (req, res) => {
       req._cmdc.rawBody = bodyRaw || "";
       logReq();
 
-      const chatReq = responsesToChatRequest(body, sessionKey);
+      const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
       let up;
       try {
         up = await upstreamFetch(`${UPSTREAM}/v1/chat/completions`, {
@@ -1804,7 +1970,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const oai = JSON.parse(text);
           req._cmdc.usage = normalizeUsage(oai.usage);
-          const respObj = chatResponseToResponses(oai, requested);
+          const respObj = chatResponseToResponses(oai, requested, customToolNames);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(respObj));
         } catch (e) {
@@ -1820,7 +1986,7 @@ const server = http.createServer(async (req, res) => {
         res.end(text);
         return;
       }
-      const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body));
+      const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body), customToolNames);
       await pumpConvertedStream(up, conv, res, "responses");
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
       return;

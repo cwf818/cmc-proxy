@@ -1858,9 +1858,9 @@ const server = http.createServer(async (req, res) => {
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
-    // 标签 S{id}#{req} 与 REQ 同色 (按请求轮转取色); model 提前到 src 之前, 扫日志先看模型
+    // 标签 S{id}#{req} 按请求轮转取色, REQ 恒为青色; model 提前到 src 之前, 扫日志先看模型
     const tag = sessTag();
-    console.log(`${cDim(`[${logTs(startAt)}]`)} ${tag ? tagColor(`${tag} REQ`) : cCyan("REQ")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${cDim(bodyPart())}`);
+    console.log(`${cDim(`[${logTs(startAt)}]`)} ${tag ? `${tagColor(tag)} ` : ""}${cCyan("REQ")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${cDim(bodyPart())}`);
     // CMC_DEBUG_PAYLOAD=1: 打印本地请求完整请求头与 body 原文 (排查会话标识等)
     if (process.env.CMC_DEBUG_PAYLOAD === "1") {
       const headers = {};

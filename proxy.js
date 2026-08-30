@@ -126,7 +126,6 @@ function loadConfig() {
     apiKey: "",
     switchOnFail: false,
     defaultModels: ["deepseek/deepseek-v4-flash"],
-    defaultModels: ["deepseek/deepseek-v4-flash"],
     modelMap: {},
     blockedModels: [],
   };

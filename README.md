@@ -217,7 +217,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 **代价须知**：最坏耗时 ≈ 候选数 × 各自的首字节超时（`firstByteTimeout`，默认 120s），5 个模型的配置最坏可拖数分钟。通常配较小的 `firstByteTimeout`（如 15~30s）使用。
 
-> 旧版的"连续失败 3 次/1 次切换"阈值逻辑与 `fallback` 参数已移除：`fallback: false` 启动时只会告警提示迁移，钉死单模型的语义请只保留 `defaultModels` 中的一个模型。旧配置中的 `defaultModel` 字段仍兼容（视为单元素列表），`imageCapableModels` 自动迁移为 `defaultVisionModels`。
+> 钉死单模型的语义请只保留 `defaultModels` 中的一个模型。旧配置中的 `defaultModel` 字段仍兼容（视为单元素列表），`imageCapableModels` 自动迁移为 `defaultVisionModels`。
 > `switchOnFail: false` 时单次请求不轮换，但失败仍会记入冷却表（`onRequestFail`），成功清除。
 
 ### 模型匹配规则
@@ -271,7 +271,6 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `stabilizeCounters`        | `true`                                | `<total_tokens>` 计数就近取整到百万                                                                               |
 | `cacheControlPassthrough`  | `true`                                | Anthropic `cache_control` → OpenAI content part                                                                   |
 | `cacheAffinity`            | `true`                                | 按会话注入 `user` / `prompt_cache_key`                                                                            |
-| `fallback`                 | —                                     | **已移除**。启动时若发现会告警，提示改用单元素 `defaultModels`                                                    |
 
 > 配置模板见 `config.example.json`（键序与 `config.json` 对齐，参数前带 `_xxx说明` 注释键）。
 
@@ -316,7 +315,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | --------------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/`、`/health`              | GET  | 健康检查，返回 `{ok, service, upstream, port}`                                                                                                                                                                                       |
 | `/v1/models`                | GET  | 上游模型列表（按 `blockedModels` 过滤，`?raw=1` 看全量），60s 缓存                                                                                                                                                                   |
-| `/v1/messages/count_tokens` | POST | 本地估算 `input_tokens`（`ceil(JSON长度/4)`），不转发上游                                                                                                                                                                            |
+| `/v1/messages/count_tokens` | POST | 本地估算 `input_tokens`（`ceil(JSON长度/4)`，最小为 1），不转发上游                                                                                                                                                                  |
 | `/v1/messages`              | POST | 模型判定为 **Claude 系**（`claude-*`）→ 原样透传上游 `/messages`（预留 Pro/Provider 直连真实 Claude）；否则 → **Anthropic → OpenAI 转换**后发上游 `/chat/completions`，响应转回 Anthropic（含 `tool_use` / `input_json_delta` 事件） |
 | `/v1/chat/completions`      | POST | 原样透传上游 `/chat/completions`，仅做模型决策与 Key 注入                                                                                                                                                                            |
 | `/v1/responses`             | POST | **Responses → Chat Completions** 转换后发上游，响应转回 Responses SSE 事件（`response.created` → `output_text.delta` / `function_call_arguments.delta` → `response.completed`），含工具调用                                          |

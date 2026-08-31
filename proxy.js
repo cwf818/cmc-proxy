@@ -56,8 +56,8 @@
  *      同时修复 messages 内 system 提醒的块数组被 JSON.stringify 成乱码的问题
  *      (改为文本提取, 块数组与拼接字符串两种客户端形态产生相同字节)。
  *   9. stripSystemReminders (默认 true): 整条剥离 history 中注入的 system 提醒
- *      (配额计数/任务催促), 提示性内容不影响编码能力; fulllog 开关: 把客户端原始
- *      请求与转发上游的请求落盘 (ROOT/fulllog.log, 值为字符串时自定义路径)。
+ *      (配额计数/任务催促), 提示性内容不影响编码能力; 请求落盘由环境变量
+ *      CMC_LOGGING_FILE 分级控制 (见下方注释), 文件固定为 ROOT/fulllog.log。
  *  10. switchOnFail (默认 false): 轮换总开关, 支持布尔或 {text, image} 对象 (单布尔统一
  *      取值)。true 时失败 1 次即切换 + failTTL 冷却: 按请求类型选列表 (文本 defaultModels /
  *      带图 defaultVisionModels, 带图 400 也轮换), 失败模型 TTL 内冷却跳过, 全部失效时返回
@@ -142,7 +142,7 @@ const CACHE_AFFINITY = config.cacheAffinity !== false; // 按会话注入 user /
 const STABILIZE_COUNTERS = config.stabilizeCounters !== false; // 易变配额计数器取整, 稳定前缀缓存
 const STRIP_SYSTEM_REMINDERS = config.stripSystemReminders !== false; // 剥离 history 中注入的 system 提醒消息
 const SERIALIZE_SESSION = config.serializeSessionRequests !== false; // 同会话上游请求串行化
-const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout || "120000", 10); // 上游响应头超时 ms (0=关闭)
+const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout ?? "120000", 10); // 上游响应头超时 ms (0=关闭; ?? 保证显式 0 不被默认值覆盖)
 const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内嵌图片保留 (注入随后的 user 消息透传上游)
 const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
 const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
@@ -205,7 +205,7 @@ const defaultVisionModels = (Array.isArray(config.defaultVisionModels) && config
 
 // ---- switchOnFail: 轮换总开关, 支持布尔或 {text, image} ----
 // 单布尔值表示 text/image 统一取值。true 时开启"失败 1 次即切换 + TTL 冷却"轮换,
-// false 时不轮换 (失败原样返回)。旧 fallback 参数已移除。
+// false 时不轮换 (失败原样返回)。
 const switchOnFailRaw = config.switchOnFail;
 const SWITCH_ON_FAIL = switchOnFailRaw === true || (switchOnFailRaw && typeof switchOnFailRaw === "object")
   ? (typeof switchOnFailRaw === "object" ? !!(switchOnFailRaw.text ?? switchOnFailRaw.image) : true)
@@ -220,10 +220,8 @@ const switchOnFailFor = (isImage) => {
 };
 // 失败模型冷却 (TTL): 模型失败后 TTL 毫秒内跳过该模型, 避免反复打已死模型。
 // 0 表示不冷却 (失败即从当次轮换中剔除, 跨请求仍可重试)。
-const FAIL_TTL = parseInt(config.failTTL || "30000", 10);
-if (config.fallback === false) {
-  console.warn(TAGW, `配置中的 fallback 参数已移除: 钉死单模型的语义请只保留 defaultModels 中的一个模型; 当前列表有 ${defaultModels.length} 个模型`);
-}
+// ?? 保证显式 0 (不冷却) 不被默认值覆盖: 0 是合法配置值, 不能用 || 兜底
+const FAIL_TTL = parseInt(config.failTTL ?? "30000", 10);
 
 // 模型失败时间戳 (TTL 冷却): model -> 最近失败时刻; 成功清除
 const modelFailAt = new Map();
@@ -295,27 +293,27 @@ function filterModels(models) {
 }
 
 /**
- * 模型解析 helper (仅目录匹配, 不含 modelMap):
- *   1. 上游模型目录匹配: 精确 / 去前缀(无前缀名) / 大小写不敏感
- *      例: deepseek-v4-flash -> deepseek/deepseek-v4-flash, qwen3.8-max -> Qwen/Qwen3.8-Max
+ * 模型解析 helper (仅目录匹配, 不包含 modelMap):
+ *   1. 上游模型目录匹配, 全局按匹配级别分层按序尝试 (外层条件, 内层遍历目录):
+ *      精确 -> 大小写不敏感 -> 去 provider 前缀按裸名 -> 去 [*] 后缀,
+ *      任一层命中即用; 例: deepseek-v4-flash -> deepseek/deepseek-v4-flash,
+ *      qwen3.8-max -> Qwen/Qwen3.8-Max
  *   2. 无任何匹配 -> 返回 null, 由调用方 (pickModel) 按请求类型回退默认模型
  */
 function resolveModel(requested) {
   if (!requested) return null;
-  // 上游模型目录匹配
+  // 上游模型目录匹配 (分层按序: 高级别匹配优先于目录顺序)
   const models = upstreamModelsCache.list;
   if (models.length) {
     const reqLower = requested.toLowerCase();
     const bareLower = requested.replace(/^[^/]*\//, "").toLowerCase(); // 去掉 provider 前缀
     // 去掉 [*] 后缀 (如 [1m]): 视为同模型的不同上下文窗口变体, 用基础名匹配
     const bareNoSuffix = bareLower.replace(/\[[^\]]*\]$/, "");
-    for (const m of models) {
-      const id = m.id;
-      if (id === requested) return id; // 精确
-      const idLower = id.toLowerCase();
-      if (idLower === reqLower) return id; // 大小写不敏感精确
-      if (idLower.endsWith("/" + bareLower)) return id; // 无前缀名匹配带前缀模型
-      if (bareNoSuffix && bareNoSuffix !== bareLower && idLower.endsWith("/" + bareNoSuffix)) return id; // 去 [*] 后缀匹配
+    for (const m of models) if (m.id === requested) return m.id; // 1. 精确
+    for (const m of models) if (m.id.toLowerCase() === reqLower) return m.id; // 2. 大小写不敏感精确
+    for (const m of models) if (m.id.toLowerCase().endsWith("/" + bareLower)) return m.id; // 3. 无前缀名匹配带前缀模型
+    if (bareNoSuffix && bareNoSuffix !== bareLower) {
+      for (const m of models) if (m.id.toLowerCase().endsWith("/" + bareNoSuffix)) return m.id; // 4. 去 [*] 后缀匹配
     }
   }
   return null;
@@ -1868,7 +1866,7 @@ async function pumpConvertedStream(up, conv, res, tag, onDone) {
     for await (const chunk of up.body) {
       // undici 流式 chunk 是 Uint8Array, 必须经 Buffer.from 才能正确 utf8 解码
       const raw = Buffer.from(chunk).toString("utf8");
-      if (process.env.CMC_DEBUG) process.stderr.write(`[DBG-UP-${tag}] ` + raw.replace(/\n/g, "\\n").slice(0, 300) + "\n");
+      if (process.env.CMC_DEBUG === "1") process.stderr.write(`[DBG-UP-${tag}] ` + raw.replace(/\n/g, "\\n").slice(0, 300) + "\n");
       const outText = conv.push(raw);
       if (outText) res.write(outText);
     }

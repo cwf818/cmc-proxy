@@ -26,10 +26,10 @@
 |---|---|---|
 | `/`、`/health` | GET | `{"ok":true,"service":"cmc-proxy","upstream":"…","port":5411}` |
 | `/v1/models` | GET | `{"object":"list","data":[...]}`，按 `blockedModels` 过滤；`?raw=1` 返回全量；上游结果内存缓存 60s |
-| `/v1/messages/count_tokens` | POST | `{"input_tokens": N}`，本地估算 = `ceil(JSON.stringify(body).length / 4)`，不转发上游 |
+| `/v1/messages/count_tokens` | POST | `{"input_tokens": N}`，本地估算 = `ceil(JSON.stringify(body).length / 4)`（最小为 1），不转发上游 |
 | 其他路径 | 任意 | 404 `{"error":{"message":"Not found: <path>","type":"invalid_request_error"}}` |
 
-> 只有路径 A / B / B′ / C 参与模型决策、失败轮换、会话串行化与访问日志的 REQ/RES 配对；路径 D 只做 Key 注入与转发。
+> 只有路径 A / B / B′ / C 参与模型决策、失败轮换与会话串行化（所有路径都打 REQ/RES 访问日志，非 model 请求无会话标签）；路径 D 只做 Key 注入与转发。
 
 所有转发路径都会做三件统一的事：
 1. **模型决策** `pickModel(requested, isImage)`：请求未带 model → 按请求类型取默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）；带了 model → 先查 `modelMap` 显式映射（命中即用，不区分请求类型，置空即关闭），未命中按 `config.resolveModel`（默认 true）目录匹配解析（命中即用，未命中按请求类型回退默认），`resolveModel:false` 时原样向上游请求。目录匹配规则：精确 → 大小写不敏感 → 去 provider 前缀按裸名匹配 → 去 `[*]` 后缀匹配（如 `deepseek-v4-flash[1m]` → `deepseek/deepseek-v4-flash`，视为同模型的不同上下文窗口变体）。之后进入轮换：`switchOnFail` 按请求类型选列表（文本 `defaultModels` / 带图 `defaultVisionModels`），失败 1 次即切换 + `failTTL` 冷却（详见 §7）。

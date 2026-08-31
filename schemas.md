@@ -20,7 +20,7 @@
 ```
 
 所有路径都会做两件统一的事：
-1. **模型映射**：`body.model` 经 `resolveModel()` 解析（显式映射表 → 上游目录匹配 → fallback 默认 `defaultModels` 当前活动模型；数组首个为默认，首个连续失败 3 次后逐一切换、后续模型失败 1 次即切换、循环进行，`fallback:false` 可关闭）
+1. **模型决策** `pickModel(requested, isImage)`：请求未带 model → 按请求类型取默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）；带了 model → 先查 `modelMap` 显式映射（命中即用，不区分请求类型，置空即关闭），未命中按 `config.resolveModel`（默认 true）目录匹配解析（命中即用，未命中按请求类型回退默认），`resolveModel:false` 时原样向上游请求。目录匹配规则：精确 → 大小写不敏感 → 去 provider 前缀按裸名匹配 → 去 `[*]` 后缀匹配（如 `deepseek-v4-flash[1m]` → `deepseek/deepseek-v4-flash`，视为同模型的不同上下文窗口变体）。之后进入轮换：`switchOnFail` 按请求类型选列表（文本 `defaultModels` / 带图 `defaultVisionModels`），失败 1 次即切换 + `failTTL` 冷却。
 2. **Key 注入**：`buildUpstreamHeaders()` 强制写入 `Authorization: Bearer <apiKey>`（覆盖客户端传的任何值），并保留客户端的 `x-api-key`
 
 另外非流式转换路径与透传路径都会解析上游响应中的 `usage` 输出到访问日志（见 §5）。
@@ -154,7 +154,7 @@ User-Agent: claude-cli/2.0.0
 
 ```json
 {
-  "model": "deepseek/deepseek-v4-flash",          // resolveModel 映射结果
+  "model": "deepseek/deepseek-v4-flash",          // pickModel 决策结果 (modelMap/目录解析/默认)
   "messages": [
     { "role": "system", "content": "You are a helpful coding assistant." },
     { "role": "user", "content": "帮我看看这个报错" },
@@ -191,7 +191,7 @@ User-Agent: claude-cli/2.0.0
 |---|---|
 | 顶层 `system`（字符串或块数组） | `messages[0]` 的 `role:"system"` |
 | user 文本 content | `role:"user"`，字符串或 `[{type:"text",text}]` 块数组 |
-| user 的 `tool_result` 块 | 拆成独立 `role:"tool"` + `tool_call_id` 消息（同一条 user 消息混合文本会拆开） |
+| user 的 `tool_result` 块 | 拆成独立 `role:"tool"` + `tool_call_id` 消息（同一条 user 消息混合文本会拆开）；内嵌 `image` 块**不放进 tool 消息**（上游 tool 消息带图实测 400），抽出到同轮末尾的 user 消息注入：`[{type:"text",text:"[tool_result <id> 附带的图片]"},{type:"image_url",...}]`，`config.toolResultImages=false` 可改为丢弃 |
 | user 的 `image` 块（base64/url） | `[{type:"image_url",image_url:{url:"data:...;base64,..."}}]` |
 | assistant 文本 | `role:"assistant"` 的 `content` |
 | assistant 的 `tool_use` 块 | `tool_calls[]`，`arguments` 为 `JSON.stringify(input)` |
@@ -199,6 +199,10 @@ User-Agent: claude-cli/2.0.0
 | `tool_choice:{type:"tool",name}` | `tool_choice:{type:"function",function:{name}}` |
 | `max_tokens` | 保留，但**钳制到 ≥16**（部分上游模型要求，Claude Code /model 探测会发 max_tokens=1） |
 | `stream:true` | 自动加 `stream_options:{include_usage:true}` |
+
+**带图请求路由与轮换**（三条 OpenAI 链路共用）：请求按类型分为文本/带图两种。`config.switchOnFail`（支持布尔或 `{text, image}` 对象，单布尔统一取值）为 true 时，失败 1 次即切换 + TTL 冷却（`config.failTTL`）轮换：文本请求按 `defaultModels` 轮换，带图请求按 `defaultVisionModels` 轮换（图片不支持的报错是 400，因此带图请求 400 也轮换），失败模型在 TTL 内冷却跳过，全部模型在冷却期时直接返回上游失败结果。switchOnFail=false 时不轮换，失败原样返回。REQ 行的 `img=N(新M)` 标记显示请求体中检测到的图片块数，其中 `新M` 为最后一条 user 消息（当前轮）中的新图数。
+
+**历史图片清理**（`config.cleanHistoryImages`，默认 false，仅 /v1/messages 转换链路）：本轮无新图时，把最后一条 user 消息之前所有 image 块（含 tool_result 内嵌）原位替换为占位文本 `[历史图片已清理]` 再转换——历史里的图上游同样 400，剥离后无新图请求可安全回流纯文本模型，路由只看新图。替换确定性，不破坏前缀缓存；代价是历史图片内容对模型不可见（视觉轮次看到的图在后续文本轮次不再可见）。
 
 ### 2.3 Upstream Response（OpenAI 非流式）
 

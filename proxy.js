@@ -58,13 +58,11 @@
  *   9. stripSystemReminders (默认 true): 整条剥离 history 中注入的 system 提醒
  *      (配额计数/任务催促), 提示性内容不影响编码能力; fulllog 开关: 把客户端原始
  *      请求与转发上游的请求落盘 (ROOT/fulllog.log, 值为字符串时自定义路径)。
- *  10. switchOnFail (默认 false): 失败即时轮换。开启后单次请求内上游失败 (仅限 403/404/408/
- *      429/5xx 与网络层错误; 400/401/413 等换模型无济于事的不轮换) 即按 defaultModels 顺序
- *      逐个重试 (解析后的模型优先, 显式映射优先级不变, 去重), 直到 2xx 成功或全部试完后把
- *      最后一次上游响应/错误透传给客户端; 轮换成功后默认模型指针跟到成功的模型。关闭时保持
- *      阈值轮换逻辑不变。defaultModels 仅一个模型时两种模式都不轮换; 旧 fallback 参数已移除,
- *      其 false 语义 (钉死单模型) 由仅配置一个 defaultModels 表达。重试仅覆盖响应头阶段,
- *      中途断流不可重试。
+ *  10. switchOnFail (默认 false): 轮换总开关, 支持布尔或 {text, image} 对象 (单布尔统一
+ *      取值)。true 时失败 1 次即切换 + failTTL 冷却: 按请求类型选列表 (文本 defaultModels /
+ *      带图 defaultVisionModels, 带图 400 也轮换), 失败模型 TTL 内冷却跳过, 全部失效时返回
+ *      上游失败结果; false 时不轮换, 失败原样返回。模型决策见 pickModel (modelMap 优先 ->
+ *      resolveModel 目录解析 -> 按请求类型回退默认)。
  */
 "use strict";
 
@@ -97,6 +95,7 @@ const cDim = paint(C.dim);
 const cBlue = paint(C.blue);
 const cOrange = paint("\x1b[38;5;208m"); // 256 色橙
 const cBrightGreen = paint("\x1b[92m"); // 亮绿
+const cBrightCyan = paint("\x1b[96m"); // 亮青 (usage cr 缓存命中突出)
 
 // 日志标签 (前缀着色)
 const TAGW = cYellow("[cmc-proxy]");
@@ -144,6 +143,9 @@ const STABILIZE_COUNTERS = config.stabilizeCounters !== false; // 易变配额�
 const STRIP_SYSTEM_REMINDERS = config.stripSystemReminders !== false; // 剥离 history 中注入的 system 提醒消息
 const SERIALIZE_SESSION = config.serializeSessionRequests !== false; // 同会话上游请求串行化
 const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout || "120000", 10); // 上游响应头超时 ms (0=关闭)
+const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内嵌图片保留 (注入随后的 user 消息透传上游)
+const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
+const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
 
 // 请求落盘分级 (环境变量 CMC_LOGGING_FILE, 未设置或 0 = 关闭):
 //   1 = 严重事件落盘 (上游请求失败/超时、客户端中途断开 ABT)
@@ -188,60 +190,78 @@ if (!API_KEY) {
 // ---------------------------------------------------------------------------
 const modelMap = config.modelMap || {};
 
-// ---- 多模型轮换 (defaultModels, 数组格式) ----
-// 第一个模型作为默认模型; 出错达阈值后逐个 fallback, 后续模型不重试(失败 1 次即切换), 循环进行。
+// ---- 多模型轮换列表 ----
+// defaultModels: 文本请求轮换列表; defaultVisionModels: 带图请求轮换列表。
 // 兼容旧配置: 仅配置 defaultModel 时自动视为单元素数组。
 const defaultModels = (Array.isArray(config.defaultModels) && config.defaultModels.length)
   ? config.defaultModels
   : [config.defaultModel || "deepseek/deepseek-v4-flash"];
+// 视觉模型列表: 带图请求的轮换范围。旧配置 imageCapableModels 自动迁移。
+const defaultVisionModels = (Array.isArray(config.defaultVisionModels) && config.defaultVisionModels.length)
+  ? config.defaultVisionModels
+  : (Array.isArray(config.imageCapableModels) && config.imageCapableModels.length)
+    ? config.imageCapableModels
+    : [];
 
-// 失败即时轮换 (默认关闭): 开启后单次请求内失败即按 defaultModels 逐个重试, 直到成功或试完;
-// 关闭时保持阈值轮换逻辑 (连续失败 N 次仅切换下一次请求的默认模型, 当次失败原样返回)。
-// defaultModels 仅一个模型时两种模式都不轮换。旧配置的 fallback 参数已移除: 其 false 语义
-// (钉死单模型) 由"仅配置一个 defaultModels"表达, 残留的 fallback:false 会在启动时提示迁移。
-const SWITCH_ON_FAIL = config.switchOnFail === true;
+// ---- switchOnFail: 轮换总开关, 支持布尔或 {text, image} ----
+// 单布尔值表示 text/image 统一取值。true 时开启"失败 1 次即切换 + TTL 冷却"轮换,
+// false 时不轮换 (失败原样返回)。旧 fallback 参数已移除。
+const switchOnFailRaw = config.switchOnFail;
+const SWITCH_ON_FAIL = switchOnFailRaw === true || (switchOnFailRaw && typeof switchOnFailRaw === "object")
+  ? (typeof switchOnFailRaw === "object" ? !!(switchOnFailRaw.text ?? switchOnFailRaw.image) : true)
+  : false;
+const switchOnFailFor = (isImage) => {
+  if (switchOnFailRaw === true) return true;
+  if (switchOnFailRaw && typeof switchOnFailRaw === "object") {
+    const v = isImage ? switchOnFailRaw.image : switchOnFailRaw.text;
+    return !!v;
+  }
+  return false;
+};
+// 失败模型冷却 (TTL): 模型失败后 TTL 毫秒内跳过该模型, 避免反复打已死模型。
+// 0 表示不冷却 (失败即从当次轮换中剔除, 跨请求仍可重试)。
+const FAIL_TTL = parseInt(config.failTTL || "30000", 10);
 if (config.fallback === false) {
-  console.warn(TAGW, `配置中的 fallback 参数已移除: 钉死单模型的语义请只保留 defaultModels 中的一个模型; 当前列表有 ${defaultModels.length} 个模型, 将按${SWITCH_ON_FAIL ? "switchOnFail 即时轮换" : "阈值轮换"}处理`);
+  console.warn(TAGW, `配置中的 fallback 参数已移除: 钉死单模型的语义请只保留 defaultModels 中的一个模型; 当前列表有 ${defaultModels.length} 个模型`);
 }
 
-// 轮换状态 (全局, 跨请求): 当前活动模型下标 + 失败计数
-let activeModelIdx = 0;
-let activeModelFails = 0;
-const FIRST_FAIL_LIMIT = 3; // 第一个(默认)模型: 连续失败 3 次后切换
-const OTHER_FAIL_LIMIT = 1; // fallback 模型: 失败 1 次即切换, 不重试
+// 模型失败时间戳 (TTL 冷却): model -> 最近失败时刻; 成功清除
+const modelFailAt = new Map();
+function markModelFail(model) {
+  if (model) modelFailAt.set(model, Date.now());
+}
+function markModelOk(model) {
+  if (model) modelFailAt.delete(model);
+}
+function modelInCooldown(model) {
+  const t = modelFailAt.get(model);
+  return !!(t && FAIL_TTL > 0 && Date.now() - t < FAIL_TTL);
+}
+function cooldownRemainMs(model) {
+  const t = modelFailAt.get(model);
+  return t && FAIL_TTL > 0 ? Math.max(0, FAIL_TTL - (Date.now() - t)) : 0;
+}
 
-/** 当前应使用的默认模型 (初始为列表第一个) */
+/** 当前默认模型: 文本列表第一个 (轮换指针语义已移除, 保持简单) */
 function currentDefaultModel() {
-  return defaultModels[activeModelIdx % defaultModels.length];
+  return defaultModels[0];
 }
 
-/** 一次请求失败时调用: 达到阈值则切到下一个模型并返回 true (列表轮完回到第一个, 循环进行)。
- *  仅统计当前默认模型自身的失败: 客户端显式请求其他模型 (如 blockedModels 中的
- *  gpt-5.6-luna 被上游 403) 时, 失败不记到默认模型头上, 避免触发无谓轮换 */
+/** 一次请求失败时调用 (非轮换模式下的计数, 现仅保留 TTL 记录) */
 function onRequestFail(failedModel) {
-  if (defaultModels.length < 2) return false;
-  if (failedModel && failedModel !== defaultModels[activeModelIdx]) return false;
-  const limit = activeModelIdx === 0 ? FIRST_FAIL_LIMIT : OTHER_FAIL_LIMIT;
-  activeModelFails += 1;
-  if (activeModelFails < limit) return false;
-  const from = defaultModels[activeModelIdx];
-  activeModelIdx = (activeModelIdx + 1) % defaultModels.length;
-  activeModelFails = 0;
-  const to = defaultModels[activeModelIdx];
-  console.warn(TAGW, `模型 ${from} 连续失败 ${limit} 次, 默认模型切换 → ${to}${activeModelIdx === 0 ? " (已循环回到第一个)" : ""}`);
-  return true;
+  markModelFail(failedModel);
 }
 
-/** 一次请求成功时调用: 清零当前模型失败计数 (仅当成功的就是当前默认模型) */
+/** 一次请求成功时调用 */
 function onRequestOk(okModel) {
-  if (okModel && okModel !== defaultModels[activeModelIdx]) return;
-  activeModelFails = 0;
+  markModelOk(okModel);
 }
 
 // ---------------------------------------------------------------------------
 // 上游模型列表缓存 (供 /v1/models 与模型目录匹配使用, 启动时异步刷新)
 // ---------------------------------------------------------------------------
 let upstreamModelsCache = { list: [], fetchedAt: 0 };
+let upstreamModelsCacheFetched = false; // 首次成功获取后打印条数日志
 
 async function refreshModels(force) {
   const now = Date.now();
@@ -254,7 +274,13 @@ async function refreshModels(force) {
     });
     if (!r.ok) throw new Error(`upstream models HTTP ${r.status}`);
     const j = await r.json();
-    upstreamModelsCache = { list: j.data || [], fetchedAt: now };
+    const list = j.data || [];
+    upstreamModelsCache = { list, fetchedAt: now };
+    // 首次获取打日志: 成功获取到多少条上游模型信息 (本地时间)
+    if (!upstreamModelsCacheFetched) {
+      upstreamModelsCacheFetched = true;
+      console.log(`[cmc-proxy] 刷新上游模型列表成功: ${list.length} 条 (${logTs(now)})`);
+    }
   } catch (e) {
     console.warn(TAGW, "刷新上游模型列表失败:", e.message);
   }
@@ -269,39 +295,129 @@ function filterModels(models) {
 }
 
 /**
- * 模型解析 helper:
- *   1. modelMap 显式映射优先
- *   2. 上游模型目录匹配: 精确 / 去前缀(无前缀名) / 大小写不敏感
+ * 模型解析 helper (仅目录匹配, 不含 modelMap):
+ *   1. 上游模型目录匹配: 精确 / 去前缀(无前缀名) / 大小写不敏感
  *      例: deepseek-v4-flash -> deepseek/deepseek-v4-flash, qwen3.8-max -> Qwen/Qwen3.8-Max
- *   3. 无任何匹配 -> fallback 到当前默认模型 (defaultModels 轮换指针)
+ *   2. 无任何匹配 -> 返回 null, 由调用方 (pickModel) 按请求类型回退默认模型
  */
 function resolveModel(requested) {
-  if (!requested) return currentDefaultModel();
-
-  // 1. 显式映射表
-  if (modelMap[requested]) return modelMap[requested];
-
-  // 2. 上游模型目录匹配
+  if (!requested) return null;
+  // 上游模型目录匹配
   const models = upstreamModelsCache.list;
   if (models.length) {
     const reqLower = requested.toLowerCase();
     const bareLower = requested.replace(/^[^/]*\//, "").toLowerCase(); // 去掉 provider 前缀
+    // 去掉 [*] 后缀 (如 [1m]): 视为同模型的不同上下文窗口变体, 用基础名匹配
+    const bareNoSuffix = bareLower.replace(/\[[^\]]*\]$/, "");
     for (const m of models) {
       const id = m.id;
       if (id === requested) return id; // 精确
       const idLower = id.toLowerCase();
       if (idLower === reqLower) return id; // 大小写不敏感精确
       if (idLower.endsWith("/" + bareLower)) return id; // 无前缀名匹配带前缀模型
+      if (bareNoSuffix && bareNoSuffix !== bareLower && idLower.endsWith("/" + bareNoSuffix)) return id; // 去 [*] 后缀匹配
     }
   }
+  return null;
+}
 
-  // 3. 无匹配 -> 当前默认模型 (GOAT 无 Claude 模型, claude-* 也会落到这里)
-  return currentDefaultModel();
+/** 请求类型对应的默认模型: 文本 -> defaultModels[0], 带图 -> defaultVisionModels[0] */
+function defaultForType(isImage) {
+  return isImage && defaultVisionModels.length ? defaultVisionModels[0] : defaultModels[0];
+}
+
+/**
+ * 最终模型决策 (所有转发路径共用):
+ *   1. 请求未带 model -> 按请求类型取默认 (defaultModels[0] / defaultVisionModels[0])
+ *   2. 带 model -> modelMap 显式映射, 命中即用 (不区分请求类型, 优先级最高, 置空即关闭)
+ *   3. 未命中 modelMap -> 按 config.resolveModel 开关:
+ *      true  (默认): 目录匹配解析, 命中即用; 未命中按请求类型回退默认
+ *      false        : 原样向上游请求 (不解析不回退)
+ */
+function pickModel(requested, isImage) {
+  if (!requested) return defaultForType(isImage);
+  if (modelMap[requested]) return modelMap[requested]; // 显式映射优先
+  if (!RESOLVE_MODEL) return requested; // 解析关闭: 原样
+  return resolveModel(requested) || defaultForType(isImage);
+}
+
+/** 当前默认模型 (文本) */
+function currentDefaultModel() {
+  return defaultModels[0];
 }
 
 /** 判断某模型是否需要走 Anthropic /messages 端点 (Claude 系) */
 function isClaudeModel(model) {
   return /^claude(-|$)/.test(model);
+}
+
+/** OpenAI messages 数组是否含 image_url part (任意角色) */
+function openAIMessagesHaveImages(messages) {
+  if (!Array.isArray(messages)) return false;
+  return messages.some((m) => Array.isArray(m.content) && m.content.some((p) => p && p.type === "image_url"));
+}
+
+/** 深度统计请求体里的图片块: Anthropic image 块 + OpenAI image_url / input_image
+ *  part。用于 REQ 行 img=N 标记与带图路由判断, 每请求一次 O(节点数) 遍历 */
+function countImagesDeep(v) {
+  if (Array.isArray(v)) {
+    let n = 0;
+    for (const x of v) n += countImagesDeep(x);
+    return n;
+  }
+  if (!v || typeof v !== "object") return 0;
+  let n = v.type === "image" && v.source ? 1 : v.type === "image_url" || v.type === "input_image" ? 1 : 0;
+  for (const k in v) n += countImagesDeep(v[k]);
+  return n;
+}
+
+// 历史图片清理后的占位文本 (确定性替换, 保证前缀缓存稳定)
+const STRIP_IMG_PLACEHOLDER = "[历史图片已清理]";
+
+/** 最后一条 user 消息 (即本轮) 中的图片块数, 无 user 消息返回 0。
+ *  Claude Code 每轮重发全量历史, 最后一条 user 消息即当前轮新产生的内容,
+ *  其中的图视为新图, 更早消息里的图视为历史图 */
+function countLastUserImages(body) {
+  const msgs = body.messages;
+  if (!Array.isArray(msgs)) return 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === "user") return countImagesDeep(msgs[i]);
+  }
+  return 0;
+}
+
+/** 清理历史图片: 把最后一条 user 消息之前的所有 image 块原位替换为占位文本
+ *  (直接 image 块与 tool_result 内嵌 image 块都处理)。上游对历史里的图片同样
+ *  400, 剥离后无新图的请求可安全发给纯文本模型, 带图路由随之只看新图 —— 会话
+ *  不再被历史图片钉死在视觉模型。替换是确定性的: 同一历史每轮剥出逐字节一致
+ *  的结果, 不影响前缀缓存。 */
+function stripHistoryImages(body) {
+  const msgs = body.messages;
+  if (!Array.isArray(msgs)) return;
+  let lastUser = msgs.length;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  for (let i = 0; i < lastUser; i++) {
+    const m = msgs[i];
+    if (!m || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "image" && b.source) {
+        b.type = "text";
+        b.text = STRIP_IMG_PLACEHOLDER;
+        delete b.source;
+      } else if (b.type === "tool_result" && Array.isArray(b.content)) {
+        for (let j = 0; j < b.content.length; j++) {
+          const x = b.content[j];
+          if (x && x.type === "image") b.content[j] = { type: "text", text: STRIP_IMG_PLACEHOLDER };
+        }
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,27 +539,49 @@ function anthropicBlocksToParts(blocks) {
       if (CC_PASSTHROUGH && b.cache_control) p.cache_control = b.cache_control;
       parts.push(p);
     } else if (b.type === "image") {
-      const src = b.source;
-      if (src && src.type === "base64" && src.media_type && src.data) {
-        parts.push({ type: "image_url", image_url: { url: `data:${src.media_type};base64,${src.data}` } });
-      } else if (src && src.type === "url" && src.url) {
-        parts.push({ type: "image_url", image_url: { url: src.url } });
-      }
+      const p = imageSourceToPart(b.source);
+      if (p) parts.push(p);
     }
     // 其他块类型 (thinking 等上游无对应概念) 跳过
   }
   return parts;
 }
 
-/** tool_result 块内容 -> tool 消息文本 */
+/** Anthropic image source -> OpenAI image_url part; 无效 source 返回 null */
+function imageSourceToPart(src) {
+  if (src && src.type === "base64" && src.media_type && src.data) {
+    return { type: "image_url", image_url: { url: `data:${src.media_type};base64,${src.data}` } };
+  }
+  if (src && src.type === "url" && src.url) {
+    return { type: "image_url", image_url: { url: src.url } };
+  }
+  return null;
+}
+
+/** tool_result 块内容 -> tool 消息文本 (非文本块折叠为占位符) */
 function toolResultToText(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map((x) => (x.type === "text" ? x.text : `[${x.type}]`))
+      .map((x) => (x && x.type === "text" ? x.text : `[${(x && x.type) || "unknown"}]`))
       .join("");
   }
   return content == null ? "" : JSON.stringify(content);
+}
+
+/** tool_result 块内容中的 image 块 -> image_url part 数组。
+ *  上游 tool 消息不支持带图 (实测 400 Invalid input, vision 模型同样拒绝),
+ *  图片由 anthropicMessageToOpenAI 注入随后的 user 消息转发 */
+function toolResultImageParts(content) {
+  if (!Array.isArray(content)) return [];
+  const parts = [];
+  for (const x of content) {
+    if (x && x.type === "image") {
+      const p = imageSourceToPart(x.source);
+      if (p) parts.push(p);
+    }
+  }
+  return parts;
 }
 
 function anthropicMessageToOpenAI(msg) {
@@ -452,16 +590,19 @@ function anthropicMessageToOpenAI(msg) {
   if (role === "user") {
     const toolMsgs = [];
     const parts = [];
+    const toolImgs = []; // tool_result 抽出的图片 (注入末尾 user 消息)
     if (Array.isArray(msg.content)) {
       for (const b of msg.content) {
         if (b.type === "tool_result") {
-          // OpenAI 要求 tool 消息独立成条
+          // OpenAI 要求 tool 消息独立成条; tool 消息不能带图 (上游 400), 图片抽出注入 user 消息
           const c = toolResultToText(b.content);
           toolMsgs.push({
             role: "tool",
             tool_call_id: b.tool_use_id,
             content: typeof c === "string" && c.length ? c : JSON.stringify(c),
           });
+          const imgs = TOOL_RESULT_IMAGES ? toolResultImageParts(b.content) : [];
+          if (imgs.length) toolImgs.push({ id: b.tool_use_id, imgs });
         } else if (b.type === "text" || b.type === "image") {
           const converted = anthropicBlocksToParts([b]);
           parts.push(...converted);
@@ -471,7 +612,16 @@ function anthropicMessageToOpenAI(msg) {
       parts.push({ type: "text", text: msg.content });
     }
     const out = [...toolMsgs];
-    if (parts.length) out.push({ role: "user", content: parts });
+    if (parts.length || toolImgs.length) {
+      // 图片以带来源标签的 part 追加在同一条 user 消息尾部; 历史回放时块内容不变,
+      // 注入结构确定, 不影响前缀缓存
+      const userParts = [...parts];
+      for (const { id, imgs } of toolImgs) {
+        userParts.push({ type: "text", text: id ? `[tool_result ${id} 附带的图片]` : "[tool_result 附带的图片]" });
+        userParts.push(...imgs);
+      }
+      out.push({ role: "user", content: userParts });
+    }
     return out;
   }
 
@@ -549,7 +699,7 @@ function affinityUser(sessionKey) {
 }
 
 function anthropicToOpenAIRequest(body, sessionKey) {
-  const mapped = resolveModel(body.model);
+  const mapped = body.model; // model 由调用方 (pickModel) 决策后覆盖
   const messages = [];
   // 顶层 system: 块数组 1:1 映射为 part 数组 (保结构稳定 + cache_control 透传)
   if (body.system != null) {
@@ -1079,7 +1229,7 @@ function responsesInputToChatMessages(input) {
 
 /** 把 Responses 请求体转换为 chat/completions 请求体 */
 function responsesToChatRequest(body, sessionKey) {
-  const mapped = resolveModel(body.model);
+  const mapped = body.model; // model 由调用方 (pickModel) 决策后覆盖
   const messages = [];
   if (body.instructions) messages.push({ role: "system", content: body.instructions });
   const { messages: inputMessages, additionalTools } = responsesInputToChatMessages(body.input);
@@ -1553,40 +1703,33 @@ async function upstreamFetch(url, init, requestedModel, signal) {
 /** switchOnFail 视为"换模型重试有意义"的上游状态码; 400/401/413/422 等换模型无济于事, 不轮换 */
 const ROTATE_STATUSES = new Set([403, 404, 408, 429, 500, 502, 503, 504]);
 
-/** switchOnFail: 轮换成功后把默认模型指针落到最终成功的模型上 (仅列表内模型), 使后续默认请求直接绕开已死模型 */
-function settleRotatePointer(model) {
-  const idx = defaultModels.indexOf(model);
-  if (idx < 0) return;
-  if (idx === activeModelIdx) { activeModelFails = 0; return; }
-  const from = defaultModels[activeModelIdx];
-  activeModelIdx = idx;
-  activeModelFails = 0;
-  console.warn(TAGI, `switchOnFail: 默认模型指针 ${from} → ${model}`);
-}
-
 /**
  * 上游请求统一入口 (四个转发路径共用)。
- * switchOnFail=false: 与 upstreamFetch 完全一致 (阈值轮换计数, 当次失败原样返回)。
- * switchOnFail=true: 单次请求内失败即时轮换 —— 先试解析后的模型 (modelMap 显式映射优先级不变),
- * 失败 (仅限 ROTATE_STATUSES 与网络层错误) 后按 defaultModels 列表顺序逐个重试 (去重),
- * 直到某次 2xx 成功, 或全部试完后把最后一次上游响应/错误透传给调用方。
+ * 轮换语义 (switchOnFail=true 时):
+ *   - 候选列表按请求类型: 文本请求 -> defaultModels, 带图请求 (isImage) -> defaultVisionModels;
+ *     客户端显式映射的模型 (firstModel) 始终作为首个候选。
+ *   - 失败 1 次即切换下一个候选 (不再有阈值/首个模型的区别)。
+ *   - 模型失败后进入 TTL 冷却 (config.failTTL, 默认 30s), 冷却期内跳过该模型。
+ *   - 候选全部在冷却期 (失效范围) 时, 不再轮换, 直接透传最后一次上游失败结果。
+ * switchOnFail=false: 单次请求不轮换, 与 upstreamFetch 一致 (当次失败原样返回)。
  * hooks.onModel(finalModel): 轮换后回调实际使用的模型, 供 RES 行 model= 展示。
- * 注意: 重试仅覆盖响应头阶段的失败; 中途断流时字节已发往客户端, 无法重试 (与现状一致)。
  */
 async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
-  const { sessTag, onModel } = hooks;
-  if (!SWITCH_ON_FAIL) {
+  const { sessTag, onModel, isImage = false } = hooks;
+  const rotateOn = switchOnFailFor(isImage);
+  if (!rotateOn) {
     const r = await upstreamFetch(url, init, firstModel, signal);
     if (onModel) onModel(firstModel);
     return r;
   }
   if (firstModel && blockedSet.has(firstModel)) warnBlockedModel(firstModel);
-  // 候选序列: 解析后的模型优先 (尊重客户端显式意图), 再按 defaultModels 顺序补全, 去重
+  // 候选序列: 解析后的模型优先 (尊重客户端显式意图), 再按类型列表顺序补全, 去重
+  const list = isImage ? defaultVisionModels : defaultModels;
   const candidates = [];
   const seen = new Set();
   const add = (m) => { if (m && !seen.has(m)) { seen.add(m); candidates.push(m); } };
   add(firstModel);
-  for (const m of defaultModels) add(m);
+  for (const m of list) add(m);
   const pfx = sessTag ? `${sessTag()} ` : "";
   // 每次尝试按候选模型重写 JSON body 的 model 字段 (轮换不能只换计数名, 上游实际收到的模型必须跟着变)
   const attemptInit = (model) => {
@@ -1599,23 +1742,40 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       return init;
     }
   };
+  let lastErr = null;
   for (let i = 0; i < candidates.length; i++) {
     const model = candidates[i];
-    const next = i + 1 < candidates.length ? candidates[i + 1] : null;
+    // TTL 冷却: 冷却期内的模型跳过
+    if (modelInCooldown(model)) {
+      lastErr = upstreamError(`模型 ${model} 冷却中 (剩 ${Math.ceil(cooldownRemainMs(model) / 1000)}s)`);
+      console.warn(TAGW, `${pfx}模型 ${model} 冷却中, 跳过`);
+      continue;
+    }
     try {
       const r = await rawUpstreamFetch(url, attemptInit(model), signal);
       if (r.ok) {
-        if (i > 0) settleRotatePointer(model); // 发生过 fallback: 指针跟到成功的模型, 后续默认请求绕开死模型
-        else if (model === defaultModels[activeModelIdx]) activeModelFails = 0;
+        markModelOk(model);
         if (onModel) onModel(model);
         return r;
       }
+      lastErr = r;
+      markModelFail(model);
+      // 带图请求: 图片不支持的报错就是 400 (This model does not support image), 400 也轮换
+      if (isImage && r.status === 400) {
+        if (i + 1 < candidates.length) {
+          console.warn(TAGW, `${pfx}上游 400 (${model}), 带图轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
+          try { r.body?.cancel(); } catch { /* 丢弃已失败响应 */ }
+          continue;
+        }
+        if (onModel) onModel(model);
+        return r; // 全部候选试完: 透传最后一次上游响应给客户端
+      }
       if (!ROTATE_STATUSES.has(r.status)) {
         if (onModel) onModel(model);
-        return r; // 400/401/413 等换模型无济于事的失败: 不轮换, 原样透传
+        return r; // 400/401/413 等换模型无济于事的失败: 不轮换, 原样透传 (已计冷却)
       }
-      if (next) {
-        console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), switchOnFail 轮换 → ${next} (${i + 1}/${candidates.length})`);
+      if (i + 1 < candidates.length) {
+        console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
         try { r.body?.cancel(); } catch { /* 丢弃已失败响应 */ }
         continue;
       }
@@ -1623,13 +1783,17 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       return r; // 全部候选试完: 透传最后一次上游响应给客户端
     } catch (e) {
       if (e.clientAbort) throw e; // 客户端已断开, 立即终止, 不再重试
-      if (next) {
-        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${e.message}, switchOnFail 轮换 → ${next} (${i + 1}/${candidates.length})`);
+      lastErr = e;
+      markModelFail(model);
+      if (i + 1 < candidates.length) {
+        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${e.message}, 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
         continue;
       }
       throw e; // 全部候选试完: 抛最后一次错误, 调用方按 502 收尾
     }
   }
+  // 候选全部在冷却期 (失效范围): 返回上游失败结果
+  throw lastErr || upstreamError("所有候选模型均在冷却中");
 }
 
 const blockedModelWarned = new Set();
@@ -2001,23 +2165,38 @@ const server = http.createServer(async (req, res) => {
     const c = req._cmdc;
     return c && c.stream != null ? ` stream=${c.stream ? 1 : 0}` : "";
   };
+  // 带图标记: 请求体中检测到的图片块数 (Anthropic image / OpenAI image_url、input_image);
+  // imgNew 为最后一条 user 消息 (本轮) 中的新图数, 仅 /v1/messages 链路计算
+  const imgPart = () => {
+    const c = req._cmdc;
+    if (!c || !c.img) return "";
+    const newSuffix = c.imgNew != null ? `(新${c.imgNew})` : "";
+    return cMagenta(` img=${c.img}${newSuffix}`);
+  };
   // 请求体大小 (帮助区分两条请求是否完全相同: 工具循环请求体递增, 重试请求体相同)
   const fmtBytes = (n) => (n >= 1024 ? (n / 1024).toFixed(1) + "KB" : n + "B");
   const bodyPart = () => {
     const bb = req._cmdc.bodyBytes;
     return bb ? ` body=${fmtBytes(bb)}` : "";
   };
-  // 会话+请求编号标签: 如 S1#10 = 1 号会话的第 10 个请求; 非 model 请求无会话, 返回空串
+  // 会话+请求编号标签: 如 S1#10 = 1 号会话的第 10 个请求; 非 model 请求无会话, 返回空串;
+  // 本轮带新图时标签前加 @ (无前导空格), 行拼接处按 @ 决定要不要补空格 ——
+  // 无图行 "] S1#2", 带新图行 "]@S1#3" 紧贴时间戳
   let willQueue = false; // 本请求到达时同会话已有在途请求, RES 前的 REQ 行标 *
   const sessTag = () => {
-    return session ? `S${session.id}#${reqNo}` : "";
+    if (!session) return "";
+    const at = req._cmdc && req._cmdc.imgNew ? "@" : "";
+    return at + `S${session.id}#${reqNo}`;
   };
+  // 会话标签前导空格: @ 开头(带新图)不补, 否则补一个空格 —— REQ/RES 行:
+  // 无图 "] S1#2", 带新图 "]@S1#3" 紧贴时间戳
+  const tagPad = () => (req._cmdc && req._cmdc.imgNew ? "" : " ");
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
     // 标签 S{id}#{req} 按请求轮转取色, REQ 恒为青色; model 提前到 src 之前, 扫日志先看模型
     const tag = sessTag();
-    console.log(`${cDim(`[${logTs(startAt)}]`)} ${tag ? `${tagColor(tag)} ` : ""}${cCyan("REQ") + (willQueue ? cRed("*") : "")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${cDim(bodyPart())}`);
+    console.log(`${cDim(`[${logTs(startAt)}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${cCyan("REQ") + (willQueue ? cRed("*") : "")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${imgPart()}${cDim(bodyPart())}`);
     // CMC_DEBUG_PAYLOAD=1: 打印本地请求完整请求头与 body 原文 (排查会话标识等)
     if (process.env.CMC_DEBUG_PAYLOAD === "1") {
       const headers = {};
@@ -2086,12 +2265,13 @@ const server = http.createServer(async (req, res) => {
     const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms };
     rec.ms = ms; // 统计口径与 took 一致: 仅计发往上游之后的耗时 (排队等待单列 qwait)
     if (u) {
+      // usage 摘要配色: in/out/cw 青色 (和谐), rt 紫色, cr 亮青突出 (缓存命中量)
       const parts = [];
-      if (u.input != null) parts.push(`in:${u.input}`);
-      if (u.output != null) parts.push(`out:${u.output}`);
-      if (u.reasoning != null) parts.push(`rt:${u.reasoning}`);
-      if (u.cacheRead != null) parts.push(`cr:${u.cacheRead}`);
-      if (u.cacheWrite != null) parts.push(`cw:${u.cacheWrite}`);
+      if (u.input != null) parts.push(cCyan(`in:${u.input}`));
+      if (u.output != null) parts.push(cCyan(`out:${u.output}`));
+      if (u.reasoning != null) parts.push(cMagenta(`rt:${u.reasoning}`));
+      if (u.cacheRead != null) parts.push(cBrightCyan(`cr:${u.cacheRead}`));
+      if (u.cacheWrite != null) parts.push(cCyan(`cw:${u.cacheWrite}`));
       if (parts.length) usageStr = ` ${parts.join(" ")}`;
       rec.in = u.input ?? 0;
       rec.out = u.output ?? 0;
@@ -2131,7 +2311,7 @@ const server = http.createServer(async (req, res) => {
     const stFn = res.statusCode >= 500 ? cRed : res.statusCode >= 400 ? cYellow : res.statusCode >= 300 ? cCyan : cGreen;
     // 标签 S{id}#{req} 用该请求闭包捕获的颜色 (与 REQ 行同色); 状态码保持原波段色
     const tag = sessTag();
-    console.log(`${cDim(`[${logTs(Date.now())}]`)} ${tag ? `${tagColor(tag)} ` : ""}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
+    console.log(`${cDim(`[${logTs(Date.now())}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 
@@ -2174,11 +2354,14 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/v1/messages" && req.method === "POST") {
       const bodyRaw = await readBody(req);
       const body = JSON.parse(bodyRaw || "{}");
-      const requested = body.model || currentDefaultModel();
-      const mapped = resolveModel(requested);
-      const useAnthropicEndpoint = isClaudeModel(mapped);
       const isStream = !!body.stream;
-      req._cmdc = { model: requested, mapped, stream: isStream };
+      const imgCount = countImagesDeep(body);
+      const imgNew = countLastUserImages(body);
+      const isImage = imgCount > 0; // 请求类型 (原始请求体判定, 转换后可能因清理历史图变化)
+      const requested = body.model || defaultForType(isImage);
+      const mapped = pickModel(body.model, isImage);
+      const useAnthropicEndpoint = isClaudeModel(mapped);
+      req._cmdc = { model: requested, mapped, stream: isStream, img: imgCount, imgNew };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
       willQueue = !!(session && (session.pending || 0) > 0);
@@ -2229,8 +2412,16 @@ const server = http.createServer(async (req, res) => {
       }
 
       // 非 Claude 模型 -> Anthropic -> OpenAI 协议转换
+      // cleanHistoryImages: 本轮无新图时剥离历史图片, 请求可安全走纯文本模型;
+      // 路由判断基于转换后的消息, 历史图被剥后自然不触发, 只看新图
+      if (CLEAN_HISTORY_IMAGES && !imgNew) stripHistoryImages(body);
+      // 用"剥离后的最终请求类型"重新决策模型并覆盖, 转换函数使用
+      const finalImage = imgCount > 0 && !(CLEAN_HISTORY_IMAGES && imgNew === 0);
+      body.model = pickModel(body.model, finalImage);
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
+      // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选是最终决策的模型
       const upstreamBodyJson = JSON.stringify(oaiReq);
+      req._cmdc.mapped = oaiReq.model;
       req._cmdc.upstreamBody = upstreamBodyJson;
       const pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""), JSON.stringify({ ...oaiReq, messages: undefined }));
       req._cmdc.pfx = pfx;
@@ -2253,7 +2444,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(oaiReq),
-        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
+        }, oaiReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage: finalImage });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2304,9 +2495,11 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/v1/chat/completions" && req.method === "POST") {
       const bodyRaw = await readBody(req);
       const body = JSON.parse(bodyRaw || "{}");
-      const requested = body.model || currentDefaultModel();
-      if (body.model) body.model = resolveModel(body.model);
-      req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream };
+      const imgCount = countImagesDeep(body);
+      const isImage = imgCount > 0;
+      const requested = body.model || defaultForType(isImage);
+      body.model = pickModel(body.model, isImage);
+      req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream, img: imgCount };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
       willQueue = !!(session && (session.pending || 0) > 0);
@@ -2331,7 +2524,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(body),
-        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
+        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2351,10 +2544,12 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/v1/responses" && req.method === "POST") {
       const bodyRaw = await readBody(req);
       const body = JSON.parse(bodyRaw || "{}");
-      const requested = body.model || currentDefaultModel();
-      const mapped = resolveModel(requested);
       const isStream = !!body.stream;
-      req._cmdc = { model: requested, mapped, stream: isStream };
+      const imgCount = countImagesDeep(body);
+      const requested = body.model || defaultForType(imgCount > 0);
+      const mapped = pickModel(body.model, imgCount > 0);
+      body.model = mapped; // 转换函数使用
+      req._cmdc = { model: requested, mapped, stream: isStream, img: imgCount };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
       willQueue = !!(session && (session.pending || 0) > 0);
@@ -2362,6 +2557,8 @@ const server = http.createServer(async (req, res) => {
       logReq();
 
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
+      // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选仍是解析后的模型
+      const isImage = openAIMessagesHaveImages(chatReq.messages);
       const upstreamBodyJson = JSON.stringify(chatReq);
       req._cmdc.upstreamBody = upstreamBodyJson;
       const pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify({ ...chatReq, messages: undefined }));
@@ -2385,7 +2582,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(chatReq),
-        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
+        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2469,8 +2666,16 @@ server.listen(PORT, HOST, () => {
   console.log(cBlue("  cmc-proxy 已启动"));
   console.log(cBlue(`  监听地址   : http://${HOST}:${PORT}`));
   console.log(cBlue(`  上游端点   : ${UPSTREAM}`));
-  console.log(cBlue(`  默认模型   : ${currentDefaultModel()}  (轮换列表: ${defaultModels.join(" → ")})`));
-  console.log(cBlue(`  失败即轮换 : ${defaultModels.length < 2 ? "不适用 (defaultModels 仅一个模型, 不轮换)" : SWITCH_ON_FAIL ? "开启 (switchOnFail, 单次请求内失败按 defaultModels 逐个重试, 试完透传)" : "关闭 (阈值轮换: 首个模型连续失败 3 次切换, 后续失败 1 次即切换, 循环)"}`));
+  const dmList = defaultModels.map((m, i) => (i === 0 ? `${m}(默认)` : m)).join(" → ");
+  const vmList = defaultVisionModels.map((m, i) => (i === 0 ? `${m}(默认)` : m)).join(" → ") || "(无)";
+  console.log(cBlue(`  默认模型   : ${dmList}`));
+  console.log(cBlue(`  视觉模型   : ${vmList}`));
+  const sofDesc = switchOnFailRaw && typeof switchOnFailRaw === "object"
+    ? `对象 {text:${!!switchOnFailRaw.text}, image:${!!switchOnFailRaw.image}}`
+    : SWITCH_ON_FAIL ? "开启" : "关闭";
+  console.log(cBlue(`  失败轮换   : ${defaultModels.length < 2 && defaultVisionModels.length < 2 ? "不适用 (列表仅一个模型, 不轮换)" : `${sofDesc} (失败1次即切换 + ${FAIL_TTL / 1000}s 冷却)`}`));
+  console.log(cBlue(`  历史图清理 : ${CLEAN_HISTORY_IMAGES ? "开启 (无新图请求时剥离历史图, 回流请求指定模型)" : "关闭 (历史图随上下文保留)"}`));
+  console.log(cBlue(`  tool结果图 : ${TOOL_RESULT_IMAGES ? "保留 (注入 user 消息透传)" : "丢弃 (折叠为 [image])"}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
   console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));

@@ -1,6 +1,6 @@
 # cmc-proxy — commandcode GOAT 订阅本地反代网关
 
-![version](https://img.shields.io/badge/version-v1.1.0-blue)
+![version](https://img.shields.io/badge/version-v1.3.0-blue)
 ![stars](https://img.shields.io/github/stars/cwf818/cmc-proxy)
 ![issues](https://img.shields.io/github/issues/cwf818/cmc-proxy)
 

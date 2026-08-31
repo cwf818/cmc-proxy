@@ -4,17 +4,24 @@
   "host": "127.0.0.1",
   "upstream": "https://api.commandcode.ai/provider",
   "apiKey": "",
-  "_默认模型说明": "defaultModels 为数组, 第一个模型作为默认模型。出错后按顺序逐个 fallback: 首个模型连续失败 3 次切换, 后续模型失败 1 次即切换(不重试), 全部轮完循环回到第一个。仅配置一个模型即钉死不轮换(替代旧 fallback 参数)。列表可调整顺序, 模型 id 见 /v1/models 接口。",
-  "defaultModels": [
-    "deepseek/deepseek-v4-flash",
-    "deepseek/deepseek-v4-flash-vision-exp",
-    "z-ai/glm-5.3-flash",
-    "Qwen/Qwen3.8-27B",
-    "xiaomi/mimo-v2.5"
-  ],
-  "_失败即轮换说明": "switchOnFail: true 时单次请求内上游失败(仅限 403/404/408/429/5xx 与网络层错误)即按 defaultModels 逐个重试, 直到成功或试完后透传最后一次结果; false(默认)保持阈值轮换(当次失败原样返回, 连续失败仅切换后续请求的默认模型)。defaultModels 仅一个模型时不生效。最坏耗时≈候选数×firstByteTimeout, 建议配合较小的 firstByteTimeout 使用。",
-  "switchOnFail": false,
-  "_模型映射说明": "key 是客户端请求的模型名, value 是实际转发到上游的模型名。未命中映射表且上游目录中不存在(含无前缀名匹配)的模型, 会 fallback 到 defaultModels 当前活动模型。",
+  "_失败轮换说明": "switchOnFail: 轮换总开关, 支持布尔或 {text, image} 对象, 单布尔表示统一取值。true 时失败 1 次即切换 + TTL 冷却 (failTTL) 轮换: 文本请求按 defaultModels, 带图请求按 defaultVisionModels, 失败模型 TTL 内冷却跳过, 全部失效时返回上游失败结果。false 时不轮换。",
+  "switchOnFail": {
+    "text": true,
+    "image": true
+  },
+  "_历史图清理说明": "cleanHistoryImages: true 时, /v1/messages 转换链路检测到本轮(最后一条 user 消息)无新图, 会把历史里的图片块原位替换为占位文本 [历史图片已清理] 再转发 —— 历史图上游同样 400, 剥离后请求可安全回流默认模型, 带图路由只看新图, 会话不再被历史图钉死在视觉模型。替换确定性, 不破坏前缀缓存。默认 false。",
+  "cleanHistoryImages": true,
+  "_tool结果图说明": "toolResultImages: false 时丢弃 tool_result 内嵌图片 (折叠为 [image] 占位), 默认保留 (注入随后 user 消息透传)。",
+  "toolResultImages": true,
+  "_冷却说明": "failTTL: 模型失败后的冷却时间 ms, 冷却期内跳过该模型 (默认 30000)。",
+  "failTTL": 30000,
+  "_模型解析说明": "resolveModel: modelMap 未命中时的解析开关 (默认 true)。true: 按上游目录匹配 (精确/去前缀/大小写不敏感), 命中即用, 未命中按请求类型回退 defaultModels[0]/defaultVisionModels[0]; false: 原样向上游请求 (不解析不回退)。",
+  "resolveModel": true,
+  "_串行化说明": "serializeSessionRequests: 同一会话的上游请求串行发送 (默认 true)。CC 的会话标题探测请求与主请求毫秒级并发时, 中转侧曾出现主请求 300s 无响应头悬挂; 串行化规避并发。排队中的请求若客户端断开会立即出队。",
+  "serializeSessionRequests": true,
+  "_首字节超时说明": "firstByteTimeout: 上游超过该毫秒数未返回响应头时主动中止并返回 502 (0=关闭, 兜底 undici 的 300s)。默认 120000。",
+  "firstByteTimeout": 120000,
+  "_模型映射说明": "modelMap: 客户端请求模型名的显式映射, 命中即用, 不区分请求类型 (文本/带图), 优先级最高, 置空即关闭。key 是客户端请求名, value 是转发到上游的模型名。",
   "modelMap": {
     "claude-sonnet-4-6": "deepseek/deepseek-v4-flash",
     "claude-sonnet-4-5": "deepseek/deepseek-v4-flash",
@@ -31,7 +38,21 @@
     "gpt-5.2-codex": "gpt-5.6-sol",
     "gpt-5.1-codex": "gpt-5.6-sol"
   },
-  "_屏蔽说明": "这些模型在 GOAT 计划下不可用, 从 /v1/models 列表中隐藏, 避免客户端误选。",
+  "_默认模型说明": "defaultModels: 文本请求的轮换列表, 第一个作为文本默认模型。失败 1 次即切换, TTL 冷却后重试。模型 id 见 /v1/models。",
+  "defaultModels": [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
+    "z-ai/glm-5.3-flash",
+    "Qwen/Qwen3.8-27B",
+    "xiaomi/mimo-v2.5"
+  ],
+  "_视觉模型说明": "defaultVisionModels: 带图请求的轮换列表, 第一个作为视觉默认模型 (未带 model 的带图请求直接用它)。带图请求按此列表轮换找能处理图片的模型。",
+  "defaultVisionModels": [
+    "xiaomi/mimo-v2.5",
+    "z-ai/glm-5.3-flash",
+    "Qwen/Qwen3.8-27B"
+  ],
+  "_屏蔽说明": "blockedModels: 这些模型在 GOAT 计划下不可用, 从 /v1/models 列表中隐藏, 避免客户端误选。",
   "blockedModels": [
     "claude-sonnet-4-6",
     "claude-sonnet-5",
@@ -46,9 +67,5 @@
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "google/gemini-3.6-flash"
-  ],
-  "_串行化说明": "serializeSessionRequests: 同一会话的上游请求串行发送 (默认 true)。CC 的会话标题探测请求与主请求毫秒级并发时, 中转侧曾出现主请求 300s 无响应头悬挂; 串行化规避并发。排队中的请求若客户端断开会立即出队。",
-  "serializeSessionRequests": true,
-  "_首字节超时说明": "firstByteTimeout: 上游超过该毫秒数未返回响应头时主动中止并返回 502 (0=关闭, 兜底 undici 的 300s)。默认 120000。",
-  "firstByteTimeout": 120000
+  ]
 }

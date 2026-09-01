@@ -2029,13 +2029,16 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
   //   分叉点在 120 字符内 -> 头部截断 140 + "…" (分叉点后至少留 20 字符上下文)
   //   分叉点在 120 之外 -> 头 59 + "…" + 自分叉点前 10 字符起的 80 字符定位子串
   //     (前 10 + 后 70), 59+1+80=140 恰好撑满; 旧/新行分叉点列位一致, 便于对齐
+  // 分叉段 (分叉起点至行尾) 以 \x01 起始标记, 打印时标橙; JSON.stringify 会转义
+  // 控制符, 预览串中不会出现裸 \x01, 哨兵安全
   const PREVIEW_LEN = 140;
   const LOCATE_HEAD = 59; // 定位路径头部长度 = PREVIEW_LEN - 1("…") - 80(定位子串)
+  const marked = (s, at) => (at < s.length ? s.slice(0, at) + "\x01" + s.slice(at) : s);
   const brief = (j, divAt) => {
-    if (j.length <= PREVIEW_LEN) return j;
-    if (divAt <= 120) return j.slice(0, PREVIEW_LEN) + "…";
+    if (j.length <= PREVIEW_LEN) return marked(j, divAt);
+    if (divAt <= 120) return marked(j.slice(0, PREVIEW_LEN) + "…", divAt);
     const start = Math.max(0, divAt - 10);
-    return j.slice(0, LOCATE_HEAD) + "…" + j.slice(start, start + 80);
+    return marked(j.slice(0, LOCATE_HEAD) + "…" + j.slice(start, start + 80), LOCATE_HEAD + 1 + (divAt - start));
   };
   const a = prev.msgs[i], b = curMsgsJson[i];
   let d = 0;
@@ -2324,7 +2327,20 @@ const server = http.createServer(async (req, res) => {
     // 前缀分叉标记: 仅在检测到分叉/压缩时输出 (纯追加为健康状态, 不输出); 分叉内容预览单独成行
     const pfx = (req._cmdc && req._cmdc.pfx) || { mark: "", detail: "" };
     const pfxMark = pfx.mark ? ` ${cRed(pfx.mark)}` : "";
-    if (pfx.detail) console.warn(cRed(`[cmc-proxy] ${sessTag()} 前缀分叉: ${pfx.detail}`));
+    if (pfx.detail) {
+      // 分叉预览逐行着色: 标记 \x01 之前红色 (与整行一致), 之后为分叉段标橙;
+      // 不嵌套在 cRed 内 —— 橙段的复位码会连带复位外层红色
+      const colored = useColor
+        ? pfx.detail
+            .split("\n")
+            .map((l) => {
+              const k = l.indexOf("\x01");
+              return k < 0 ? cRed(l) : cRed(l.slice(0, k)) + cOrange(l.slice(k + 1));
+            })
+            .join("\n")
+        : pfx.detail.replace(/\x01/g, "");
+      console.warn(cRed(`[cmc-proxy] ${sessTag()} 前缀分叉: `) + colored);
+    }
     const stFn = res.statusCode >= 500 ? cRed : res.statusCode >= 400 ? cYellow : res.statusCode >= 300 ? cCyan : cGreen;
     // 标签 S{id}#{req} 用该请求闭包捕获的颜色 (与 REQ 行同色); 状态码保持原波段色
     const tag = sessTag();

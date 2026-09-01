@@ -2021,10 +2021,26 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
   const role = (j) => {
     try { const m = JSON.parse(j); return m.role || m.type || "?"; } catch { return "?"; }
   };
-  const brief = (j) => (j.length > 110 ? j.slice(0, 110) + "…" : j);
+  // 分叉内容预览, 总长固定 140 字符, 目标是让分叉点落在预览内可对齐比较:
+  //   消息本身不超 140 -> 原样
+  //   分叉点在 120 字符内 -> 头部截断 140 + "…" (分叉点后至少留 20 字符上下文)
+  //   分叉点在 120 之外 -> 头 59 + "…" + 自分叉点前 10 字符起的 80 字符定位子串
+  //     (前 10 + 后 70), 59+1+80=140 恰好撑满; 旧/新行分叉点列位一致, 便于对齐
+  const PREVIEW_LEN = 140;
+  const LOCATE_HEAD = 59; // 定位路径头部长度 = PREVIEW_LEN - 1("…") - 80(定位子串)
+  const brief = (j, divAt) => {
+    if (j.length <= PREVIEW_LEN) return j;
+    if (divAt <= 120) return j.slice(0, PREVIEW_LEN) + "…";
+    const start = Math.max(0, divAt - 10);
+    return j.slice(0, LOCATE_HEAD) + "…" + j.slice(start, start + 80);
+  };
+  const a = prev.msgs[i], b = curMsgsJson[i];
+  let d = 0;
+  const n = Math.min(a.length, b.length);
+  while (d < n && a[d] === b[d]) d++;
   return {
     mark: `pfx~${i}`,
-    detail: `消息 ${i} (${role(prev.msgs[i])}) 分叉: 旧 ${brief(prev.msgs[i])} || 新 ${brief(curMsgsJson[i])}`,
+    detail: `消息 ${i} (${role(a)}) 分叉:\n旧 ${brief(a, d)}\n新 ${brief(b, d)}`,
   };
 }
 

@@ -1919,14 +1919,17 @@ function winAgg(n) {
 /** 速度数字格式化: 整数去 .0 */
 const fmtSpeed = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, ""));
 
+/** 百分比格式化: 最多 1 位小数, 整数不带小数点 (99% / 98.7%) */
+const fmtPct = (p) => p.toFixed(1).replace(/\.0$/, "") + "%";
+
 /** 生成滚动统计串: "ch:87% ts:33/s,40/s,50/s" (ch 为会话累计, ts 为滚动窗口, 各自波段色) */
 function movingStatsStr(session) {
   // ch: 按会话累计 (session.in / session.cr), 无会话时退化为当前次
   const chIn = session ? session.in : 0;
   const chCr = session ? session.cr : 0;
   const chTotal = chIn + chCr;
-  const chPct = chTotal > 0 ? Math.round((chCr / chTotal) * 100) : 0;
-  const chStr = cacheSegment("ch:" + (chTotal > 0 ? chPct + "%" : "-"), chPct);
+  const chPct = chTotal > 0 ? (chCr / chTotal) * 100 : 0;
+  const chStr = cacheSegment("ch:" + (chTotal > 0 ? fmtPct(chPct) : "-"), chPct);
   const n = stats.recent.length;
   const levels = n >= 11 ? [1, 10, 50] : n >= 2 ? [1, 10] : [1];
   const tsParts = levels.map((win, i) => {
@@ -1943,8 +1946,8 @@ function movingStatsStr(session) {
 function statsLine(label, agg) {
   if (!agg || !agg.req) return;
   const totalIn = agg.in + agg.cr;
-  const pct = totalIn > 0 ? Math.round((agg.cr / totalIn) * 100) : 0;
-  const chStr = cacheSegment("ch:" + (totalIn > 0 ? pct + "%" : "-"), pct);
+  const pct = totalIn > 0 ? (agg.cr / totalIn) * 100 : 0;
+  const chStr = cacheSegment("ch:" + (totalIn > 0 ? fmtPct(pct) : "-"), pct);
   // 生成 tokens = 输出 out + 思考 rt
   const v = agg.ms > 0 ? (agg.out + agg.rt) / (agg.ms / 1000) : 0;
   const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);

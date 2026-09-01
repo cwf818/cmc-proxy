@@ -265,7 +265,7 @@ User-Agent: claude-cli/2.0.0
 - **已知限制**：文本链路用 `[历史图片已清理]`，而 `tool_result` 折叠用的是 `[image]`（§2.2 表格）。带图轮次的图在下一轮变成占位文本时，该条消息内容必然与上一轮不同 → RES 行触发一次 `pfx~N` 分叉
 - 仅 `/v1/messages` 转换链路生效；`/v1/chat/completions`、`/v1/responses` 不清理
 
-**带图请求路由与轮换**（上游 `/chat/completions` 的 A/B/C 三条链路共用；B′ 直连 `/messages` 时按文本列表 `defaultModels` 轮换）：请求按类型分为文本/带图两种。`config.switchOnFail`（支持布尔或 `{text, image}` 对象，单布尔统一取值）为 true 时，失败 1 次即切换 + TTL 冷却（`config.failTTL`）轮换：文本请求按 `defaultModels` 轮换，带图请求按 `defaultVisionModels` 轮换（图片不支持的报错是 400，因此带图请求 400 也轮换），失败模型在 TTL 内冷却跳过，全部模型在冷却期时直接返回上游失败结果。switchOnFail=false 时不轮换，失败原样返回。REQ 行的 `img=N(新M)` 标记显示请求体中检测到的图片块数，其中 `新M` 为最后一条 user 消息（当前轮）中的新图数（仅本路径计算）。
+**带图请求路由与轮换**（上游 `/chat/completions` 的 A/B/C 三条链路共用；B′ 直连 `/messages` 时按文本列表 `defaultModels` 轮换）：请求按类型分为文本/带图两种。`config.switchOnFail`（支持布尔或 `{text, image}` 对象，单布尔统一取值）为 true 时，失败 1 次即切换 + TTL 冷却（`config.failTTL`）轮换：文本请求按 `defaultModels` 轮换，带图请求按 `defaultVisionModels` 轮换（图片不支持的报错是 400，因此带图请求 400 也轮换），失败模型在 TTL 内冷却跳过，全部模型在冷却期时直接返回上游失败结果。**冷却只对回退到默认的模型生效**：用户显式指定模型（`modelMap` / 目录解析命中，未落到回退点）失败不冷却，下次请求仍从它开始（不去猜测其能力）；只有未带 model 或指定模型解析失败回退到 `defaultForType` 的模型失败才进入 TTL 冷却，默认列表内后续候选照常冷却。switchOnFail=false 时不轮换，失败原样返回。REQ 行的 `img=N(新M)` 标记显示请求体中检测到的图片块数，其中 `新M` 为最后一条 user 消息（当前轮）中的新图数（仅本路径计算）。
 
 ### 2.3 Upstream Response（OpenAI 非流式）
 
@@ -654,12 +654,15 @@ data: [DONE]
 
 ```
 switchOnFail(按请求类型: text / image)?
-├─ false → 单次请求不轮换; 失败原样返回 (仍记入 failTTL 冷却表, 成功清除)
+├─ false → 单次请求不轮换; 失败原样返回 (回退到默认的模型记入 failTTL 冷却表,
+│          用户显式指定的模型不记入; 成功清除)
 └─ true  → 候选序列 = [pickModel 决策出的模型] + 类型列表(defaultModels / defaultVisionModels) 去重
            逐个尝试:
+             用户显式指定模型 (isFallback=false 且 i===0)
+             └─ 不检查冷却, 永远先试; 失败不 markModelFail, 直接轮换
              冷却中(modelInCooldown) → 跳过, 打印 "模型 X 冷却中, 跳过"
              2xx                    → 成功, 清除冷却, 结束
-             非 2xx                 → markModelFail (进入冷却)
+             非 2xx                 → markModelFail (进入冷却) [回退/默认候选]
                   ├─ 带图且 400                → 轮换下一个
                   ├─ 403/404/408/429/5xx       → 轮换下一个
                   └─ 其他 (401/413/422...)     → 不轮换, 原样透传
@@ -668,6 +671,11 @@ switchOnFail(按请求类型: text / image)?
            全部试完 → 透传最后一次上游响应 (或抛最后一次错误 → 502)
            全部在冷却期 → 不发请求, 直接 502
 ```
+
+**冷却范围**（`isFallback`）：只有回退到默认的模型（未带 model，或指定模型解析失败落到
+`defaultForType`）失败才 `markModelFail` 进入 TTL 冷却；用户显式指定的模型（`modelMap` /
+目录解析命中）失败不冷却，下次请求仍从它开始 —— 不去猜测用户指定模型的能力（如纯文本模型
+收到带图请求）。默认列表里的后续候选（轮换到的 index ≥ 1）无论何种情况都照常冷却（方案 A）。
 
 轮换日志示例（`TAGW` = 黄色 `[cmc-proxy]` 前缀，带会话标签）：
 

@@ -62,7 +62,10 @@
  *      取值)。true 时失败 1 次即切换 + failTTL 冷却: 按请求类型选列表 (文本 defaultModels /
  *      带图 defaultVisionModels, 带图 400 也轮换), 失败模型 TTL 内冷却跳过, 全部失效时返回
  *      上游失败结果; false 时不轮换, 失败原样返回。模型决策见 pickModel (modelMap 优先 ->
- *      resolveModel 目录解析 -> 按请求类型回退默认)。
+ *      resolveModel 目录解析 -> 按请求类型回退默认)。**冷却只对回退到默认的模型生效**:
+ *      用户显式指定的模型 (modelMap/目录解析命中) 失败不冷却、下次请求仍从它开始 —— 不去
+ *      猜测用户指定模型的能力; 只有未带 model 或指定模型解析失败回退到 defaultForType 时,
+ *      失败才进入 TTL 冷却 (默认列表内后续候选无论何种情况都照常冷却)。
  */
 "use strict";
 
@@ -333,10 +336,23 @@ function defaultForType(isImage) {
  *      false        : 原样向上游请求 (不解析不回退)
  */
 function pickModel(requested, isImage) {
-  if (!requested) return defaultForType(isImage);
-  if (modelMap[requested]) return modelMap[requested]; // 显式映射优先
-  if (!RESOLVE_MODEL) return requested; // 解析关闭: 原样
-  return resolveModel(requested) || defaultForType(isImage);
+  return pickModelWithFlag(requested, isImage).model;
+}
+
+/**
+ * 模型决策 + 是否"回退到默认"标志。isFallback=true 表示最终模型是系统回退选出的
+ * (未带 model, 或用户指定模型解析失败落到 defaultForType), 即非用户显式意图。
+ * 该标志驱动冷却范围: 只有回退到默认的模型失败才进入 failTTL 冷却 (用户显式指定的
+ * 模型不猜测、不冷却, 下次请求仍从它开始)。与 pickModel 唯一区别是附带 isFallback。
+ */
+function pickModelWithFlag(requested, isImage) {
+  if (!requested) return { model: defaultForType(isImage), isFallback: true };
+  if (modelMap[requested]) return { model: modelMap[requested], isFallback: false }; // 显式映射优先
+  if (!RESOLVE_MODEL) return { model: requested, isFallback: false }; // 解析关闭: 原样
+  const resolved = resolveModel(requested);
+  return resolved
+    ? { model: resolved, isFallback: false }
+    : { model: defaultForType(isImage), isFallback: true };
 }
 
 /** 当前默认模型 (文本) */
@@ -1680,7 +1696,7 @@ async function rawUpstreamFetch(url, init, signal) {
   }
 }
 
-async function upstreamFetch(url, init, requestedModel, signal) {
+async function upstreamFetch(url, init, requestedModel, signal, isFallback = true) {
   if (requestedModel && blockedSet.has(requestedModel)) warnBlockedModel(requestedModel);
   let r;
   try {
@@ -1690,11 +1706,13 @@ async function upstreamFetch(url, init, requestedModel, signal) {
     if (signal?.aborted && !e.firstByteTimeout) {
       throw upstreamError("客户端已断开, 终止上游请求", { clientAbort: true });
     }
-    onRequestFail(requestedModel);
+    // 用户显式指定模型失败不冷却 (不去猜测能力); 回退/默认模型照常冷却
+    if (isFallback) onRequestFail(requestedModel);
     throw e;
   }
-  if (!r.ok) onRequestFail(requestedModel);
-  else onRequestOk(requestedModel);
+  if (!r.ok) {
+    if (isFallback) onRequestFail(requestedModel);
+  } else onRequestOk(requestedModel);
   return r;
 }
 
@@ -1709,14 +1727,19 @@ const ROTATE_STATUSES = new Set([403, 404, 408, 429, 500, 502, 503, 504]);
  *   - 失败 1 次即切换下一个候选 (不再有阈值/首个模型的区别)。
  *   - 模型失败后进入 TTL 冷却 (config.failTTL, 默认 30s), 冷却期内跳过该模型。
  *   - 候选全部在冷却期 (失效范围) 时, 不再轮换, 直接透传最后一次上游失败结果。
+ * 冷却范围 (hooks.isFallback):
+ *   - isFallback=false (用户显式指定模型, 经 modelMap/目录解析命中): 该模型不检查冷却、
+ *     失败也不计入冷却 —— 不去猜测用户指定模型的能力, 下次请求仍从它开始。
+ *   - isFallback=true (未带 model 或指定模型解析失败回退到默认): 首个候选照常冷却;
+ *     默认列表里的后续候选 (index >= 1) 无论哪种情况都照常冷却 (方案 A)。
  * switchOnFail=false: 单次请求不轮换, 与 upstreamFetch 一致 (当次失败原样返回)。
  * hooks.onModel(finalModel): 轮换后回调实际使用的模型, 供 RES 行 model= 展示。
  */
 async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
-  const { sessTag, onModel, isImage = false } = hooks;
+  const { sessTag, onModel, isImage = false, isFallback = true } = hooks;
   const rotateOn = switchOnFailFor(isImage);
   if (!rotateOn) {
-    const r = await upstreamFetch(url, init, firstModel, signal);
+    const r = await upstreamFetch(url, init, firstModel, signal, isFallback);
     if (onModel) onModel(firstModel);
     return r;
   }
@@ -1743,8 +1766,10 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
   let lastErr = null;
   for (let i = 0; i < candidates.length; i++) {
     const model = candidates[i];
-    // TTL 冷却: 冷却期内的模型跳过
-    if (modelInCooldown(model)) {
+    // 用户显式指定模型 (i===0 且非回退): 不检查冷却, 永远先试 —— 不去猜测它的能力
+    const isUserModel = !isFallback && i === 0;
+    // TTL 冷却: 冷却期内的模型跳过 (用户显式指定模型除外)
+    if (!isUserModel && modelInCooldown(model)) {
       lastErr = upstreamError(`模型 ${model} 冷却中 (剩 ${Math.ceil(cooldownRemainMs(model) / 1000)}s)`);
       console.warn(TAGW, `${pfx}模型 ${model} 冷却中, 跳过`);
       continue;
@@ -1757,7 +1782,8 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
         return r;
       }
       lastErr = r;
-      markModelFail(model);
+      // 用户显式指定模型失败不冷却 (不去猜测能力), 只轮换; 回退/默认候选照常冷却
+      if (!isUserModel) markModelFail(model);
       // 带图请求: 图片不支持的报错就是 400 (This model does not support image), 400 也轮换
       if (isImage && r.status === 400) {
         if (i + 1 < candidates.length) {
@@ -1782,7 +1808,8 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
     } catch (e) {
       if (e.clientAbort) throw e; // 客户端已断开, 立即终止, 不再重试
       lastErr = e;
-      markModelFail(model);
+      // 用户显式指定模型失败不冷却, 只轮换; 回退/默认候选照常冷却
+      if (!isUserModel) markModelFail(model);
       if (i + 1 < candidates.length) {
         console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${e.message}, 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
         continue;
@@ -2392,7 +2419,7 @@ const server = http.createServer(async (req, res) => {
       const imgNew = countLastUserImages(body);
       const isImage = imgCount > 0; // 请求类型 (原始请求体判定, 转换后可能因清理历史图变化)
       const requested = body.model || defaultForType(isImage);
-      const mapped = pickModel(body.model, isImage);
+      const { model: mapped, isFallback: mappedFallback } = pickModelWithFlag(body.model, isImage);
       const useAnthropicEndpoint = isClaudeModel(mapped);
       req._cmdc = { model: requested, mapped, stream: isStream, img: imgCount, imgNew };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
@@ -2426,7 +2453,7 @@ const server = http.createServer(async (req, res) => {
               "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
             }),
             body: JSON.stringify(body),
-          }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; } });
+          }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isFallback: mappedFallback });
         } catch (e) {
           releaseUp();
           upstreamFail(e);
@@ -2450,7 +2477,8 @@ const server = http.createServer(async (req, res) => {
       if (CLEAN_HISTORY_IMAGES && !imgNew) stripHistoryImages(body);
       // 用"剥离后的最终请求类型"重新决策模型并覆盖, 转换函数使用
       const finalImage = imgCount > 0 && !(CLEAN_HISTORY_IMAGES && imgNew === 0);
-      body.model = pickModel(body.model, finalImage);
+      const finalDecision = pickModelWithFlag(body.model, finalImage);
+      body.model = finalDecision.model;
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
       // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选是最终决策的模型
       const upstreamBodyJson = JSON.stringify(oaiReq);
@@ -2477,7 +2505,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(oaiReq),
-        }, oaiReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage: finalImage });
+        }, oaiReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage: finalImage, isFallback: finalDecision.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2531,7 +2559,8 @@ const server = http.createServer(async (req, res) => {
       const imgCount = countImagesDeep(body);
       const isImage = imgCount > 0;
       const requested = body.model || defaultForType(isImage);
-      body.model = pickModel(body.model, isImage);
+      const decision = pickModelWithFlag(body.model, isImage);
+      body.model = decision.model;
       req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream, img: imgCount };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
@@ -2557,7 +2586,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(body),
-        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage });
+        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: decision.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2580,7 +2609,8 @@ const server = http.createServer(async (req, res) => {
       const isStream = !!body.stream;
       const imgCount = countImagesDeep(body);
       const requested = body.model || defaultForType(imgCount > 0);
-      const mapped = pickModel(body.model, imgCount > 0);
+      const decision = pickModelWithFlag(body.model, imgCount > 0);
+      const mapped = decision.model;
       body.model = mapped; // 转换函数使用
       req._cmdc = { model: requested, mapped, stream: isStream, img: imgCount };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
@@ -2615,7 +2645,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(chatReq),
-        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage });
+        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: decision.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);

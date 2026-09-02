@@ -155,15 +155,14 @@ const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内
 const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
 const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
 
-// 模型参数目录 (modelCatalog): 指向价格/额度 JSON 文件, 默认 goat-prices.json。
-// 存在且解析成功时作为模型参数数据源, 用于计算单次请求的额度 (credit) 消耗;
-// 文件不存在 / 读取或解析失败时静默跳过 —— 只是没有模型参数数据, 不影响转发与日志。
-const MODEL_CATALOG_PATH = config.modelCatalog
-  ? path.resolve(ROOT, config.modelCatalog)
-  : path.join(ROOT, "goat-prices.json");
+// 模型参数目录 (modelCatalog): 指向价格/额度 JSON 文件的路径, **仅在配置文件中显式指定时
+// 才加载** (无默认值)。存在且解析成功时作为模型参数数据源, 用于计算单次请求的额度 (credit)
+// 消耗; 文件不存在 / 读取或解析失败时静默跳过 —— 只是没有模型参数数据, 不影响转发与日志。
+// 未配置时 modelCatalog 保持 null, 不统计额度。
+const MODEL_CATALOG_PATH = config.modelCatalog ? path.resolve(ROOT, config.modelCatalog) : null;
 let modelCatalog = null; // { plan, index: Map<slug, model>, norm: Map<去非字母数字小写, model>, byId: Map<id, model> }
 try {
-  if (fs.existsSync(MODEL_CATALOG_PATH)) {
+  if (MODEL_CATALOG_PATH && fs.existsSync(MODEL_CATALOG_PATH)) {
     const parsed = JSON.parse(fs.readFileSync(MODEL_CATALOG_PATH, "utf8"));
     if (parsed && Array.isArray(parsed.models)) {
       const index = new Map(parsed.models.map((m) => (m && m.slug ? [m.slug, m] : null)).filter(Boolean));

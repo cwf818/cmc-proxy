@@ -17,7 +17,7 @@
   "failTTL": 30000,
   "_模型解析说明": "resolveModel: modelMap 未命中时的解析开关 (默认 true)。true: 按上游目录分层按序匹配 (精确 -> 大小写不敏感 -> 去 provider 前缀按裸名 -> 去 [*] 后缀), 命中即用, 未命中按请求类型回退 defaultModels[0]/defaultVisionModels[0]; false: 原样向上游请求 (不解析不回退)。",
   "resolveModel": true,
-  "_模型目录说明": "modelCatalog: 模型参数数据文件路径 (默认 goat-prices.json, 相对 proxy.js 目录)。存在且解析成功时用于计算单次请求的额度 (credit): 成本按牌价 priceUsdPerMTok 直接算, 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits; offPeak.windows 高峰窗口 (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价。文件不存在/读取失败静默跳过, 只是没有额度数据, 不影响转发与日志。加载成功打印日志并在启动 banner 显示模型数; 未配置时 banner 显示 '未配置'。",
+  "_模型目录说明": "modelCatalog: 模型参数数据文件路径 (相对 proxy.js 目录), 仅显式配置时加载 (无默认值)。存在且解析成功时用于计算单次请求的额度 (credit): 成本按牌价 priceUsdPerMTok 直接算, 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits; offPeak.windows 高峰窗口 (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价。文件不存在/读取失败静默跳过, 只是没有额度数据, 不影响转发与日志。加载成功打印日志并在启动 banner 显示模型数; 未配置时 banner 显示 '未配置'。",
   "modelCatalog": "goat-prices.json",
   "_串行化说明": "serializeSessionRequests: 同一会话的上游请求串行发送 (默认 true)。CC 的会话标题探测请求与主请求毫秒级并发时, 中转侧曾出现主请求 300s 无响应头悬挂; 串行化规避并发。排队中的请求若客户端断开会立即出队。",
   "serializeSessionRequests": true,

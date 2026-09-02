@@ -262,7 +262,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `defaultVisionModels`      | `[]`                                  | 带图请求轮换列表，第一个为视觉默认模型（旧 `imageCapableModels` 自动迁移）；为空时带图请求回退 `defaultModels[0]` |
 | `modelMap`                 | `{}`                                  | 显式模型映射（key = 客户端请求名，value = 上游模型名），优先级最高，置空即关闭                                    |
 | `resolveModel`             | `true`                                | `modelMap` 未命中时是否做目录解析 + 回退默认；`false` = 原样向上游请求                                            |
-| `modelCatalog`             | `goat-prices.json`                    | 模型参数数据文件路径（相对 `proxy.js` 目录）；存在且解析成功时用于计算单次请求的额度，文件缺失/解析失败静默跳过      |
+| `modelCatalog`             | 未配置（无默认）                        | 模型参数数据文件路径（相对 `proxy.js` 目录），仅显式配置时加载；存在且解析成功时用于计算单次请求的额度，文件缺失/解析失败静默跳过      |
 | `blockedModels`            | `[]`                                  | 从 `/v1/models` 列表隐藏（避免客户端误选）；**转发时不拦截**，命中只打印一次性告警                                |
 | `cleanHistoryImages`       | `false`                               | 本轮无新图时把历史图片块替换为 `[历史图片已清理]`（见「多模态」）                                                 |
 | `toolResultImages`         | `true`                                | `tool_result` 内嵌图片保留并注入后续 user 消息；`false` 折叠为 `[image]`                                          |

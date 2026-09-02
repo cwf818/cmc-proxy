@@ -2085,7 +2085,7 @@ function statsLine(label, agg) {
   const v = agg.ms > 0 ? (agg.out + agg.rt) / (agg.ms / 1000) : 0;
   const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
   // 额度 (credit): 累计额度黄色 6 位小数, avg 为单次平均额度; 插在 ch 之后 (与 RES 行一致)
-  const credStr = agg.credit > 0 ? cYellow(` cred:${agg.credit.toFixed(6)}`) : "";
+  const credStr = agg.credit > 0 ? cYellow(` credit:${agg.credit.toFixed(6)}`) : "";
   const costStr = agg.cost > 0 ? ` cost:$${agg.cost.toFixed(4)}` : "";
   const avgStr = agg.credit > 0 ? cYellow(` avg:${(agg.credit / agg.req).toFixed(6)}`) : "";
   console.log(

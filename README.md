@@ -390,8 +390,8 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 **2. TOD / ALL 累计（每 10 个请求打印）**
 
 ```
-[20:16:30.000] STATS TOD req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% cred:8.420000 cost:$7.2200 avg:0.336800 ts:210.1/s
-[20:16:30.000] STATS ALL req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% cred:8.420000 cost:$7.2200 avg:0.336800 ts:210.1/s
+[20:16:30.000] STATS TOD req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% credit:8.420000 cost:$7.2200 avg:0.336800 ts:210.1/s
+[20:16:30.000] STATS ALL req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% credit:8.420000 cost:$7.2200 avg:0.336800 ts:210.1/s
 ```
 
 | 行    | 范围                 | 说明                                |
@@ -400,7 +400,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | `ALL` | 进程启动以来累计     | **当天启动时与 TOD 一致，自动省略** |
 
 - `in:`/`out:`/`rt:`/`cr:`/`cw:` 含义与 RES 行相同；数字超 1K/1M 自动缩写
-- `cred:` 累计额度消耗（黄色，6 位小数），`cost:` 累计成本（USD），`avg:` 单次请求平均额度 = `cred ÷ req`（6 位小数）；均位于 `ch:` 之后
+- `credit:` 累计额度消耗（黄色，6 位小数），`cost:` 累计成本（USD），`avg:` 单次请求平均额度 = `credit ÷ req`（6 位小数）；均位于 `ch:` 之后
 - 额度计算口径：成本 = 按模型目录 `priceUsdPerMTok` 牌价直接算；额度 = 成本 × `plan.credits` ÷ 模型 `monthlyCredits`。未配置 `modelCatalog` / 模型未收录 / `monthlyCredits` 缺失时不累计（无该字段）
 - 打印频率可用环境变量 `CMC_STATS_EVERY` 调整（默认 10）
 - 统计为内存态，进程重启后清零

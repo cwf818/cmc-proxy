@@ -66,6 +66,11 @@
  *      用户显式指定的模型 (modelMap/目录解析命中) 失败不冷却、下次请求仍从它开始 —— 不去
  *      猜测用户指定模型的能力; 只有未带 model 或指定模型解析失败回退到 defaultForType 时,
  *      失败才进入 TTL 冷却 (默认列表内后续候选无论何种情况都照常冷却)。
+ *  11. modelCatalog (默认 goat-prices.json): 模型参数数据文件路径, 存在且解析成功时作为
+ *      模型参数数据源, 计算单次请求的额度 (credit) 消耗。成本按牌价 priceUsdPerMTok 直接
+ *      算 USD; 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits。offPeak.windows 高峰窗口
+ *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价。RES 行输出 credit (黄) / 高峰
+ *      !credit (红), TOD/ALL stats 输出累计 cred / cost / avg。文件缺失/解析失败静默跳过。
  */
 "use strict";
 
@@ -149,6 +154,32 @@ const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout ?? "120000", 10); //
 const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内嵌图片保留 (注入随后的 user 消息透传上游)
 const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
 const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
+
+// 模型参数目录 (modelCatalog): 指向价格/额度 JSON 文件, 默认 goat-prices.json。
+// 存在且解析成功时作为模型参数数据源, 用于计算单次请求的额度 (credit) 消耗;
+// 文件不存在 / 读取或解析失败时静默跳过 —— 只是没有模型参数数据, 不影响转发与日志。
+const MODEL_CATALOG_PATH = config.modelCatalog
+  ? path.resolve(ROOT, config.modelCatalog)
+  : path.join(ROOT, "goat-prices.json");
+let modelCatalog = null; // { plan, index: Map<slug, model>, norm: Map<去非字母数字小写, model>, byId: Map<id, model> }
+try {
+  if (fs.existsSync(MODEL_CATALOG_PATH)) {
+    const parsed = JSON.parse(fs.readFileSync(MODEL_CATALOG_PATH, "utf8"));
+    if (parsed && Array.isArray(parsed.models)) {
+      const index = new Map(parsed.models.map((m) => (m && m.slug ? [m.slug, m] : null)).filter(Boolean));
+      // 规范化索引: slug 去非字母数字后小写 —— 覆盖上游 id 与显示名派生 slug 的命名差异
+      // (如 Qwen3.8-27B vs qwen-3.8-27b)
+      const norm = new Map();
+      for (const m of index.values()) norm.set(m.slug.replace(/[^a-z0-9]+/g, ""), m);
+      // 上游 id 索引 (schema@2+ 新增): 上游转发的模型名就是 id, 精确命中优先于 slug 归一化
+      const byId = new Map(parsed.models.map((m) => (m && m.id ? [m.id, m] : null)).filter(Boolean));
+      modelCatalog = { plan: parsed.plan || {}, index, norm, byId };
+      console.log(`[cmc-proxy] 模型目录已加载: ${MODEL_CATALOG_PATH} (${modelCatalog.index.size} 个模型)`);
+    }
+  }
+} catch (e) {
+  console.warn(TAGW, "模型目录加载失败 (静默跳过):", e.message);
+}
 
 // 请求落盘分级 (环境变量 CMC_LOGGING_FILE, 未设置或 0 = 关闭):
 //   1 = 严重事件落盘 (上游请求失败/超时、客户端中途断开 ABT)
@@ -1926,8 +1957,82 @@ const dayKey = () => {
 };
 const fmtNum = (n) =>
   n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(n);
-const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0 });
+const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0, credit: 0, cost: 0 });
 const stats = { day: null, today: zeroAgg(), total: zeroAgg(), recent: [] };
+
+// ---- 模型目录: 单次请求成本 / 额度计算 ----
+// 成本 (cost): 按数据文件牌价直接计算 USD; 额度 (credit): 成本 × plan.credits / monthlyCredits。
+// offPeak 高峰窗口 (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价, cacheRead/cacheWrite 沿用原价。
+
+/** 按 modelCatalog 匹配模型记录: 请求模型名 -> id/slug/norm (与 goat-prices.js toSlug 同规则) */
+function catalogModel(mapped) {
+  if (!modelCatalog || !mapped) return null;
+  // 1. 上游 id 精确命中 (schema@2+): 上游转发的模型名就是 id (如 deepseek/deepseek-v4-flash-vision-exp)
+  if (modelCatalog.byId && modelCatalog.byId.has(mapped)) return modelCatalog.byId.get(mapped);
+  // 2. slug / 规范化匹配: 去掉 provider 前缀、[*] 上下文窗口后缀 (如 [1m]) 与 (latest)/(exp)
+  //    变体后缀, 再按 slug 规则归一化; 未命中回退到去非字母数字的规范化索引
+  //    (覆盖 Qwen3.8-27B vs qwen-3.8-27b 差异)
+  const bare = mapped.replace(/^[^/]*\//, "").toLowerCase().replace(/\[[^\]]*\]$/, "");
+  const slug = bare
+    .replace(/\((?:latest|exp)\)/g, "")
+    .replace(/[-.]?-(?:latest|exp)$/, "")
+    .replace(/[^a-z0-9.+]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return modelCatalog.index.get(slug) || modelCatalog.norm.get(slug.replace(/[^a-z0-9]+/g, "")) || null;
+}
+
+/** 解析 offPeak.windows "01–04 & 06–10 UTC" -> [{a,b},...] (end 包含); 跨午夜区间 b+=24; 解析失败返回 null */
+function parseWindows(str) {
+  if (!str) return null;
+  const re = /(\d{1,2})\s*[–\-—~]\s*(\d{1,2})/g;
+  const ranges = [];
+  let m;
+  while ((m = re.exec(str))) {
+    let a = +m[1], b = +m[2];
+    if (a > b) b += 24; // 跨午夜区间 (如 22-02) 归一为可比较
+    ranges.push({ a, b });
+  }
+  return ranges.length ? ranges : null;
+}
+
+/** 当前 UTC 时刻 (hour + minute/60) 是否落在某高峰区间内 */
+function inPeakWindow(model) {
+  const off = model && model.offPeak;
+  if (!off || !off.windows) return false;
+  const ranges = parseWindows(off.windows);
+  if (!ranges) return false;
+  const d = new Date();
+  const nowH = d.getUTCHours() + d.getUTCMinutes() / 60;
+  return ranges.some(({ a, b }) => nowH >= a && nowH <= b); // end 包含
+}
+
+/**
+ * 单次请求: 成本 (USD) + 额度 (credit)。
+ *  - 无模型目录 / 未收录模型 / 无 usage -> { credit:0, cost:0, peak:false, rated:false }
+ *  - monthlyCredits 缺失 (null) -> 成本照算, credit 记为 0, rated=false (不显示)
+ *  - peak=true 表示当前 UTC 时刻处于该模型 offPeak 高峰窗口, 已按峰值牌价计费
+ */
+function calcCredit(usage, mapped) {
+  if (!usage || !modelCatalog) return { credit: 0, cost: 0, peak: false, rated: false };
+  const model = catalogModel(mapped);
+  if (!model || !model.priceUsdPerMTok) return { credit: 0, cost: 0, peak: false, rated: false };
+  const peak = inPeakWindow(model);
+  const rate = { ...model.priceUsdPerMTok };
+  if (peak && model.offPeak && model.offPeak.peakUsdPerMTok) {
+    const p = model.offPeak.peakUsdPerMTok;
+    if (p.input != null) rate.input = p.input; // 高峰覆盖: 仅 input/output
+    if (p.output != null) rate.output = p.output;
+  }
+  let cost = 0;
+  for (const k of ["input", "output", "cacheRead", "cacheWrite"]) {
+    const tokens = usage[k] || 0;
+    const r = rate[k];
+    if (r != null) cost += (tokens / 1e6) * r;
+  }
+  const mc = model.monthlyCredits;
+  const credit = mc > 0 ? (cost * (modelCatalog.plan.credits || 0)) / mc : 0;
+  return { credit, cost, peak, rated: mc > 0 };
+}
 
 /** 最近 n 个请求的聚合 */
 function winAgg(n) {
@@ -1949,8 +2054,9 @@ const fmtSpeed = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/,
 /** 百分比格式化: 最多 1 位小数, 整数不带小数点 (99% / 98.7%) */
 const fmtPct = (p) => p.toFixed(1).replace(/\.0$/, "") + "%";
 
-/** 生成滚动统计串: "ch:87% ts:33/s,40/s,50/s" (ch 为会话累计, ts 为滚动窗口, 各自波段色) */
-function movingStatsStr(session) {
+/** 生成滚动统计串: "ch:87% credit=0.014 ts:33/s,40/s,50/s"
+ *  (ch 为会话累计, credit 单次额度紧跟其后, ts 为滚动窗口, 各自波段色) */
+function movingStatsStr(session, creditStr) {
   // ch: 按会话累计 (session.in / session.cr), 无会话时退化为当前次
   const chIn = session ? session.in : 0;
   const chCr = session ? session.cr : 0;
@@ -1966,10 +2072,10 @@ function movingStatsStr(session) {
     const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
     return speedSegment(text, v);
   });
-  return ` ${chStr} ${tsParts.join("")}`;
+  return ` ${chStr}${creditStr} ${tsParts.join("")}`;
 }
 
-/** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色) */
+/** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色); cred 为累计额度, avg 为单次平均额度 */
 function statsLine(label, agg) {
   if (!agg || !agg.req) return;
   const totalIn = agg.in + agg.cr;
@@ -1978,8 +2084,12 @@ function statsLine(label, agg) {
   // 生成 tokens = 输出 out + 思考 rt
   const v = agg.ms > 0 ? (agg.out + agg.rt) / (agg.ms / 1000) : 0;
   const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
+  // 额度 (credit): 累计额度黄色 6 位小数, avg 为单次平均额度; 插在 ch 之后 (与 RES 行一致)
+  const credStr = agg.credit > 0 ? cYellow(` cred:${agg.credit.toFixed(6)}`) : "";
+  const costStr = agg.cost > 0 ? ` cost:$${agg.cost.toFixed(4)}` : "";
+  const avgStr = agg.credit > 0 ? cYellow(` avg:${(agg.credit / agg.req).toFixed(6)}`) : "";
   console.log(
-    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr} ${tsStr}`
+    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr}${credStr}${costStr}${avgStr} ${tsStr}`
   );
 }
 
@@ -1988,7 +2098,7 @@ function logStats() {
   statsLine("TOD", stats.today);
   const same =
     stats.today.req === stats.total.req &&
-    ["in", "out", "rt", "cr", "cw", "ms"].every((k) => stats.today[k] === stats.total[k]);
+    ["in", "out", "rt", "cr", "cw", "ms", "credit", "cost"].every((k) => stats.today[k] === stats.total[k]);
   if (!same) statsLine("ALL", stats.total);
 }
 
@@ -1996,7 +2106,7 @@ function logStats() {
 function accumulate(rec, trackRolling) {
   stats.today.req += 1;
   stats.total.req += 1;
-  for (const k of ["in", "out", "rt", "cr", "cw", "ms"]) {
+  for (const k of ["in", "out", "rt", "cr", "cw", "ms", "credit", "cost"]) {
     stats.today[k] += rec[k];
     stats.total[k] += rec[k];
   }
@@ -2309,7 +2419,7 @@ const server = http.createServer(async (req, res) => {
     // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
     const u = req._cmdc && req._cmdc.usage;
     let usageStr = "";
-    const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms };
+    const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms, credit: 0, cost: 0 };
     rec.ms = ms; // 统计口径与 took 一致: 仅计发往上游之后的耗时 (排队等待单列 qwait)
     if (u) {
       // usage 摘要配色: in/out/cw 青色 (和谐), rt 紫色, cr 亮青突出 (缓存命中量)
@@ -2326,6 +2436,15 @@ const server = http.createServer(async (req, res) => {
       rec.cr = u.cacheRead ?? 0;
       rec.cw = u.cacheWrite ?? 0;
     }
+    // 额度 (credit): 成本 × plan.credits / monthlyCredits; 高峰窗口内以峰值牌价计。
+    // 仅在有 usage 且模型目录收录时输出: 非高峰黄色 credit=N, 高峰红色 !credit=N (前缀 ! 显式区分);
+    // 6 位小数。插入位置在 movingStatsStr 的 ch 之后 (见 movingStr 调用)。
+    const cq = calcCredit(u, req._cmdc.mapped);
+    rec.credit = cq.credit;
+    rec.cost = cq.cost;
+    const creditStr = cq.rated && cq.credit > 0
+      ? (cq.peak ? cRed(` !credit=${cq.credit.toFixed(6)}`) : cYellow(` credit=${cq.credit.toFixed(6)}`))
+      : "";
     // 跨天: 先打印上日 TOD/ALL 汇总, 重置当天
     const day = dayKey();
     if (stats.day !== day) {
@@ -2349,8 +2468,9 @@ const server = http.createServer(async (req, res) => {
         session.lastLowCacheSeq = session.seq;
       }
     }
-    // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加
-    const movingStr = usageStr ? movingStatsStr(session) : "";
+    // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加;
+    // credit 传入插在 ch 之后 (仅本次解析到 usage 时)
+    const movingStr = usageStr ? movingStatsStr(session, creditStr) : "";
     // 前缀分叉标记: 仅在检测到分叉/压缩时输出 (纯追加为健康状态, 不输出); 分叉内容预览单独成行
     const pfx = (req._cmdc && req._cmdc.pfx) || { mark: "", detail: "" };
     const pfxMark = pfx.mark ? ` ${cRed(pfx.mark)}` : "";
@@ -2739,6 +2859,7 @@ server.listen(PORT, HOST, () => {
   console.log(cBlue(`  失败轮换   : ${defaultModels.length < 2 && defaultVisionModels.length < 2 ? "不适用 (列表仅一个模型, 不轮换)" : `${sofDesc} (失败1次即切换 + ${FAIL_TTL / 1000}s 冷却)`}`));
   console.log(cBlue(`  历史图清理 : ${CLEAN_HISTORY_IMAGES ? "开启 (无新图请求时剥离历史图, 回流请求指定模型)" : "关闭 (历史图随上下文保留)"}`));
   console.log(cBlue(`  tool结果图 : ${TOOL_RESULT_IMAGES ? "保留 (注入 user 消息透传)" : "丢弃 (折叠为 [image])"}`));
+  console.log(cBlue(`  模型目录   : ${modelCatalog ? `已加载 (${modelCatalog.index.size} 个模型, ${MODEL_CATALOG_PATH})` : (config.modelCatalog ? "未加载 (文件缺失或解析失败)" : "未配置 (不统计额度)")}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
   console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));

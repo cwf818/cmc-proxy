@@ -70,7 +70,7 @@
  *      模型参数数据源, 计算单次请求的额度 (credit) 消耗。成本按牌价 priceUsdPerMTok 直接
  *      算 USD; 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits。offPeak.windows 高峰窗口
  *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价。RES 行输出 credit (黄) / 高峰
- *      !credit (红), TOD/ALL stats 输出累计 cred / cost / avg。文件缺失/解析失败静默跳过。
+ *      credit^ (数字后红色 ^ 标记), TOD/ALL stats 输出累计 cred / cost / avg。文件缺失/解析失败静默跳过。
  */
 "use strict";
 
@@ -2163,19 +2163,23 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
   };
   // 分叉内容预览, 总长固定 140 字符, 目标是让分叉点落在预览内可对齐比较:
   //   消息本身不超 140 -> 原样
-  //   分叉点在 120 字符内 -> 头部截断 140 + "…" (分叉点后至少留 20 字符上下文)
-  //   分叉点在 120 之外 -> 头 59 + "…" + 自分叉点前 10 字符起的 80 字符定位子串
-  //     (前 10 + 后 70), 59+1+80=140 恰好撑满; 旧/新行分叉点列位一致, 便于对齐
+  //   分叉点在 100 字符内 -> 头部截断 140 + "…" (分叉点后至少留 20 字符上下文)
+  //   分叉点在 100 之外 -> 头 49 + "…" + 自分叉点往前 20 字符起、一直取到 140 撑满
+  //     (前 20 + 后 70), 49+1+90=140 恰好撑满; 旧/新行分叉点列位一致, 便于对齐
   // 分叉段 (分叉起点至行尾) 以 \x01 起始标记, 打印时标橙; JSON.stringify 会转义
   // 控制符, 预览串中不会出现裸 \x01, 哨兵安全
   const PREVIEW_LEN = 140;
-  const LOCATE_HEAD = 59; // 定位路径头部长度 = PREVIEW_LEN - 1("…") - 80(定位子串)
+  const LOCATE_HEAD = 49; // 定位路径头部长度, 49 + 1("…") = 50
+  const LOCATE_LEAD = 20; // 定位起点自分叉点往前追的字符数 (分叉点前定位窗口)
   const marked = (s, at) => (at < s.length ? s.slice(0, at) + "\x01" + s.slice(at) : s);
   const brief = (j, divAt) => {
-    if (j.length <= PREVIEW_LEN) return marked(j, divAt);
-    if (divAt <= 120) return marked(j.slice(0, PREVIEW_LEN) + "…", divAt);
-    const start = Math.max(0, divAt - 10);
-    return marked(j.slice(0, LOCATE_HEAD) + "…" + j.slice(start, start + 80), LOCATE_HEAD + 1 + (divAt - start));
+    // 超 139 必带省略号: ≤139 原样 (含 140 整串时无尾缀), 否则截断到 140 (140 含尾部 …)
+    if (j.length < PREVIEW_LEN) return marked(j, divAt);
+    if (divAt < 100) return marked(j.slice(0, PREVIEW_LEN - 1) + "…", divAt);
+    // divAt >= 100: 定位窗口 往前20+往后(撑到140), 头 49 + "…" + 定位子串
+    const start = Math.max(0, divAt - LOCATE_LEAD); // 定位起点: 前追 20 (不足 20 则从 0)
+    const locLen = PREVIEW_LEN - (LOCATE_HEAD + 1); // 定位子串长度 = 140 - 50 = 90
+    return marked(j.slice(0, LOCATE_HEAD) + "…" + j.slice(start, start + locLen), LOCATE_HEAD + 1 + (divAt - start));
   };
   const a = prev.msgs[i], b = curMsgsJson[i];
   let d = 0;
@@ -2437,13 +2441,13 @@ const server = http.createServer(async (req, res) => {
       rec.cw = u.cacheWrite ?? 0;
     }
     // 额度 (credit): 成本 × plan.credits / monthlyCredits; 高峰窗口内以峰值牌价计。
-    // 仅在有 usage 且模型目录收录时输出: 非高峰黄色 credit=N, 高峰红色 !credit=N (前缀 ! 显式区分);
+    // 仅在有 usage 且模型目录收录时输出: 非高峰黄色 credit=N, 高峰 credit=N^ (数字后红色 ^ 标记);
     // 6 位小数。插入位置在 movingStatsStr 的 ch 之后 (见 movingStr 调用)。
     const cq = calcCredit(u, req._cmdc.mapped);
     rec.credit = cq.credit;
     rec.cost = cq.cost;
     const creditStr = cq.rated && cq.credit > 0
-      ? (cq.peak ? cRed(` !credit=${cq.credit.toFixed(6)}`) : cYellow(` credit=${cq.credit.toFixed(6)}`))
+      ? (cq.peak ? cYellow(` credit=${cq.credit.toFixed(6)}`) + cRed("^") : cYellow(` credit=${cq.credit.toFixed(6)}`))
       : "";
     // 跨天: 先打印上日 TOD/ALL 汇总, 重置当天
     const day = dayKey();

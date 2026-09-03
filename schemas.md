@@ -378,6 +378,7 @@ data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta"
 - `message_start.usage.input_tokens` 为**本地估算值**（`estimateInputTokens(body)`）；`message_delta.usage` 带上真实的净输入，是最后能修正客户端用量的机会（Claude Code 按 `input_tokens + cache_read_input_tokens` 统计）
 - 上游非 2xx 时**不做转换**：直接 `up.text()` 原样透传上游状态码与错误 body（OpenAI 格式）
 - 上游流中途中断：已发出的字节不可撤回，只补 `content_block_stop` / `message_delta` / `message_stop` 收尾并打印 `上游 messages 流中断`
+- **块索引 0 是合法值**：文本块索引初始为 `null`，创建后从 `nextBlockIndex` 自增（首个文本块可能是 `0`），判断「文本块是否已建」必须用 `== null` 而非 `!textBlock`——`!0` 为真会让第 2 个内容 chunk 误建第二个文本块，把一条消息拆成两个 text block（Claude Code 渲染成「头部 + 剩余全文」两截、各带一个圆点）
 - `CMC_DEBUG=1` 时每个上游 chunk 打到 stderr，前缀 `[DBG-UP-messages]`
 
 ---

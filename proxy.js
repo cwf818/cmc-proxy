@@ -857,6 +857,7 @@ class StreamConverter {
     this.rawUsage = null; // 最后一次完整 usage 对象 (供日志输出)
     this.localToolSeq = 0;
     this.pending = "";
+    this.textBlock = null; // 文本块索引, null=未创建 (0 是合法索引, 判断必须用 == null 而非 !textBlock, 否则第 2 个内容 chunk 会误建新块把消息拆成两截)
   }
 
   /** 从 OpenAI chunk 中提取 usage (chat/completions 流式的 usage 在末尾 chunk) */
@@ -940,7 +941,7 @@ class StreamConverter {
 
     // 文本增量
     if (delta.content) {
-      if (!this.textBlock) {
+      if (this.textBlock == null) {
         this.textBlock = this.nextBlockIndex++;
         this.activeBlocks.push(this.textBlock);
         events.push(

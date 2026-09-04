@@ -331,9 +331,9 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 
 ```
 [20:15:55.877] S3#1 REQ POST /v1/messages model=deepseek-v4-flash src=127.0.0.1:54321 ua=claude-cli/2.0.0 stream=1 body=186.5KB
-[20:15:58.232] S3#1 200 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ch:87% credit=0.013500 ts:241.3/s
+[20:15:58.232] S3#1 200 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ch:87% cost=$0.011571 credit=0.013500 ts:241.3/s
 [20:15:58.822]@S3#2 REQ POST /v1/messages model=mimo-v2.5 src=127.0.0.1:54321 ua=claude-cli/2.0.0 stream=1 img=2(新1) body=321.4KB
-[20:16:00.510]@S3#2 200 POST /v1/messages took=1.69s out=567B qwait:1.2s in:987 out:45 cr:0 cw:0 ch:40% credit=0.031250^ gap:10 ts:26.6/s
+[20:16:00.510]@S3#2 200 POST /v1/messages took=1.69s out=567B qwait:1.2s in:987 out:45 cr:0 cw:0 ch:40% peak^ cost=$0.026786 credit=0.031250 gap:10 ts:26.6/s
 [20:16:30.000] S5#7 REQ* POST /v1/chat/completions model=gpt-5.6-sol src=127.0.0.1:48721 ua=codex/1.0.0 stream=0 body=88B
 [20:17:30.000] S5#7 502 POST /v1/chat/completions took=60.01s out=112B pfx~3
 ```
@@ -357,7 +357,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | `in:` / `out:`               | 输入 / 输出 tokens。**`in:` 为净输入**（已扣除缓存命中部分，即按原价计费的量；流式与非流式、转换与透传路径均解析；上游未返回时不显示）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `rt:`                        | 思考 tokens（`reasoning_tokens`，DeepSeek 系常见，已包含在 `out:` 中，仅上游返回时出现）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `cr:` / `cw:`                | 缓存读取（`cached_tokens`） / 缓存写入（`cache_creation_input_tokens`） tokens，命中缓存可大幅省钱。`in:` + `cr:` = 总输入                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `credit:` (`^`)             | **单次请求额度消耗**（黄色），**位于 `ch:` 之后**：成本按模型目录 `priceUsdPerMTok` 牌价计算（USD），额度 = 成本 × `plan.credits` ÷ 模型 `monthlyCredits`。6 位小数；仅当配置 `modelCatalog` 且模型已收录、本次解析到 usage 时输出。**数字后的 `^`（仅 `^` 红色）表示当前 UTC 时刻处于该模型 `offPeak.windows` 高峰窗口**（已按 `peakUsdPerMTok` 覆盖 input/output 牌价）                                                                                                                                                                                                                                                                    |
+| `peak^` / `cost:` / `credit:` | **单次请求成本与额度消耗**，**位于 `ch:` 之后、`cost:` 在前**。`cost:`（橙色）为美元成本（按模型目录 `priceUsdPerMTok` 牌价直接计算，6 位小数）；`credit:`（黄色）为额度 = `cost` × `plan.credits` ÷ 模型 `monthlyCredits`（6 位小数）。**两者不保持固定比例**：不同模型 `monthlyCredits` 不同。仅当配置 `modelCatalog` 且模型已收录、本次解析到 usage 时输出。**`peak^`（红色）表示当前 UTC 时刻处于该模型 `offPeak.windows` 高峰窗口**（已按 `peakUsdPerMTok` 覆盖 input/output/cacheRead 牌价），插在 `cost:` 之前                                                                                                                                                                                                    |
 | `gap:`                       | **低缓存间隔**：仅当本次缓存命中率 `cr ÷ (in + cr)` < 50% 时输出，值为本次与**该会话最近一次**低缓存命中请求的**请求序号差**（会话内序号只对有 usage 的请求递增）。会话内**首次**低缓存只记录基准、不输出 `gap`                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `pfx~`                       | **前缀分叉标记**（红色，详见「缓存优化」章节）：`pfx~N` 该会话上一次请求的第 N 条消息与本次不同（索引含 system，`pfx~1` 即首条 user 消息）、`pfx~tools` 工具定义变化、`pfx~params` 顶层参数变化（附字段名）、`pfx<N` 历史变短（压缩）。分叉处之后本轮必然无法命中前缀缓存；纯追加（健康）不输出，同时会单独打印多行分叉内容预览（分叉段橙色高亮）                                                                                                                                                                                                                                                                                      |
 | `ch:` / `ts:`                | 会话累计缓存命中率与滚动生成速度（见「用量统计」），仅在本次解析到 usage 时追加                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -390,8 +390,8 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 **2. TOD / ALL 累计（每 10 个请求打印）**
 
 ```
-[20:16:30.000] STATS TOD req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% credit:8.420000 cost:$7.2200 avg:0.336800 ts:210.1/s
-[20:16:30.000] STATS ALL req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% credit:8.420000 cost:$7.2200 avg:0.336800 ts:210.1/s
+[20:16:30.000] STATS TOD req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% cost:$7.220000 credit:8.420000 avg:0.336800 ts:210.1/s
+[20:16:30.000] STATS ALL req:25 in:56.3K out:12.4K rt:9.1K cr:98.7K cw:0 ch:63% cost:$7.220000 credit:8.420000 avg:0.336800 ts:210.1/s
 ```
 
 | 行    | 范围                 | 说明                                |
@@ -400,7 +400,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | `ALL` | 进程启动以来累计     | **当天启动时与 TOD 一致，自动省略** |
 
 - `in:`/`out:`/`rt:`/`cr:`/`cw:` 含义与 RES 行相同；数字超 1K/1M 自动缩写
-- `credit:` 累计额度消耗（黄色，6 位小数），`cost:` 累计成本（USD），`avg:` 单次请求平均额度 = `credit ÷ req`（6 位小数）；均位于 `ch:` 之后
+- `cost:` 累计成本（USD，橙色，6 位小数），`credit:` 累计额度消耗（黄色，6 位小数），`avg:` 单次请求平均额度 = `credit ÷ req`（6 位小数）；顺序为 `cost:` 在前、`credit:` 次之，均位于 `ch:` 之后（与 RES 行一致）
 - 额度计算口径：成本 = 按模型目录 `priceUsdPerMTok` 牌价直接算；额度 = 成本 × `plan.credits` ÷ 模型 `monthlyCredits`。未配置 `modelCatalog` / 模型未收录 / `monthlyCredits` 缺失时不累计（无该字段）
 - 打印频率可用环境变量 `CMC_STATS_EVERY` 调整（默认 10）
 - 统计为内存态，进程重启后清零

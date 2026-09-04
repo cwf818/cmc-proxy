@@ -69,8 +69,9 @@
  *  11. modelCatalog (默认 goat-prices.json): 模型参数数据文件路径, 存在且解析成功时作为
  *      模型参数数据源, 计算单次请求的额度 (credit) 消耗。成本按牌价 priceUsdPerMTok 直接
  *      算 USD; 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits。offPeak.windows 高峰窗口
- *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价。RES 行输出 credit (黄) / 高峰
- *      credit^ (数字后红色 ^ 标记), TOD/ALL stats 输出累计 cred / cost / avg。文件缺失/解析失败静默跳过。
+ *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output/cacheRead 牌价。RES 行输出 cost (橙) 与
+ *      credit (黄), 高峰时段在 cost 前加红色 peak^ 标记; TOD/ALL stats 输出累计 cost / credit / avg。
+ *      文件缺失/解析失败静默跳过。
  */
 "use strict";
 
@@ -1962,7 +1963,8 @@ const stats = { day: null, today: zeroAgg(), total: zeroAgg(), recent: [] };
 
 // ---- 模型目录: 单次请求成本 / 额度计算 ----
 // 成本 (cost): 按数据文件牌价直接计算 USD; 额度 (credit): 成本 × plan.credits / monthlyCredits。
-// offPeak 高峰窗口 (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价, cacheRead/cacheWrite 沿用原价。
+// offPeak 高峰窗口 (UTC) 内以 peakUsdPerMTok 覆盖 input/output/cacheRead 牌价,
+// cacheRead 仅当峰值字段存在时覆盖 (schema@1 缺该字段沿用原价); cacheWrite 沿用原价。
 
 /** 按 modelCatalog 匹配模型记录: 请求模型名 -> id/slug/norm (与 goat-prices.js toSlug 同规则) */
 function catalogModel(mapped) {
@@ -2010,7 +2012,9 @@ function inPeakWindow(model) {
  * 单次请求: 成本 (USD) + 额度 (credit)。
  *  - 无模型目录 / 未收录模型 / 无 usage -> { credit:0, cost:0, peak:false, rated:false }
  *  - monthlyCredits 缺失 (null) -> 成本照算, credit 记为 0, rated=false (不显示)
- *  - peak=true 表示当前 UTC 时刻处于该模型 offPeak 高峰窗口, 已按峰值牌价计费
+ *  - peak=true 表示当前 UTC 时刻处于该模型 offPeak 高峰窗口, 已按峰值牌价
+ *    (peakUsdPerMTok 覆盖 input/output/cacheRead) 计费
+ *  - cost 为美元成本 (与 credit 不保持固定比例: 不同模型 monthlyCredits 不同)
  */
 function calcCredit(usage, mapped) {
   if (!usage || !modelCatalog) return { credit: 0, cost: 0, peak: false, rated: false };
@@ -2019,9 +2023,13 @@ function calcCredit(usage, mapped) {
   const peak = inPeakWindow(model);
   const rate = { ...model.priceUsdPerMTok };
   if (peak && model.offPeak && model.offPeak.peakUsdPerMTok) {
+    // 高峰覆盖: input/output/cacheRead。cacheRead 仅当峰值字段非 null 时覆盖
+    // (schema@1 的 peakUsdPerMTok 只有 input/output, 缺 cacheRead 则沿用原价);
+    // cacheWrite 无峰值概念, 沿用原价。
     const p = model.offPeak.peakUsdPerMTok;
-    if (p.input != null) rate.input = p.input; // 高峰覆盖: 仅 input/output
+    if (p.input != null) rate.input = p.input;
     if (p.output != null) rate.output = p.output;
+    if (p.cacheRead != null) rate.cacheRead = p.cacheRead;
   }
   let cost = 0;
   for (const k of ["input", "output", "cacheRead", "cacheWrite"]) {
@@ -2054,9 +2062,9 @@ const fmtSpeed = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/,
 /** 百分比格式化: 最多 1 位小数, 整数不带小数点 (99% / 98.7%) */
 const fmtPct = (p) => p.toFixed(1).replace(/\.0$/, "") + "%";
 
-/** 生成滚动统计串: "ch:87% credit=0.014 ts:33/s,40/s,50/s"
- *  (ch 为会话累计, credit 单次额度紧跟其后, ts 为滚动窗口, 各自波段色) */
-function movingStatsStr(session, creditStr) {
+/** 生成滚动统计串: "ch:87% peak^ cost=$0.098 credit=0.014 ts:33/s,40/s,50/s"
+ *  (ch 为会话累计, peak 高峰标记(红)/cost(橙)/credit(黄)紧跟其后, ts 为滚动窗口, 各自波段色) */
+function movingStatsStr(session, peakStr, costStr, creditStr) {
   // ch: 按会话累计 (session.in / session.cr), 无会话时退化为当前次
   const chIn = session ? session.in : 0;
   const chCr = session ? session.cr : 0;
@@ -2072,10 +2080,10 @@ function movingStatsStr(session, creditStr) {
     const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
     return speedSegment(text, v);
   });
-  return ` ${chStr}${creditStr} ${tsParts.join("")}`;
+  return ` ${chStr}${peakStr}${costStr}${creditStr} ${tsParts.join("")}`;
 }
 
-/** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色); cred 为累计额度, avg 为单次平均额度 */
+/** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色); cost 为累计成本 (橙), cred 为累计额度 (黄), avg 为单次平均额度 */
 function statsLine(label, agg) {
   if (!agg || !agg.req) return;
   const totalIn = agg.in + agg.cr;
@@ -2084,12 +2092,13 @@ function statsLine(label, agg) {
   // 生成 tokens = 输出 out + 思考 rt
   const v = agg.ms > 0 ? (agg.out + agg.rt) / (agg.ms / 1000) : 0;
   const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
-  // 额度 (credit): 累计额度黄色 6 位小数, avg 为单次平均额度; 插在 ch 之后 (与 RES 行一致)
+  // 成本 (cost, 橙) / 额度 (credit, 黄): 均为 6 位小数, cost 在前, avg 为单次平均额度;
+  // 插在 ch 之后 (顺序与 RES 行一致)
+  const costStr = agg.cost > 0 ? cOrange(` cost:$${agg.cost.toFixed(6)}`) : "";
   const credStr = agg.credit > 0 ? cYellow(` credit:${agg.credit.toFixed(6)}`) : "";
-  const costStr = agg.cost > 0 ? ` cost:$${agg.cost.toFixed(4)}` : "";
   const avgStr = agg.credit > 0 ? cYellow(` avg:${(agg.credit / agg.req).toFixed(6)}`) : "";
   console.log(
-    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr}${credStr}${costStr}${avgStr} ${tsStr}`
+    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr}${costStr}${credStr}${avgStr} ${tsStr}`
   );
 }
 
@@ -2440,14 +2449,17 @@ const server = http.createServer(async (req, res) => {
       rec.cr = u.cacheRead ?? 0;
       rec.cw = u.cacheWrite ?? 0;
     }
-    // 额度 (credit): 成本 × plan.credits / monthlyCredits; 高峰窗口内以峰值牌价计。
-    // 仅在有 usage 且模型目录收录时输出: 非高峰黄色 credit=N, 高峰 credit=N^ (数字后红色 ^ 标记);
-    // 6 位小数。插入位置在 movingStatsStr 的 ch 之后 (见 movingStr 调用)。
+    // 额度 (credit) / 成本 (cost): cost 为美元成本 (按牌价直接算), credit = cost ×
+    // plan.credits / monthlyCredits; 高峰窗口内以峰值牌价计 (cacheRead 同被覆盖)。
+    // 仅在有 usage 且模型目录收录时输出 (cost 照常输出, credit 另需 rated): cost=$N (橙)
+    // credit=N (黄) 均 6 位小数, cost 在前; 高峰时段在 cost 之前插红色 peak^ 标记。
     const cq = calcCredit(u, req._cmdc.mapped);
     rec.credit = cq.credit;
     rec.cost = cq.cost;
+    const peakStr = cq.peak ? ` ${cRed("peak^")}` : ""; // 高峰标记 (整串红色)
+    const costStr = cq.cost > 0 ? cOrange(` cost=$${cq.cost.toFixed(6)}`) : "";
     const creditStr = cq.rated && cq.credit > 0
-      ? (cq.peak ? cYellow(` credit=${cq.credit.toFixed(6)}`) + cRed("^") : cYellow(` credit=${cq.credit.toFixed(6)}`))
+      ? cYellow(` credit=${cq.credit.toFixed(6)}`)
       : "";
     // 跨天: 先打印上日 TOD/ALL 汇总, 重置当天
     const day = dayKey();
@@ -2473,8 +2485,8 @@ const server = http.createServer(async (req, res) => {
       }
     }
     // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加;
-    // credit 传入插在 ch 之后 (仅本次解析到 usage 时)
-    const movingStr = usageStr ? movingStatsStr(session, creditStr) : "";
+    // peak/cost/credit 传入插在 ch 之后 (仅本次解析到 usage 时)
+    const movingStr = usageStr ? movingStatsStr(session, peakStr, costStr, creditStr) : "";
     // 前缀分叉标记: 仅在检测到分叉/压缩时输出 (纯追加为健康状态, 不输出); 分叉内容预览单独成行
     const pfx = (req._cmdc && req._cmdc.pfx) || { mark: "", detail: "" };
     const pfxMark = pfx.mark ? ` ${cRed(pfx.mark)}` : "";

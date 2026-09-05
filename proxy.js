@@ -69,7 +69,8 @@
  *  11. modelCatalog (默认 goat-prices.json): 模型参数数据文件路径, 存在且解析成功时作为
  *      模型参数数据源, 计算单次请求的额度 (credit) 消耗。成本按牌价 priceUsdPerMTok 直接
  *      算 USD; 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits。offPeak.windows 高峰窗口
- *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output/cacheRead 牌价。RES 行输出 cost (橙) 与
+ *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output/cacheRead 牌价; 高峰仅工作日 (周一~周五,
+ *      UTC) 生效, 周末整天按错峰价。RES 行输出 cost (橙) 与
  *      credit (黄), 高峰时段在 cost 前加红色 peak^ 标记; TOD/ALL stats 输出累计 cost / credit / avg。
  *      文件缺失/解析失败静默跳过。
  */
@@ -1997,13 +1998,17 @@ function parseWindows(str) {
   return ranges.length ? ranges : null;
 }
 
-/** 当前 UTC 时刻 (hour + minute/60) 是否落在某高峰区间内 */
+/** 当前 UTC 时刻是否落在某高峰区间内 (高峰仅工作日生效) */
 function inPeakWindow(model) {
   const off = model && model.offPeak;
   if (!off || !off.windows) return false;
   const ranges = parseWindows(off.windows);
   if (!ranges) return false;
   const d = new Date();
+  // 高峰窗口按 UTC+0 定义, 工作日亦按 UTC 计算 (getUTCDay: 0=周日..6=周六);
+  // 周末整天走错峰价, 不在任何高峰区间内。
+  const dow = d.getUTCDay();
+  if (dow === 0 || dow === 6) return false; // 周六 / 周日 -> 非高峰
   const nowH = d.getUTCHours() + d.getUTCMinutes() / 60;
   return ranges.some(({ a, b }) => nowH >= a && nowH <= b); // end 包含
 }
@@ -2012,7 +2017,7 @@ function inPeakWindow(model) {
  * 单次请求: 成本 (USD) + 额度 (credit)。
  *  - 无模型目录 / 未收录模型 / 无 usage -> { credit:0, cost:0, peak:false, rated:false }
  *  - monthlyCredits 缺失 (null) -> 成本照算, credit 记为 0, rated=false (不显示)
- *  - peak=true 表示当前 UTC 时刻处于该模型 offPeak 高峰窗口, 已按峰值牌价
+ *  - peak=true 表示当前 UTC 时刻处于该模型 offPeak 高峰窗口 (且为工作日), 已按峰值牌价
  *    (peakUsdPerMTok 覆盖 input/output/cacheRead) 计费
  *  - cost 为美元成本 (与 credit 不保持固定比例: 不同模型 monthlyCredits 不同)
  */

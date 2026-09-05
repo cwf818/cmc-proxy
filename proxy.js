@@ -71,7 +71,8 @@
  *      算 USD; 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits。offPeak.windows 高峰窗口
  *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output/cacheRead 牌价; 高峰仅工作日 (周一~周五,
  *      UTC) 生效, 周末整天按错峰价。RES 行输出 cost (橙) 与
- *      credit (黄), 高峰时段在 cost 前加红色 peak^ 标记; TOD/ALL stats 输出累计 cost / credit / avg。
+ *      credit (黄), 高峰时段 cost/credit 前缀加 ^ (如 ^cost=); REQ/RES 行时间戳在高峰时段
+ *      改暗红 (亮度同暗灰, 按本请求实际转发模型判定)。TOD/ALL stats 输出累计 cost / credit / avg。
  *      文件缺失/解析失败静默跳过。
  */
 "use strict";
@@ -106,6 +107,7 @@ const cBlue = paint(C.blue);
 const cOrange = paint("\x1b[38;5;208m"); // 256 色橙
 const cBrightGreen = paint("\x1b[92m"); // 亮绿
 const cBrightCyan = paint("\x1b[96m"); // 亮青 (usage cr 缓存命中突出)
+const cDimRed = paint("\x1b[2m\x1b[31m"); // 暗红 (dim+红): 高峰时段时间戳着色, 亮度与暗灰 cDim 相当
 
 // 日志标签 (前缀着色)
 const TAGW = cYellow("[cmc-proxy]");
@@ -2013,6 +2015,14 @@ function inPeakWindow(model) {
   return ranges.some(({ a, b }) => nowH >= a && nowH <= b); // end 包含
 }
 
+/** 时间戳着色函数: 请求所转发模型当前处于高峰窗口 -> 暗红 (与 RES 行 cost/credit 前缀 ^ 同口径,
+ *  仅需模型目录收录该模型), 否则暗灰 cDim。未配置目录/未收录 -> 恒暗灰。 */
+function peakTsColor(mapped) {
+  if (!modelCatalog || !mapped) return cDim;
+  const model = catalogModel(mapped);
+  return model && inPeakWindow(model) ? cDimRed : cDim;
+}
+
 /**
  * 单次请求: 成本 (USD) + 额度 (credit)。
  *  - 无模型目录 / 未收录模型 / 无 usage -> { credit:0, cost:0, peak:false, rated:false }
@@ -2067,9 +2077,10 @@ const fmtSpeed = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/,
 /** 百分比格式化: 最多 1 位小数, 整数不带小数点 (99% / 98.7%) */
 const fmtPct = (p) => p.toFixed(1).replace(/\.0$/, "") + "%";
 
-/** 生成滚动统计串: "ch:87% peak^ cost=$0.098 credit=0.014 ts:33/s,40/s,50/s"
- *  (ch 为会话累计, peak 高峰标记(红)/cost(橙)/credit(黄)紧跟其后, ts 为滚动窗口, 各自波段色) */
-function movingStatsStr(session, peakStr, costStr, creditStr) {
+/** 生成滚动统计串: "ch:87% ^cost=$0.098 ^credit=0.014 ts:33/s,40/s,50/s"
+ *  (ch 为会话累计, cost(橙)/credit(黄)紧跟其后, 高峰时 cost/credit 前缀加 ^ 替代原 peak^ 标记,
+ *  ts 为滚动窗口, 各自波段色) */
+function movingStatsStr(session, costStr, creditStr) {
   // ch: 按会话累计 (session.in / session.cr), 无会话时退化为当前次
   const chIn = session ? session.in : 0;
   const chCr = session ? session.cr : 0;
@@ -2085,7 +2096,7 @@ function movingStatsStr(session, peakStr, costStr, creditStr) {
     const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
     return speedSegment(text, v);
   });
-  return ` ${chStr}${peakStr}${costStr}${creditStr} ${tsParts.join("")}`;
+  return ` ${chStr}${costStr}${creditStr} ${tsParts.join("")}`;
 }
 
 /** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色); cost 为累计成本 (橙), cred 为累计额度 (黄), avg 为单次平均额度 */
@@ -2371,7 +2382,8 @@ const server = http.createServer(async (req, res) => {
     req._cmdc.reqLogged = true;
     // 标签 S{id}#{req} 按请求轮转取色, REQ 恒为青色; model 提前到 src 之前, 扫日志先看模型
     const tag = sessTag();
-    console.log(`${cDim(`[${logTs(startAt)}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${cCyan("REQ") + (willQueue ? cRed("*") : "")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${imgPart()}${cDim(bodyPart())}`);
+    const tsColor = peakTsColor(req._cmdc.mapped); // 高峰暗红时间戳 (按本请求当前已定模型)
+    console.log(`${tsColor(`[${logTs(startAt)}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${cCyan("REQ") + (willQueue ? cRed("*") : "")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${imgPart()}${cDim(bodyPart())}`);
     // CMC_DEBUG_PAYLOAD=1: 打印本地请求完整请求头与 body 原文 (排查会话标识等)
     if (process.env.CMC_DEBUG_PAYLOAD === "1") {
       const headers = {};
@@ -2457,14 +2469,15 @@ const server = http.createServer(async (req, res) => {
     // 额度 (credit) / 成本 (cost): cost 为美元成本 (按牌价直接算), credit = cost ×
     // plan.credits / monthlyCredits; 高峰窗口内以峰值牌价计 (cacheRead 同被覆盖)。
     // 仅在有 usage 且模型目录收录时输出 (cost 照常输出, credit 另需 rated): cost=$N (橙)
-    // credit=N (黄) 均 6 位小数, cost 在前; 高峰时段在 cost 之前插红色 peak^ 标记。
+    // credit=N (黄) 均 6 位小数, cost 在前; 高峰时段 cost/credit 前缀加 ^ (替代原 peak^ 标记),
+    // 时间戳已同时暗红 (见 peakTsColor), 无需再单列 peak^。
     const cq = calcCredit(u, req._cmdc.mapped);
     rec.credit = cq.credit;
     rec.cost = cq.cost;
-    const peakStr = cq.peak ? ` ${cRed("peak^")}` : ""; // 高峰标记 (整串红色)
-    const costStr = cq.cost > 0 ? cOrange(` cost=$${cq.cost.toFixed(6)}`) : "";
+    const peakMark = cq.peak ? "^" : ""; // 高峰前缀: ^cost= / ^credit=
+    const costStr = cq.cost > 0 ? cOrange(` ${peakMark}cost=$${cq.cost.toFixed(6)}`) : "";
     const creditStr = cq.rated && cq.credit > 0
-      ? cYellow(` credit=${cq.credit.toFixed(6)}`)
+      ? cYellow(` ${peakMark}credit=${cq.credit.toFixed(6)}`)
       : "";
     // 跨天: 先打印上日 TOD/ALL 汇总, 重置当天
     const day = dayKey();
@@ -2491,7 +2504,7 @@ const server = http.createServer(async (req, res) => {
     }
     // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加;
     // peak/cost/credit 传入插在 ch 之后 (仅本次解析到 usage 时)
-    const movingStr = usageStr ? movingStatsStr(session, peakStr, costStr, creditStr) : "";
+    const movingStr = usageStr ? movingStatsStr(session, costStr, creditStr) : "";
     // 前缀分叉标记: 仅在检测到分叉/压缩时输出 (纯追加为健康状态, 不输出); 分叉内容预览单独成行
     const pfx = (req._cmdc && req._cmdc.pfx) || { mark: "", detail: "" };
     const pfxMark = pfx.mark ? ` ${cRed(pfx.mark)}` : "";
@@ -2512,7 +2525,8 @@ const server = http.createServer(async (req, res) => {
     const stFn = res.statusCode >= 500 ? cRed : res.statusCode >= 400 ? cYellow : res.statusCode >= 300 ? cCyan : cGreen;
     // 标签 S{id}#{req} 用该请求闭包捕获的颜色 (与 REQ 行同色); 状态码保持原波段色
     const tag = sessTag();
-    console.log(`${cDim(`[${logTs(Date.now())}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
+    const tsColor = peakTsColor(req._cmdc.mapped); // 高峰暗红时间戳 (按最终实际转发模型)
+    console.log(`${tsColor(`[${logTs(Date.now())}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 

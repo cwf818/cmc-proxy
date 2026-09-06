@@ -1948,7 +1948,7 @@ async function pumpConvertedStream(up, conv, res, tag, onDone) {
 // ---------------------------------------------------------------------------
 // 用量统计
 // ---------------------------------------------------------------------------
-// 1) 滚动统计: ch 只输出按会话累计的缓存命中率, ts(速度=(输出+思考)tokens/s)按最近 1 / 10 / 50 次请求滚动统计;
+// 1) 滚动统计: ch 只输出按会话累计的缓存命中率, ts(速度=输出 tokens/s, 输出含思考)按最近 1 / 10 / 50 次请求滚动统计;
 //    每次请求完成时输出, ts 值个数按历史请求数: 1 次显示 1 值 / 2-10 次显示 2 值 / >=11 次显示 3 值
 // 2) 当前次 ch 不直接输出, 仅在 <50% 时输出 gap (与上次低命中请求的序号差)
 // 2) TOD/ALL: 按天累计与进程累计, 每 STATS_EVERY 个请求打印 (环境变量 CMC_STATS_EVERY 可调, 默认 10),
@@ -2091,8 +2091,8 @@ function movingStatsStr(session, costStr, creditStr) {
   const levels = n >= 11 ? [1, 10, 50] : n >= 2 ? [1, 10] : [1];
   const tsParts = levels.map((win, i) => {
     const w = winAgg(win);
-    // 生成 tokens = 输出 out + 思考 rt
-    const v = w.ms > 0 ? (w.out + w.rt) / (w.ms / 1000) : 0;
+    // 输出 token 含思考量 (out 已含 rt), 直接用 out 计速度
+    const v = w.ms > 0 ? w.out / (w.ms / 1000) : 0;
     const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
     return speedSegment(text, v);
   });
@@ -2105,8 +2105,8 @@ function statsLine(label, agg) {
   const totalIn = agg.in + agg.cr;
   const pct = totalIn > 0 ? (agg.cr / totalIn) * 100 : 0;
   const chStr = cacheSegment("ch:" + (totalIn > 0 ? fmtPct(pct) : "-"), pct);
-  // 生成 tokens = 输出 out + 思考 rt
-  const v = agg.ms > 0 ? (agg.out + agg.rt) / (agg.ms / 1000) : 0;
+  // 输出 token 含思考量 (out 已含 rt), 直接用 out 计速度
+  const v = agg.ms > 0 ? agg.out / (agg.ms / 1000) : 0;
   const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
   // 成本 (cost, 橙) / 额度 (credit, 黄): 均为 6 位小数, cost 在前, avg 为单次平均额度;
   // 插在 ch 之后 (顺序与 RES 行一致)

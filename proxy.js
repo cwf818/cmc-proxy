@@ -239,6 +239,19 @@ function logSevere(req, pathname, session, message) {
 //     jsonlLog: true        -> 写 ROOT/requests.jsonl
 //     jsonlLog: "<路径>"    -> 相对 proxy.js 目录解析 (如 "log/requests.jsonl", 自动建目录)
 //     未设置 / false        -> 关闭
+//
+// 按日切分 (rotation): 每日按**本地时区**切一个文件。当日记录写热文件 requests.jsonl;
+//   检测到系统日期跨天时, 把热文件整体改名为 requests-YYYY-MM-DD.jsonl 归档 (归档日 = 热文件里
+//   记录的实际日期, 由最近一次写入决定), 再新建热文件接续 —— 热文件恒为"当前日", 文件名稳定,
+//   与 README/vislog 自动加载/配置说明对 requests.jsonl 的既有引用保持兼容, 历史日文件可下拉浏览。
+//   归档保留 JSONL_ROTATE_KEEP 天, 跨日/启动时清理过期。
+//   开关: config.jsonlRotateDays 或 CLI --jsonlRotateDays (默认 30; 0/"false" 关闭旋转, 保持原
+//   单一 requests.jsonl 无限追加行为, 不做清理)。仅对**文件名为 requests.jsonl** 的日志生效
+//   (无论默认 ROOT 还是自定义目录如 "log/requests.jsonl"); 自定义为其他文件名属于精确文件,
+//   切分语义不明, 一律按原无限追加处理。
+const jsonlRotateRaw = argVal("--jsonlRotateDays", String(config.jsonlRotateDays ?? 30));
+const JSONL_ROTATE_OFF = jsonlRotateRaw === "false" || jsonlRotateRaw === "0";
+const JSONL_ROTATE_KEEP = JSONL_ROTATE_OFF ? 0 : Math.max(1, parseInt(jsonlRotateRaw, 10) || 30);
 const JSONL_LOG = (() => {
   const v = config.jsonlLog;
   if (v === false || v == null) return null;
@@ -246,10 +259,80 @@ const JSONL_LOG = (() => {
   try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {}
   return p;
 })();
+/** 是否启用"热文件 + 按日归档": 默认命名 requests.jsonl 且旋转未关 */
+function jsonlRotateOn() {
+  return !!JSONL_LOG && !JSONL_ROTATE_OFF && path.basename(JSONL_LOG) === "requests.jsonl";
+}
+/** 当前本地日期 YYYY-MM-DD (切分键) */
+function localDateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+/** 归档文件是否由本旋转机制命名 (可安全清理) */
+function isRotateArchiveName(name) {
+  return /^requests-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name);
+}
+/** 启动时滚动一次 (幂等): 上次运行跨日遗留的热文件先归档, 再开始今日日志。启动失败不阻断 */
+function startupJsonlRollover() {
+  if (!jsonlRotateOn()) return;
+  try { rollJsonlIfCrossed(); } catch { /* 启动不阻断 */ }
+}
+/** 热文件当前归属日: 取文件 mtime 的本地日期 (未写过/不存在按今日算, 免误归档) */
+function hotFileDayKey() {
+  if (!JSONL_LOG) return localDateKey(new Date());
+  try {
+    if (fs.existsSync(JSONL_LOG)) return localDateKey(fs.statSync(JSONL_LOG).mtime);
+  } catch { /* stat 失败按今日算 */ }
+  return localDateKey(new Date());
+}
+/**
+ * 滚动编排 (原子): 若热文件归属日 < 今日 —— 跨日, 把热文件改名归档到归属日, 建空热文件。
+ * 同步自旋开关 jsonlRotating 防重入: 判定与改名在同一 tick 完成, 后续写入自然落到新热文件。
+ */
+let jsonlRotating = false;
+function rollJsonlIfCrossed() {
+  if (!jsonlRotateOn()) return;
+  if (jsonlRotating) return;
+  const nowKey = localDateKey(new Date());
+  const fileKey = hotFileDayKey();
+  if (fileKey >= nowKey) return; // 归属日 == 今日 (或文件不存在按今日): 无需滚动
+  jsonlRotating = true;
+  try {
+    const arch = path.join(path.dirname(JSONL_LOG), "requests-" + fileKey + ".jsonl");
+    // 归档目标已存在 (如上次进程跨日已归档但未开新热文件): 去重再改名, 避免误合并两日
+    if (fs.existsSync(arch)) fs.rmSync(arch, { force: true });
+    if (fs.existsSync(JSONL_LOG)) fs.renameSync(JSONL_LOG, arch);
+    fs.closeSync(fs.openSync(JSONL_LOG, "a")); // 建空热文件, mtime 即今日
+    pruneJsonlArchives();
+    console.log(TAGI, `jsonl 按日切分: ${path.basename(arch)} 归档 (已保留历史)`);
+  } catch (e) {
+    console.error(TAGE, "jsonl 按日滚动失败:", e.message);
+  } finally {
+    jsonlRotating = false;
+  }
+}
+/** 删除超过 JSONL_ROTATE_KEEP 天的归档 requests-YYYY-MM-DD.jsonl */
+function pruneJsonlArchives() {
+  if (!JSONL_LOG) return;
+  const dir = path.dirname(JSONL_LOG);
+  const keepMs = JSONL_ROTATE_KEEP * 86400e3;
+  const now = Date.now();
+  let removed = 0;
+  let entries = [];
+  try { entries = fs.readdirSync(dir); } catch { return; }
+  for (const name of entries) {
+    if (!isRotateArchiveName(name)) continue;
+    const p = path.join(dir, name);
+    try {
+      if (now - fs.statSync(p).mtimeMs > keepMs) { fs.rmSync(p, { force: true }); removed++; }
+    } catch { /* 单个文件失败不阻断 */ }
+  }
+  if (removed) console.log(TAGI, `jsonl 过期归档清理: 删除 ${removed} 个 (保留 ${JSONL_ROTATE_KEEP} 天)`);
+}
 let jsonlChain = Promise.resolve(); // 串行追加, 保证写入顺序与到达顺序一致
 function jsonlWrite(obj) {
   if (!JSONL_LOG) return;
   const line = JSON.stringify(obj);
+  rollJsonlIfCrossed(); // 写前检查跨日: 首写完成启动遗留归档; 长跑跨日在此切到新热文件
   jsonlChain = jsonlChain
     .then(() => fs.promises.appendFile(JSONL_LOG, line + "\n"))
     .catch((e) => console.error(TAGE, "jsonl 写入失败:", e.message));
@@ -3082,11 +3165,13 @@ server.listen(PORT, HOST, () => {
     ? new Date(modelCatalog.fetchedAt).toLocaleString("zh-CN", { hour12: false })
     : "";
   console.log(cBlue(`  模型目录   : ${modelCatalog ? `已加载 (${modelCatalog.index.size} 个模型, 更新于 ${catalogTs}, ${MODEL_CATALOG_PATH})` : (config.modelCatalog ? "未加载 (文件缺失或解析失败)" : "未配置 (不统计额度)")}`));
-  console.log(cBlue(`  结构化日志 : ${JSONL_LOG ? `开启 (写入 ${JSONL_LOG})` : "关闭 (config.json jsonlLog)"}`));
+  console.log(cBlue(`  结构化日志 : ${JSONL_LOG ? `开启 (写入 ${JSONL_LOG})${jsonlRotateOn() ? ` · 按日切分 (保留 ${JSONL_ROTATE_KEEP} 天)` : JSONL_ROTATE_OFF ? " · 按日切分: 已关闭" : ""}` : "关闭 (config.json jsonlLog)"}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
   console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));
   console.log(line);
+  // 启动时按日切分滚动一次 (幂等): 上次运行跨日遗留的热文件先归档, 再开始今日日志
+  startupJsonlRollover();
   // 启动时预热模型列表
   refreshModels(true);
 });

@@ -23,6 +23,8 @@
   "modelCatalog": "goat-prices.json",
   "_jsonl日志说明": "jsonlLog: 结构化 JSONL 请求日志开关 (独立于 CMC_LOGGING_FILE 分级落盘)。true = 写 ROOT/requests.jsonl; 字符串 = 自定义路径 (相对 proxy.js 目录, 自动建目录); false/缺省 = 关闭。记录与终端 REQ/RES 两行同源的当前次请求数据 (会话/模型/用量/成本/缓存), 在 RES 输出时写一条 JSON, 供离线分析; 滚动/累计统计不入档。",
   "jsonlLog": false,
+  "_jsonl按日切分说明": "jsonlRotateDays: JSONL 按本地时区按日切分 (仅对默认命名 requests.jsonl 生效; 自定义 jsonlLog 路径是精确文件, 不切分)。当日记录写热文件 requests.jsonl, 跨日(系统日期变化)时把热文件改名为 requests-YYYY-MM-DD.jsonl 归档并开新热文件; 归档保留 N 天, 启动/跨日时清理过期。默认 30; 0 或 'false' 关闭切分, 保持原单一 requests.jsonl 无限追加、不清理。也可用 CLI --jsonlRotateDays 覆盖。",
+  "jsonlRotateDays": 30,
   "_串行化说明": "serializeSessionRequests: 同一会话的上游请求串行发送 (默认 true)。CC 的会话标题探测请求与主请求毫秒级并发时, 中转侧曾出现主请求 300s 无响应头悬挂; 串行化规避并发。排队中的请求若客户端断开会立即出队。",
   "serializeSessionRequests": true,
   "_首字节超时说明": "firstByteTimeout: 上游超过该毫秒数未返回响应头时主动中止并返回 502 (0=关闭, 兜底 undici 的 300s)。默认 120000。",

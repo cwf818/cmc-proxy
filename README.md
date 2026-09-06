@@ -271,6 +271,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `toolResultImages`         | `true`                                | `tool_result` 内嵌图片保留并注入后续 user 消息；`false` 折叠为 `[image]`                                                          |
 | `visionAutoRoute`          | `true`                                | 带图请求前置路由：模型判定不支持视觉则改走 `defaultVisionModels[0]`（见「多模态」）                                               |
 | `jsonlLog`                 | 关闭                                  | 结构化 JSONL 请求日志：`true` 写 `requests.jsonl`，字符串为自定义路径；`false`/缺省关闭（见「结构化请求日志 (JSONL)」）             |
+| `jsonlRotateDays`          | `30`                                  | JSONL 按日切分保留天数：当日写 `requests.jsonl`，跨日归档 `requests-YYYY-MM-DD.jsonl`，过期清理；`0`/`false` 关闭切分（可用 `--jsonlRotateDays` 覆盖） |
 | `serializeSessionRequests` | `true`                                | 同会话上游请求串行化                                                                                                              |
 | `firstByteTimeout`         | `120000`                              | 上游响应头超时 ms，`0` 关闭                                                                                                       |
 | `stripSystemReminders`     | `true`                                | 剥离 `messages` 里注入的 `system` 提醒                                                                                            |
@@ -415,8 +416,9 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 独立于 `CMC_LOGGING_FILE` 分级落盘的**结构化请求日志**：把与终端 `REQ`/`RES` 两行**同源**的当前次请求数据，在 RES 输出时组织成**一条 JSON** 追加到 JSONL（JSON Lines）文件，便于后续用 `jq`/脚本按会话、模型、缓存命中、成本做离线分析。每条记录除当次请求信息外，附带 RES 行尾展示的**滚动派生值**快照（`res.ch` 会话累计命中率、`res.ts` 窗口 1 速度），省得离线重算；TOD/ALL 累计不入档。
 
 - **开关**：`config.json` 的 `jsonlLog`（默认关闭）。`true` 写入 `requests.jsonl`（proxy.js 目录）；值为字符串则视为路径（相对 proxy.js 目录，自动建目录），如 `"log/requests.jsonl"`。未配置/`false` 不生成文件
+- **按日切分**：`jsonlRotateDays`（默认 `30`，`config.json` 或 CLI `--jsonlRotateDays`）——当日记录写热文件 `requests.jsonl`；检测到跨日（按本地时区）时把热文件整体改名为 `requests-YYYY-MM-DD.jsonl` 归档并开新热文件，热文件名恒定、只含当日。归档保留 N 天，启动/跨日时自动清理过期归档（仅删本机制命名的 `requests-*.jsonl`）。`0`/`false` 关闭切分，保持原单一无限追加、不清理。自定义 `jsonlLog` 为非 `requests.jsonl` 文件名时不做切分（视为精确文件）
 - **触发**：仅 model 类请求（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`，即带 `S会话#请求` 标签的请求）在响应完成（RES 输出）时写一条；健康检查、`/v1/models`、通配透传不写；客户端中途断开（`ABT`）不触发响应完成，不写
-- **格式**：每行一个 JSON 对象（UTF-8），追加式写入，写入顺序 = 完成顺序；`*.jsonl` 已加入 `.gitignore`
+- **格式**：每行一个 JSON 对象（UTF-8），追加式写入，写入顺序 = 完成顺序；`*.jsonl` 已加入 `.gitignore`。切分后历史日文件（`requests-YYYY-MM-DD.jsonl`）仍可被 `vislog` 下拉选中离线分析
 
 记录字段（与终端行的对应关系）：
 

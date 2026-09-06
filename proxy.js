@@ -69,6 +69,10 @@
  *      用户显式指定的模型 (modelMap/目录解析命中) 失败不冷却、下次请求仍从它开始 —— 不去
  *      猜测用户指定模型的能力; 只有未带 model 或指定模型解析失败回退到 defaultForType 时,
  *      失败才进入 TTL 冷却 (默认列表内后续候选无论何种情况都照常冷却)。
+ *  10a. visionAutoRoute (默认 true): 带图请求前置路由。true 时, 请求带图且决策出的模型
+ *      判定不支持视觉 (modelCatalog vision 字段与 defaultVisionModels 白名单并集: 在名单内
+ *      或 catalog vision:true 视为支持), 则不发该模型、改走 defaultVisionModels[0], 免上游
+ *      400/静默盲视; false 时保持现状 (先按原模型发, 失败靠 switchOnFail 轮换)。
  *  11. modelCatalog (默认 goat-prices.json): 模型参数数据文件路径, 存在且解析成功时作为
  *      模型参数数据源, 计算单次请求的额度 (credit) 消耗。成本按牌价 priceUsdPerMTok 直接
  *      算 USD; 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits。offPeak.windows 高峰窗口
@@ -161,6 +165,7 @@ const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout ?? "120000", 10); //
 const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内嵌图片保留 (注入随后的 user 消息透传上游)
 const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
 const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
+const VISION_AUTO_ROUTE = config.visionAutoRoute !== false; // 带图前置路由: 请求模型判定不支持视觉时, 不发它而改走 defaultVisionModels[0]
 
 // 模型参数目录 (modelCatalog): 指向价格/额度 JSON 文件的路径, **仅在配置文件中显式指定时
 // 才加载** (无默认值)。存在且解析成功时作为模型参数数据源, 用于计算单次请求的额度 (credit)
@@ -179,7 +184,16 @@ try {
       for (const m of index.values()) norm.set(m.slug.replace(/[^a-z0-9]+/g, ""), m);
       // 上游 id 索引 (schema@2+ 新增): 上游转发的模型名就是 id, 精确命中优先于 slug 归一化
       const byId = new Map(parsed.models.map((m) => (m && m.id ? [m.id, m] : null)).filter(Boolean));
-      modelCatalog = { plan: parsed.plan || {}, index, norm, byId };
+      // fetchedAt: 目录数据的时间戳 (抓取工具写入的顶层 fetchedAt); 缺失时退回文件 mtime
+      let fetchedAt = null;
+      if (parsed && parsed.fetchedAt) {
+        const t = new Date(parsed.fetchedAt);
+        if (!isNaN(t)) fetchedAt = t.getTime();
+      }
+      if (!fetchedAt) {
+        try { fetchedAt = fs.statSync(MODEL_CATALOG_PATH).mtimeMs; } catch { /* 取不到则保持 null */ }
+      }
+      modelCatalog = { plan: parsed.plan || {}, index, norm, byId, fetchedAt };
       console.log(`[cmc-proxy] 模型目录已加载: ${MODEL_CATALOG_PATH} (${modelCatalog.index.size} 个模型)`);
     }
   }
@@ -422,6 +436,55 @@ function currentDefaultModel() {
 /** 判断某模型是否需要走 Anthropic /messages 端点 (Claude 系) */
 function isClaudeModel(model) {
   return /^claude(-|$)/.test(model);
+}
+
+/** 判定某上游模型是否具备视觉 (图片) 能力 —— visionAutoRoute 的数据源 (并集):
+ *  1. defaultVisionModels 白名单成员视为支持 (用户配置即信任);
+ *  2. modelCatalog 已加载且有该模型记录 -> 以 vision 字段为准 (权威数据);
+ *  3. 其余 (catalog 无此模型 / catalog 未加载, 且不在白名单) -> 视为不支持。
+ *  [1] 在 [2] 之前: 白名单是用户显式声明"带图用它", 优先于抓取数据的 vision 字段。 */
+function modelVisionCapable(model) {
+  if (!model) return false;
+  if (defaultVisionModels.includes(model)) return true;
+  if (modelCatalog) {
+    const rec = catalogModel(model);
+    if (rec && typeof rec.vision === "boolean") return rec.vision;
+  }
+  return false;
+}
+
+/** 判定"为什么"某模型被 visionRoute 判为不支持视觉 (仅日志用)。
+ *  catalog 有记录且 vision=false -> 'modelCatalog (vision:false)';
+ *  否则 (catalog 无此记录 / 未加载 / 非白名单) -> 'defaultVisionModels 白名单'。 */
+function visionRouteReason(model) {
+  if (modelCatalog) {
+    const rec = catalogModel(model);
+    if (rec && typeof rec.vision === "boolean") return "modelCatalog (vision:false)";
+  }
+  return "defaultVisionModels 白名单";
+}
+
+/** 带图前置路由: 在带图请求 (isImage=true) 且最终决策的模型判定不支持视觉时,
+ *  不发它 (免上游 400/静默盲视), 改走 defaultVisionModels[0]。返回
+ *  { ...decision, rerouted, from } —— rerouted=true 表示发生了前置路由 (from 为原模型),
+ *  调用方据此打 warn 提示。isFallback 置 true: 改走的是系统默认视觉模型, 失败进入冷却/
+ *  按视觉列表轮换。VISION_AUTO_ROUTE=false / 纯文本请求 / 无视觉列表时不动作 (保持现状)。 */
+function visionRoute(decision, isImage) {
+  if (!VISION_AUTO_ROUTE || !isImage || !defaultVisionModels.length) {
+    return { ...decision, rerouted: false, from: decision.model };
+  }
+  if (modelVisionCapable(decision.model)) {
+    return { ...decision, rerouted: false, from: decision.model };
+  }
+  const target = defaultVisionModels[0];
+  return { model: target, isFallback: true, rerouted: true, from: decision.model, reason: visionRouteReason(decision.model) };
+}
+
+/** 带图前置路由 warn 提示 (三条转发路径共用) */
+function warnVisionRoute(routed, sessTag) {
+  if (!routed || !routed.rerouted) return;
+  const tag = typeof sessTag === "function" ? sessTag() : "";
+  console.warn(TAGW, `${tag ? tag + " " : ""}带图请求模型 ${routed.from} 判定不支持视觉 (${routed.reason || "defaultVisionModels 白名单"}), 前置路由 → ${routed.model}`);
 }
 
 /** OpenAI messages 数组是否含 image_url part (任意角色) */
@@ -2720,7 +2783,10 @@ const server = http.createServer(async (req, res) => {
       // 用"剥离后的最终请求类型"重新决策模型并覆盖, 转换函数使用
       const finalImage = imgCount > 0 && !(CLEAN_HISTORY_IMAGES && imgNew === 0);
       const finalDecision = pickModelWithFlag(body.model, finalImage);
-      body.model = finalDecision.model;
+      // 带图前置路由 (visionAutoRoute): 最终模型判定不支持视觉时改走 defaultVisionModels[0]
+      const routed = visionRoute(finalDecision, finalImage);
+      warnVisionRoute(routed, sessTag);
+      body.model = routed.model;
       const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
       // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选是最终决策的模型
       const upstreamBodyJson = JSON.stringify(oaiReq);
@@ -2747,7 +2813,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(oaiReq),
-        }, oaiReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage: finalImage, isFallback: finalDecision.isFallback });
+        }, oaiReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage: finalImage, isFallback: routed.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2802,7 +2868,10 @@ const server = http.createServer(async (req, res) => {
       const isImage = imgCount > 0;
       const requested = body.model || defaultForType(isImage);
       const decision = pickModelWithFlag(body.model, isImage);
-      body.model = decision.model;
+      // 带图前置路由 (visionAutoRoute): 决策模型判定不支持视觉时改走 defaultVisionModels[0]
+      const routed = visionRoute(decision, isImage);
+      warnVisionRoute(routed, sessTag);
+      body.model = routed.model;
       req._cmdc = { model: requested, mapped: body.model, stream: !!body.stream, img: imgCount };
       req._cmdc.bodyBytes = Buffer.byteLength(bodyRaw || "");
       req._cmdc.rawBody = bodyRaw || "";
@@ -2828,7 +2897,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(body),
-        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: decision.isFallback });
+        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: routed.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2864,6 +2933,16 @@ const server = http.createServer(async (req, res) => {
       const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
       // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选仍是解析后的模型
       const isImage = openAIMessagesHaveImages(chatReq.messages);
+      // 带图前置路由 (visionAutoRoute): 转换后确认带图, 且模型判定不支持视觉时改走 defaultVisionModels[0]
+      let routed = null;
+      if (isImage) {
+        routed = visionRoute({ model: mapped, isFallback: decision.isFallback }, true);
+        warnVisionRoute(routed, sessTag);
+        if (routed.rerouted) {
+          chatReq.model = routed.model;
+          req._cmdc.mapped = routed.model;
+        }
+      }
       const upstreamBodyJson = JSON.stringify(chatReq);
       req._cmdc.upstreamBody = upstreamBodyJson;
       const pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify({ ...chatReq, messages: undefined }));
@@ -2887,7 +2966,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(chatReq),
-        }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: decision.isFallback });
+        }, chatReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: routed ? routed.isFallback : decision.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -2975,13 +3054,17 @@ server.listen(PORT, HOST, () => {
   const vmList = defaultVisionModels.map((m, i) => (i === 0 ? `${m}(默认)` : m)).join(" → ") || "(无)";
   console.log(cBlue(`  默认模型   : ${dmList}`));
   console.log(cBlue(`  视觉模型   : ${vmList}`));
+  console.log(cBlue(`  带图前置路由: ${VISION_AUTO_ROUTE ? `开启 (不支持视觉的模型带图改走 ${defaultVisionModels[0] || "defaultVisionModels[0]"})` : "关闭 (保持现状)"}`));
   const sofDesc = switchOnFailRaw && typeof switchOnFailRaw === "object"
     ? `对象 {text:${!!switchOnFailRaw.text}, image:${!!switchOnFailRaw.image}}`
     : SWITCH_ON_FAIL ? "开启" : "关闭";
   console.log(cBlue(`  失败轮换   : ${defaultModels.length < 2 && defaultVisionModels.length < 2 ? "不适用 (列表仅一个模型, 不轮换)" : `${sofDesc} (失败1次即切换 + ${FAIL_TTL / 1000}s 冷却)`}`));
   console.log(cBlue(`  历史图清理 : ${CLEAN_HISTORY_IMAGES ? "开启 (无新图请求时剥离历史图, 回流请求指定模型)" : "关闭 (历史图随上下文保留)"}`));
   console.log(cBlue(`  tool结果图 : ${TOOL_RESULT_IMAGES ? "保留 (注入 user 消息透传)" : "丢弃 (折叠为 [image])"}`));
-  console.log(cBlue(`  模型目录   : ${modelCatalog ? `已加载 (${modelCatalog.index.size} 个模型, ${MODEL_CATALOG_PATH})` : (config.modelCatalog ? "未加载 (文件缺失或解析失败)" : "未配置 (不统计额度)")}`));
+  const catalogTs = modelCatalog && modelCatalog.fetchedAt
+    ? new Date(modelCatalog.fetchedAt).toLocaleString("zh-CN", { hour12: false })
+    : "";
+  console.log(cBlue(`  模型目录   : ${modelCatalog ? `已加载 (${modelCatalog.index.size} 个模型, 更新于 ${catalogTs}, ${MODEL_CATALOG_PATH})` : (config.modelCatalog ? "未加载 (文件缺失或解析失败)" : "未配置 (不统计额度)")}`));
   console.log(cBlue(`  结构化日志 : ${JSONL_LOG ? `开启 (写入 ${JSONL_LOG})` : "关闭 (config.json jsonlLog)"}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));

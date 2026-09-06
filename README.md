@@ -12,7 +12,7 @@
 - **协议转换**：GOAT 订阅不含任何 Claude 模型，Claude Code 请求自动 `Anthropic → OpenAI` 转换；Codex 的 Responses 请求自动 `Responses → Chat Completions` 转换（上游只有 chat/completions）；流式 + 工具调用全链路支持
 - **统一模型决策** `pickModel`：`modelMap` 显式映射 → 上游模型目录解析（`resolveModel`）→ 按请求类型回退默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）
 - **失败轮换** `switchOnFail`（支持布尔或 `{text, image}`）：失败 1 次即切换 + `failTTL` 冷却（**只对回退到默认的模型生效**，用户显式指定模型失败不冷却、下次仍从它开始）；文本请求按 `defaultModels`、带图请求按 `defaultVisionModels` 轮换（带图请求 400 也轮换，图片不支持的报错就是 400）
-- **多模态**：`tool_result` 内嵌图片抽出注入同轮 user 消息透传；`cleanHistoryImages` 可在本轮无新图时清理历史图片，让请求安全回流纯文本模型；REQ 行 `img=N(新M)` 标记 + 会话标签 `@` 前缀
+- **多模态**：`visionAutoRoute` 在带图请求决策出"判定不支持视觉"的模型时**前置改走** `defaultVisionModels[0]`（免上游 400/静默盲视）；`tool_result` 内嵌图片抽出注入同轮 user 消息透传；`cleanHistoryImages` 可在本轮无新图时清理历史图片，让请求安全回流纯文本模型；REQ 行 `img=N(新M)` 标记 + 会话标签 `@` 前缀
 - **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源
 - **Codex 新协议全兼容**：`custom`（apply_patch freeform）/ `tool_search`（延迟工具发现）/ `namespace` 工具组 / 顶层 `function_call` 历史等新形态全链路支持
 - **会话级访问日志**：按 `x-claude-code-session-id` / `session-id` / `thread-id` 稳定归因，两行日志（REQ/RES）配对 + 缓存命中率 / 生成速度 / 前缀分叉 / 累计用量统计
@@ -242,8 +242,10 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | 开关（config.json）  | 默认    | 作用                                                                                                                                                                                                                                                                         |
 | -------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `toolResultImages`   | `true`  | `tool_result` 内嵌的图片块抽出，注入**同轮末尾的 user 消息**：先插一条文本 part `[tool_result <id> 附带的图片]`，再接 `image_url` part。`false` 时丢弃（折叠为 `[image]` 占位符）                                                                                            |
+| `visionAutoRoute`     | `true`  | 带图请求**前置路由**：决策出的模型判定不支持视觉（判定为 `modelCatalog` 的 `vision` 字段与 `defaultVisionModels` 白名单的**并集**：在名单内 / catalog `vision:true` 视为支持），则**不发该模型**、改走 `defaultVisionModels[0]`，免上游 400 / 静默盲视（200 假装看不见）。`false` = 保持现状（先按原模型发，失败靠 `switchOnFail` 轮换）                                          |
 | `cleanHistoryImages` | `false` | 仅 `/v1/messages` 转换链路：本轮（最后一条 user 消息）**无新图**时，把该消息之前所有图片块（含 `tool_result` 内嵌）**原位替换**为占位文本 `[历史图片已清理]`。历史里的图上游同样 400，剥离后请求可安全回流纯文本模型，带图路由随之只看新图——会话不再被历史图片钉死在视觉模型 |
 
+- 判定"是否支持视觉"时 `modelCatalog` 与 `defaultVisionModels` 是**并集**关系：`defaultVisionModels` 是用户显式声明"带图用它"（白名单，优先信任），`modelCatalog` 提供 catalog 里非白名单模型的权威 `vision` 字段；两者都不覆盖时视为不支持。
 - 替换是**确定性**的：同一段历史每轮剥出逐字节一致的结果，不破坏前缀缓存（代价是历史图片内容对模型不可见）。
 - 纯文本路径（无图请求）逐字节保持旧行为，`toolResultImages=false` 时文本也完全不变。
 - 日志侧：REQ 行显示 `img=N(新M)`——`N` 为请求体中的图片块总数，`新M` 为最后一条 user 消息（本轮）中的新图数；本轮有新图时会话标签加 `@` 前缀（`@S3#3`）。
@@ -267,6 +269,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `blockedModels`            | `[]`                                  | 从 `/v1/models` 列表隐藏（避免客户端误选）；**转发时不拦截**，命中只打印一次性告警                                                |
 | `cleanHistoryImages`       | `false`                               | 本轮无新图时把历史图片块替换为 `[历史图片已清理]`（见「多模态」）                                                                 |
 | `toolResultImages`         | `true`                                | `tool_result` 内嵌图片保留并注入后续 user 消息；`false` 折叠为 `[image]`                                                          |
+| `visionAutoRoute`          | `true`                                | 带图请求前置路由：模型判定不支持视觉则改走 `defaultVisionModels[0]`（见「多模态」）                                               |
 | `jsonlLog`                 | 关闭                                  | 结构化 JSONL 请求日志：`true` 写 `requests.jsonl`，字符串为自定义路径；`false`/缺省关闭（见「结构化请求日志 (JSONL)」）             |
 | `serializeSessionRequests` | `true`                                | 同会话上游请求串行化                                                                                                              |
 | `firstByteTimeout`         | `120000`                              | 上游响应头超时 ms，`0` 关闭                                                                                                       |
@@ -458,7 +461,7 @@ Get-NetTCPConnection -LocalPort 5411 -State Listen | Stop-Process
 
 **请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用（`403`）。此错误会进入轮换（开启 `switchOnFail` 时当场换下一个模型）并让该模型冷却 `failTTL`；也可以手动调整 `defaultModels` / `defaultVisionModels` 或把该模型从 `blockedModels` 里排除。
 
-**带图请求被 400（`This model does not support image`）** — 说明当前模型是纯文本模型（如 `deepseek-v4-flash`）。配置 `defaultVisionModels` 并开启 `switchOnFail.image`，带图请求会按视觉列表轮换（带图的 400 也会轮换）。历史图片会把会话一直钉在视觉模型上——先剥后送可用 `cleanHistoryImages: true`。
+**带图请求拿到空/瞎编回答或 400** — 上游纯文本模型（如 `deepseek-v4-flash`）对图片的行为是 **400 拒绝 或 200 静默盲视**（实测两种都有，不同供应商/网关形态不一）。默认开启 `visionAutoRoute`：带图请求决策出的模型若判定不支持视觉，会**前置改走** `defaultVisionModels[0]`，不再把图片发给它。`visionAutoRoute: false` 时退回"先发原模型 + `switchOnFail.image` 轮换"的旧行为。历史图片会把会话一直钉在视觉模型上——先剥后送可用 `cleanHistoryImages: true`。
 
 **想用真正的 Claude 模型** — 需要升级 Pro/Provider 计划；升级后在 `modelMap` 中把 `claude-*` 映射为真实 Claude 模型名（如 `claude-sonnet-4-6`）即可直连上游 `/messages`（`isClaudeModel()` 判定）。
 

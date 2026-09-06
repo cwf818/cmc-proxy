@@ -9,6 +9,8 @@
     "text": true,
     "image": true
   },
+  "_带图前置路由说明": "visionAutoRoute: 带图请求前置路由开关 (默认 true)。true 时, 请求带图且决策出的模型判定不支持视觉 (判定为 modelCatalog 的 vision 字段与 defaultVisionModels 白名单的并集: 在名单内 / catalog vision:true 视为支持), 则不发该模型、改走 defaultVisionModels[0]; false 时保持现状 (先按原模型发, 失败靠 switchOnFail 轮换)。",
+  "visionAutoRoute": true,
   "_历史图清理说明": "cleanHistoryImages: true 时, /v1/messages 转换链路检测到本轮(最后一条 user 消息)无新图, 会把历史里的图片块原位替换为占位文本 [历史图片已清理] 再转发 —— 历史图上游同样 400, 剥离后请求可安全回流默认模型, 带图路由只看新图, 会话不再被历史图钉死在视觉模型。替换确定性, 不破坏前缀缓存。默认 false。",
   "cleanHistoryImages": true,
   "_tool结果图说明": "toolResultImages: false 时丢弃 tool_result 内嵌图片 (折叠为 [image] 占位), 默认保留 (注入随后 user 消息透传)。",

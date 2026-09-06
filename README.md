@@ -16,6 +16,7 @@
 - **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源
 - **Codex 新协议全兼容**：`custom`（apply_patch freeform）/ `tool_search`（延迟工具发现）/ `namespace` 工具组 / 顶层 `function_call` 历史等新形态全链路支持
 - **会话级访问日志**：按 `x-claude-code-session-id` / `session-id` / `thread-id` 稳定归因，两行日志（REQ/RES）配对 + 缓存命中率 / 生成速度 / 前缀分叉 / 累计用量统计
+- **结构化 JSONL 请求日志**（`config.json` `jsonlLog`）：把与 REQ/RES 两行同源的当次请求数据在 RES 输出时写一条 JSON 到 `requests.jsonl`，供离线分析（独立于 `CMC_LOGGING_FILE` 分级落盘）
 - 支持流式 SSE 透传、token 用量上报、模型列表过滤、分级请求落盘（环境变量 `CMC_LOGGING_FILE`）
 
 ## 文件说明
@@ -266,6 +267,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `blockedModels`            | `[]`                                  | 从 `/v1/models` 列表隐藏（避免客户端误选）；**转发时不拦截**，命中只打印一次性告警                                                |
 | `cleanHistoryImages`       | `false`                               | 本轮无新图时把历史图片块替换为 `[历史图片已清理]`（见「多模态」）                                                                 |
 | `toolResultImages`         | `true`                                | `tool_result` 内嵌图片保留并注入后续 user 消息；`false` 折叠为 `[image]`                                                          |
+| `jsonlLog`                 | 关闭                                  | 结构化 JSONL 请求日志：`true` 写 `requests.jsonl`，字符串为自定义路径；`false`/缺省关闭（见「结构化请求日志 (JSONL)」）             |
 | `serializeSessionRequests` | `true`                                | 同会话上游请求串行化                                                                                                              |
 | `firstByteTimeout`         | `120000`                              | 上游响应头超时 ms，`0` 关闭                                                                                                       |
 | `stripSystemReminders`     | `true`                                | 剥离 `messages` 里注入的 `system` 提醒                                                                                            |
@@ -404,6 +406,45 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 - 额度计算口径：成本 = 按模型目录 `priceUsdPerMTok` 牌价直接算；额度 = 成本 × `plan.credits` ÷ 模型 `monthlyCredits`。未配置 `modelCatalog` / 模型未收录 / `monthlyCredits` 缺失时不累计（无该字段）
 - 打印频率可用环境变量 `CMC_STATS_EVERY` 调整（默认 10）
 - 统计为内存态，进程重启后清零
+
+## 结构化请求日志 (JSONL)
+
+独立于 `CMC_LOGGING_FILE` 分级落盘的**结构化请求日志**：把与终端 `REQ`/`RES` 两行**同源**的当前次请求数据，在 RES 输出时组织成**一条 JSON** 追加到 JSONL（JSON Lines）文件，便于后续用 `jq`/脚本按会话、模型、缓存命中、成本做离线分析。滚动统计（`ts`）、TOD/ALL 累计**不入档**——每条记录只含当次请求的信息。
+
+- **开关**：`config.json` 的 `jsonlLog`（默认关闭）。`true` 写入 `requests.jsonl`（proxy.js 目录）；值为字符串则视为路径（相对 proxy.js 目录，自动建目录），如 `"log/requests.jsonl"`。未配置/`false` 不生成文件
+- **触发**：仅 model 类请求（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`，即带 `S会话#请求` 标签的请求）在响应完成（RES 输出）时写一条；健康检查、`/v1/models`、通配透传不写；客户端中途断开（`ABT`）不触发响应完成，不写
+- **格式**：每行一个 JSON 对象（UTF-8），追加式写入，写入顺序 = 完成顺序；`*.jsonl` 已加入 `.gitignore`
+
+记录字段（与终端行的对应关系）：
+
+| JSON 字段                     | 含义（对照终端）                                                                 |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| `ts`                          | 响应完成时间，**UTC ISO**（`toISOString()`），跨时区分析用                        |
+| `session.id` / `session.req`  | 标签 `S会话#请求`（如 `S1#10`）                                                   |
+| `session.key` / `keyType`     | 底层**稳定会话标识**与其类型（`cc`/`cx`/`cx-thread`/`src`），跨重启可聚合同一 agent 会话 |
+| `session.cc`/`cxSession`/`thread` | 对应请求头 `x-claude-code-session-id` / `session-id` / `thread-id`          |
+| `http.status/method/path`     | RES 行状态码 / 方法 / 路径                                                       |
+| `http.src`/`srcPort`/`ua`     | REQ 行 `src=` 的 IP / 源端口 / User-Agent                                        |
+| `req.model`                   | REQ 行 `model=` —— 客户端请求的模型                                               |
+| `req.stream`                  | REQ 行 `stream=`（`1` 流式 / `0` 非流式 / `null` 未知）                            |
+| `req.img` / `req.imgNew`      | REQ 行 `img=N(新M)`；`imgNew` 仅 `/v1/messages` 链路计算，其余为 `null`           |
+| `req.bodyBytes`               | REQ 行 `body=`（字节数）                                                          |
+| `req.queued`                  | REQ 行 `REQ*` —— 到达时同会话已有在途请求，串行队列等待                           |
+| `req.dispatchAt`              | 真正发往上游的时刻（UTC ISO；排队等待不计入 `ms`）                                |
+| `res.model` / `modelChanged`  | RES 行 `model=` —— 实际转发模型（轮换后为最终生效）；是否与请求模型不同           |
+| `res.peak`                    | 高峰窗口（工作日 UTC）：终端 `^cost`/`^credit`/时间戳暗红同口径的布尔              |
+| `res.outBytes`                | RES 行 `out=`（响应字节数）                                                       |
+| `res.ms` / `qwaitMs`          | RES 行 `took=` / `qwait:`（ms；`took + qwait ≈ 总耗时`）                          |
+| `res.usage`                   | RES 行 `in:/out:/rt:/cr:/cw:`；**本次未解析到 usage 为 `null`**（同 RES 行不显示） |
+| `res.cost` / `credit`         | RES 行 `cost=` / `credit=`（0 / 未收录模型为 0）                                  |
+| `res.lowCache` / `gap`        | RES 行 `gap:` —— 本次缓存命中率 <50% 时为 `true` 并给出与上次低缓存的序号差       |
+| `res.pfx`                     | RES 行 `pfx~N`/`pfx~tools`/`pfx~params`/`pfx<N`（纯追加健康时为 `null`）           |
+
+示例记录：
+
+```json
+{"ts":"2026-09-06T06:20:15.622Z","event":"request","session":{"id":3,"req":10,"key":"cc:cc-4f8a...","keyType":"cc","cc":"cc-4f8a...","cxSession":null,"thread":null},"http":{"status":200,"method":"POST","path":"/v1/messages","src":"127.0.0.1","srcPort":54321,"ua":"claude-cli/2.0.0"},"req":{"model":"deepseek-v4-flash","stream":1,"img":0,"imgNew":null,"bodyBytes":190964,"queued":false,"dispatchAt":"2026-09-06T06:20:13.200Z"},"res":{"model":"deepseek/deepseek-v4-flash","modelChanged":true,"peak":false,"outBytes":1736,"ms":2350,"qwaitMs":0,"usage":{"in":1234,"out":567,"rt":480,"cr":890,"cw":0},"cost":0.011571,"credit":0.0135,"lowCache":false,"gap":null,"pfx":null}}
+```
 
 ## 常见问题
 

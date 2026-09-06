@@ -19,6 +19,8 @@
   "resolveModel": true,
   "_模型目录说明": "modelCatalog: 模型参数数据文件路径 (相对 proxy.js 目录), 仅显式配置时加载 (无默认值)。存在且解析成功时用于计算单次请求的额度 (credit): 成本按牌价 priceUsdPerMTok 直接算, 额度 = 成本 × plan.credits ÷ 模型 monthlyCredits; offPeak.windows 高峰窗口 (UTC) 内以 peakUsdPerMTok 覆盖 input/output 牌价。文件不存在/读取失败静默跳过, 只是没有额度数据, 不影响转发与日志。加载成功打印日志并在启动 banner 显示模型数; 未配置时 banner 显示 '未配置'。",
   "modelCatalog": "goat-prices.json",
+  "_jsonl日志说明": "jsonlLog: 结构化 JSONL 请求日志开关 (独立于 CMC_LOGGING_FILE 分级落盘)。true = 写 ROOT/requests.jsonl; 字符串 = 自定义路径 (相对 proxy.js 目录, 自动建目录); false/缺省 = 关闭。记录与终端 REQ/RES 两行同源的当前次请求数据 (会话/模型/用量/成本/缓存), 在 RES 输出时写一条 JSON, 供离线分析; 滚动/累计统计不入档。",
+  "jsonlLog": false,
   "_串行化说明": "serializeSessionRequests: 同一会话的上游请求串行发送 (默认 true)。CC 的会话标题探测请求与主请求毫秒级并发时, 中转侧曾出现主请求 300s 无响应头悬挂; 串行化规避并发。排队中的请求若客户端断开会立即出队。",
   "serializeSessionRequests": true,
   "_首字节超时说明": "firstByteTimeout: 上游超过该毫秒数未返回响应头时主动中止并返回 502 (0=关闭, 兜底 undici 的 300s)。默认 120000。",

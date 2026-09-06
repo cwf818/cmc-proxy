@@ -7,3 +7,6 @@ proxy.log
 release/
 fulllog.log
 fulllog*.log
+
+# 结构化 JSONL 请求日志 (jsonlLog)
+*.jsonl

@@ -58,6 +58,9 @@
  *   9. stripSystemReminders (默认 true): 整条剥离 history 中注入的 system 提醒
  *      (配额计数/任务催促), 提示性内容不影响编码能力; 请求落盘由环境变量
  *      CMC_LOGGING_FILE 分级控制 (见下方注释), 文件固定为 ROOT/fulllog.log。
+ *      jsonlLog (可选): 独立的结构化 JSONL 请求日志开关 (与 CMC_LOGGING_FILE 无关),
+ *      记录与终端 REQ/RES 两行同源的当前次请求数据, 在 RES 输出时写一条 JSON,
+ *      供离线分析 (滚动/累计不入档)。详见 README「结构化请求日志 (JSONL)」。
  *  10. switchOnFail (默认 false): 轮换总开关, 支持布尔或 {text, image} 对象 (单布尔统一
  *      取值)。true 时失败 1 次即切换 + failTTL 冷却: 按请求类型选列表 (文本 defaultModels /
  *      带图 defaultVisionModels, 带图 400 也轮换), 失败模型 TTL 内冷却跳过, 全部失效时返回
@@ -214,6 +217,28 @@ function logSevere(req, pathname, session, message) {
   if (LOG_LEVEL < 1) return;
   const c = req._cmdc || {};
   fulllogDump(req, pathname, session, [["client", c.rawBody], ["upstream", c.upstreamBody]], message);
+}
+
+// 结构化 JSONL 请求日志 (config.json jsonlLog, 独立于 CMC_LOGGING_FILE 分级落盘):
+//   与终端 REQ/RES 两行同源的**当前次**请求数据, 在 RES 输出时组织成一条 JSON 记录追加写入
+//   (滚动统计/累计数据不入档), 供后续离线分析。启用方式:
+//     jsonlLog: true        -> 写 ROOT/requests.jsonl
+//     jsonlLog: "<路径>"    -> 相对 proxy.js 目录解析 (如 "log/requests.jsonl", 自动建目录)
+//     未设置 / false        -> 关闭
+const JSONL_LOG = (() => {
+  const v = config.jsonlLog;
+  if (v === false || v == null) return null;
+  const p = typeof v === "string" ? path.resolve(ROOT, v) : path.join(ROOT, "requests.jsonl");
+  try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {}
+  return p;
+})();
+let jsonlChain = Promise.resolve(); // 串行追加, 保证写入顺序与到达顺序一致
+function jsonlWrite(obj) {
+  if (!JSONL_LOG) return;
+  const line = JSON.stringify(obj);
+  jsonlChain = jsonlChain
+    .then(() => fs.promises.appendFile(JSONL_LOG, line + "\n"))
+    .catch((e) => console.error(TAGE, "jsonl 写入失败:", e.message));
 }
 
 if (!API_KEY) {
@@ -2141,6 +2166,53 @@ function accumulate(rec, trackRolling) {
   }
 }
 
+/** 组装一条结构化请求记录 (JSONL, 仅当前次数据; 滚动/累计不入档)。
+ *  与终端 REQ/RES 两行同源: 字段对照见 README「结构化请求日志 (JSONL)」。
+ *  纯函数不落盘, 由 jsonlWrite 在 RES 输出时调用写入。入参均为 finish 处理器已算好的量。 */
+function jsonlRecord(o) {
+  const c = o.req._cmdc || {};
+  const usage = o.rec.in > 0 || o.rec.out > 0 || o.rec.rt > 0 || o.rec.cr > 0 || o.rec.cw > 0
+    ? { in: o.rec.in, out: o.rec.out, rt: o.rec.rt, cr: o.rec.cr, cw: o.rec.cw }
+    : null; // 无 usage 时不显示 usage 块 (同 RES 行不显示 in:/out:…)
+  return {
+    ts: new Date(o.endAt).toISOString(), // UTC ISO, 供跨时区分析
+    event: "request",
+    session: {
+      id: o.session.id,
+      req: o.reqNo, // S{id}#{req} 标签
+      key: o.sessionKey, keyType: o.sessionIdType, // 稳定会话标识 (跨重启聚合)
+      cc: o.req.headers["x-claude-code-session-id"] || null,
+      cxSession: o.req.headers["session-id"] || o.req.headers["session_id"] || null,
+      thread: o.req.headers["thread-id"] || null,
+    },
+    http: {
+      status: o.status, method: o.method, path: o.pathname,
+      src: o.req.socket.remoteAddress || "-",
+      srcPort: o.req.socket.remotePort ?? null,
+      ua: o.req.headers["user-agent"] || "-",
+    },
+    req: {
+      model: c.model, // 客户端请求的模型
+      stream: c.stream == null ? null : c.stream ? 1 : 0,
+      img: c.img ?? 0, imgNew: c.imgNew ?? null, // imgNew 仅 /v1/messages 链路计算
+      bodyBytes: c.bodyBytes || 0,
+      queued: !!o.queued, // REQ* 串行队列等待
+      dispatchAt: o.dispatchAt ? new Date(o.dispatchAt).toISOString() : null,
+    },
+    res: {
+      model: c.mapped, // 实际转发模型 (轮换后为最终生效)
+      modelChanged: !!c.mapped && c.model !== c.mapped,
+      peak: !!o.cq.peak, // 高峰窗口 (工作日 UTC) —— 终端 ^cost/^credit/时间戳暗红同口径
+      outBytes: o.outBytes,
+      ms: o.ms, qwaitMs: o.qwaitMs,
+      usage, // null = 本次未解析到 usage
+      cost: o.cq.cost, credit: o.cq.credit, // 0/未收录模型时为 0
+      lowCache: o.gap != null, gap: o.gap, // 本次 cr/(in+cr) < 50% 时的序号差
+      pfx: (o.pfx && o.pfx.mark) || null, // pfx~N / pfx~tools / pfx~params / pfx<N
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 请求前缀分叉检测 (定位缓存命中率低的来源)
 // ---------------------------------------------------------------------------
@@ -2327,6 +2399,8 @@ const server = http.createServer(async (req, res) => {
       : cxThreadId
         ? `cx:thread:${cxThreadId}`
         : `${srcIp}:${req.socket.remotePort || "-"}|${req.headers["user-agent"] || "-"}`;
+  // 稳定会话标识类型 (JSONL 记录用): 判定来源与 sessionKey 同源 (cc/cx/cx-thread/src)
+  const sessionIdType = ccSessionId ? "cc" : cxCodexSession ? "cx" : cxThreadId ? "cx-thread" : "src";
   // 注意: 放在闭包变量而非 req._cmdc —— 路由分支会重建 req._cmdc, 直接赋值会丢失 session
   const session = MODEL_PATHS.includes(pathname) ? getSession(sessionKey) : null;
   // 请求编号: 会话内自增计数器, REQ 行与 RES 行成对输出 (S1#10), 便于两行配对;
@@ -2491,6 +2565,7 @@ const server = http.createServer(async (req, res) => {
     // 会话累计 in/cr 用于 ch 输出; 当前次 cachehit<50% 时计算与最近一次低缓存命中请求的
     // 序号差 gap, 输出在 ch 前 (首次低缓存只记录基准, 不输出 gap)
     let gapStr = "";
+    let gapVal = null; // gap 数值 (JSONL 用); 先存再更新 lastLowCacheSeq, 否则减后恒为 0
     if (usageStr && session) {
       session.seq += 1;
       session.in += rec.in;
@@ -2498,7 +2573,10 @@ const server = http.createServer(async (req, res) => {
       const totalIn = rec.in + rec.cr;
       const pct = totalIn > 0 ? Math.round((rec.cr / totalIn) * 100) : 0;
       if (pct < 50) {
-        if (session.lastLowCacheSeq != null) gapStr = ` ${cRed(`gap:${session.seq - session.lastLowCacheSeq}`)}`;
+        if (session.lastLowCacheSeq != null) {
+          gapVal = session.seq - session.lastLowCacheSeq;
+          gapStr = ` ${cRed(`gap:${gapVal}`)}`;
+        }
         session.lastLowCacheSeq = session.seq;
       }
     }
@@ -2527,6 +2605,15 @@ const server = http.createServer(async (req, res) => {
     const tag = sessTag();
     const tsColor = peakTsColor(req._cmdc.mapped); // 高峰暗红时间戳 (按最终实际转发模型)
     console.log(`${tsColor(`[${logTs(Date.now())}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
+    // 结构化请求日志 (jsonlLog 开启时): RES 输出时把当前次请求组织成一条 JSON 写入 (仅 model 请求)
+    if (JSONL_LOG && session) {
+      jsonlWrite(jsonlRecord({
+        req, res, pathname, session, sessionKey, sessionIdType, reqNo,
+        status: res.statusCode, method: req.method, queued: willQueue,
+        startAt, endAt: Date.now(), dispatchAt, ms, qwaitMs, outBytes,
+        rec, cq, pfx, gap: gapVal,
+      }));
+    }
     if (stats.total.req % STATS_EVERY === 0) logStats();
   });
 
@@ -2895,6 +2982,7 @@ server.listen(PORT, HOST, () => {
   console.log(cBlue(`  历史图清理 : ${CLEAN_HISTORY_IMAGES ? "开启 (无新图请求时剥离历史图, 回流请求指定模型)" : "关闭 (历史图随上下文保留)"}`));
   console.log(cBlue(`  tool结果图 : ${TOOL_RESULT_IMAGES ? "保留 (注入 user 消息透传)" : "丢弃 (折叠为 [image])"}`));
   console.log(cBlue(`  模型目录   : ${modelCatalog ? `已加载 (${modelCatalog.index.size} 个模型, ${MODEL_CATALOG_PATH})` : (config.modelCatalog ? "未加载 (文件缺失或解析失败)" : "未配置 (不统计额度)")}`));
+  console.log(cBlue(`  结构化日志 : ${JSONL_LOG ? `开启 (写入 ${JSONL_LOG})` : "关闭 (config.json jsonlLog)"}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
   console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));

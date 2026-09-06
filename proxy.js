@@ -2187,7 +2187,7 @@ function movingStatsStr(session, costStr, creditStr) {
   return ` ${chStr}${costStr}${creditStr} ${tsParts.join("")}`;
 }
 
-/** 打印 TOD/ALL 统计行 (ch 与 ts 用波段色); cost 为累计成本 (橙), cred 为累计额度 (黄), avg 为单次平均额度 */
+/** 打印 TOD/ALL 统计行。除 ch 与 ts 用波段色外, 其余全部默认色 (含时间戳/STATS 字样/cost/credit/avg) */
 function statsLine(label, agg) {
   if (!agg || !agg.req) return;
   const totalIn = agg.in + agg.cr;
@@ -2196,13 +2196,12 @@ function statsLine(label, agg) {
   // 输出 token 含思考量 (out 已含 rt), 直接用 out 计速度
   const v = agg.ms > 0 ? agg.out / (agg.ms / 1000) : 0;
   const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
-  // 成本 (cost, 橙) / 额度 (credit, 黄): 均为 6 位小数, cost 在前, avg 为单次平均额度;
-  // 插在 ch 之后 (顺序与 RES 行一致)
-  const costStr = agg.cost > 0 ? cOrange(` cost:$${agg.cost.toFixed(6)}`) : "";
-  const credStr = agg.credit > 0 ? cYellow(` credit:${agg.credit.toFixed(6)}`) : "";
-  const avgStr = agg.credit > 0 ? cYellow(` avg:${(agg.credit / agg.req).toFixed(6)}`) : "";
+  // cost/credit/avg 用默认色 (不再单独着色), 顺序与 RES 行一致 (ch 之后)
+  const costStr = agg.cost > 0 ? ` cost:$${agg.cost.toFixed(6)}` : "";
+  const credStr = agg.credit > 0 ? ` credit:${agg.credit.toFixed(6)}` : "";
+  const avgStr = agg.credit > 0 ? ` avg:${(agg.credit / agg.req).toFixed(6)}` : "";
   console.log(
-    `${cDim(`[${logTs(Date.now())}]`)} ${cBlue("STATS")} ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr}${costStr}${credStr}${avgStr} ${tsStr}`
+    `[${logTs(Date.now())}] STATS ${label} req:${agg.req} in:${fmtNum(agg.in)} out:${fmtNum(agg.out)} rt:${fmtNum(agg.rt)} cr:${fmtNum(agg.cr)} cw:${fmtNum(agg.cw)} ${chStr}${costStr}${credStr}${avgStr} ${tsStr}`
   );
 }
 
@@ -2229,6 +2228,20 @@ function accumulate(rec, trackRolling) {
   }
 }
 
+/** jsonl 用滚动派生值 (与 RES 行尾滚动统计同口径, 但存数值非着色文本):
+ *  - ch: 会话累计缓存命中率 % (session.in/session.cr), 无累计时 null —— 同 RES 行 ch:;
+ *  - ts: 最近 1 次请求生成速度 tokens/s (stats.recent 末条, 输出含思考量), 无数据时 null。
+ *  在 RES 输出时调用 (session 累计与 stats.recent 均已含当前请求, 与终端同刻)。 */
+function rollingJsonlMetrics(session) {
+  const chIn = session ? session.in : 0;
+  const chCr = session ? session.cr : 0;
+  const chTotal = chIn + chCr;
+  const ch = chTotal > 0 ? Math.round((chCr / chTotal) * 1000) / 10 : null; // 1 位小数 (99 / 98.7)
+  const last = stats.recent[stats.recent.length - 1];
+  const ts = last && last.ms > 0 ? Math.round((last.out / (last.ms / 1000)) * 10) / 10 : null;
+  return { ch, ts };
+}
+
 /** 组装一条结构化请求记录 (JSONL, 仅当前次数据; 滚动/累计不入档)。
  *  与终端 REQ/RES 两行同源: 字段对照见 README「结构化请求日志 (JSONL)」。
  *  纯函数不落盘, 由 jsonlWrite 在 RES 输出时调用写入。入参均为 finish 处理器已算好的量。 */
@@ -2237,6 +2250,8 @@ function jsonlRecord(o) {
   const usage = o.rec.in > 0 || o.rec.out > 0 || o.rec.rt > 0 || o.rec.cr > 0 || o.rec.cw > 0
     ? { in: o.rec.in, out: o.rec.out, rt: o.rec.rt, cr: o.rec.cr, cw: o.rec.cw }
     : null; // 无 usage 时不显示 usage 块 (同 RES 行不显示 in:/out:…)
+  // 滚动派生值: 仅本次有 usage 时终端才显示 ch/ts (movingStatsStr 追加), jsonl 对齐该门控
+  const rolling = usage ? rollingJsonlMetrics(o.session) : null;
   return {
     ts: new Date(o.endAt).toISOString(), // UTC ISO, 供跨时区分析
     event: "request",
@@ -2269,6 +2284,8 @@ function jsonlRecord(o) {
       outBytes: o.outBytes,
       ms: o.ms, qwaitMs: o.qwaitMs,
       usage, // null = 本次未解析到 usage
+      ch: rolling ? rolling.ch : null, // 会话累计缓存命中率 % (同 RES 行 ch:, 仅本次有 usage 时算)
+      ts: rolling ? rolling.ts : null, // 最近 1 次生成速度 tokens/s (同 RES 行 ts: 窗口 1)
       cost: o.cq.cost, credit: o.cq.credit, // 0/未收录模型时为 0
       lowCache: o.gap != null, gap: o.gap, // 本次 cr/(in+cr) < 50% 时的序号差
       pfx: (o.pfx && o.pfx.mark) || null, // pfx~N / pfx~tools / pfx~params / pfx<N

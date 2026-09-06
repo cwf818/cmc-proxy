@@ -412,7 +412,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 
 ## 结构化请求日志 (JSONL)
 
-独立于 `CMC_LOGGING_FILE` 分级落盘的**结构化请求日志**：把与终端 `REQ`/`RES` 两行**同源**的当前次请求数据，在 RES 输出时组织成**一条 JSON** 追加到 JSONL（JSON Lines）文件，便于后续用 `jq`/脚本按会话、模型、缓存命中、成本做离线分析。滚动统计（`ts`）、TOD/ALL 累计**不入档**——每条记录只含当次请求的信息。
+独立于 `CMC_LOGGING_FILE` 分级落盘的**结构化请求日志**：把与终端 `REQ`/`RES` 两行**同源**的当前次请求数据，在 RES 输出时组织成**一条 JSON** 追加到 JSONL（JSON Lines）文件，便于后续用 `jq`/脚本按会话、模型、缓存命中、成本做离线分析。每条记录除当次请求信息外，附带 RES 行尾展示的**滚动派生值**快照（`res.ch` 会话累计命中率、`res.ts` 窗口 1 速度），省得离线重算；TOD/ALL 累计不入档。
 
 - **开关**：`config.json` 的 `jsonlLog`（默认关闭）。`true` 写入 `requests.jsonl`（proxy.js 目录）；值为字符串则视为路径（相对 proxy.js 目录，自动建目录），如 `"log/requests.jsonl"`。未配置/`false` 不生成文件
 - **触发**：仅 model 类请求（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`，即带 `S会话#请求` 标签的请求）在响应完成（RES 输出）时写一条；健康检查、`/v1/models`、通配透传不写；客户端中途断开（`ABT`）不触发响应完成，不写
@@ -440,6 +440,8 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | `res.ms` / `qwaitMs`          | RES 行 `took=` / `qwait:`（ms；`took + qwait ≈ 总耗时`）                          |
 | `res.usage`                   | RES 行 `in:/out:/rt:/cr:/cw:`；**本次未解析到 usage 为 `null`**（同 RES 行不显示） |
 | `res.cost` / `credit`         | RES 行 `cost=` / `credit=`（0 / 未收录模型为 0）                                  |
+| `res.ch`                      | 会话累计缓存命中率 %（同 RES 行尾 `ch:`，会话累计口径）；本次无 usage 为 `null`      |
+| `res.ts`                      | 最近 1 次生成速度 tokens/s（同 RES 行尾 `ts:` 窗口 1）；本次无 usage 为 `null`        |
 | `res.lowCache` / `gap`        | RES 行 `gap:` —— 本次缓存命中率 <50% 时为 `true` 并给出与上次低缓存的序号差       |
 | `res.pfx`                     | RES 行 `pfx~N`/`pfx~tools`/`pfx~params`/`pfx<N`（纯追加健康时为 `null`）           |
 

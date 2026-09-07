@@ -79,7 +79,7 @@
  *      (UTC) 内以 peakUsdPerMTok 覆盖 input/output/cacheRead 牌价; 高峰仅工作日 (周一~周五,
  *      UTC) 生效, 周末整天按错峰价。RES 行输出 cost (橙) 与
  *      credit (黄), 高峰时段 cost/credit 前缀加 ^ (如 ^cost=); REQ/RES 行时间戳在高峰时段
- *      改暗红 (亮度同暗灰, 按本请求实际转发模型判定)。TOD/ALL stats 输出累计 cost / credit / avg。
+ *      改亮红 (醒目, 按本请求实际转发模型判定)。TOD/ALL stats 输出累计 cost / credit / avg。
  *      文件缺失/解析失败静默跳过。
  */
 "use strict";
@@ -114,7 +114,7 @@ const cBlue = paint(C.blue);
 const cOrange = paint("\x1b[38;5;208m"); // 256 色橙
 const cBrightGreen = paint("\x1b[92m"); // 亮绿
 const cBrightCyan = paint("\x1b[96m"); // 亮青 (usage cr 缓存命中突出)
-const cDimRed = paint("\x1b[2m\x1b[31m"); // 暗红 (dim+红): 高峰时段时间戳着色, 亮度与暗灰 cDim 相当
+const cBrightRed = paint("\x1b[91m"); // 亮红 (bright red): 高峰时段时间戳着色, 比暗红醒目; 与 RES 行 ^cost/^credit 高峰标记同口径
 
 // 日志标签 (前缀着色)
 const TAGW = cYellow("[cmc-proxy]");
@@ -2186,12 +2186,12 @@ function inPeakWindow(model) {
   return ranges.some(({ a, b }) => nowH >= a && nowH <= b); // end 包含
 }
 
-/** 时间戳着色函数: 请求所转发模型当前处于高峰窗口 -> 暗红 (与 RES 行 cost/credit 前缀 ^ 同口径,
+/** 时间戳着色函数: 请求所转发模型当前处于高峰窗口 -> 亮红 (与 RES 行 cost/credit 前缀 ^ 同口径,
  *  仅需模型目录收录该模型), 否则暗灰 cDim。未配置目录/未收录 -> 恒暗灰。 */
 function peakTsColor(mapped) {
   if (!modelCatalog || !mapped) return cDim;
   const model = catalogModel(mapped);
-  return model && inPeakWindow(model) ? cDimRed : cDim;
+  return model && inPeakWindow(model) ? cBrightRed : cDim;
 }
 
 /**
@@ -2363,7 +2363,7 @@ function jsonlRecord(o) {
     res: {
       model: c.mapped, // 实际转发模型 (轮换后为最终生效)
       modelChanged: !!c.mapped && c.model !== c.mapped,
-      peak: !!o.cq.peak, // 高峰窗口 (工作日 UTC) —— 终端 ^cost/^credit/时间戳暗红同口径
+      peak: !!o.cq.peak, // 高峰窗口 (工作日 UTC) —— 终端 ^cost/^credit/时间戳亮红同口径
       outBytes: o.outBytes,
       ms: o.ms, qwaitMs: o.qwaitMs,
       usage, // null = 本次未解析到 usage
@@ -2619,7 +2619,7 @@ const server = http.createServer(async (req, res) => {
     req._cmdc.reqLogged = true;
     // 标签 S{id}#{req} 按请求轮转取色, REQ 恒为青色; model 提前到 src 之前, 扫日志先看模型
     const tag = sessTag();
-    const tsColor = peakTsColor(req._cmdc.mapped); // 高峰暗红时间戳 (按本请求当前已定模型)
+    const tsColor = peakTsColor(req._cmdc.mapped); // 高峰亮红时间戳 (按本请求当前已定模型)
     console.log(`${tsColor(`[${logTs(startAt)}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${cCyan("REQ") + (willQueue ? cRed("*") : "")} ${req.method} ${pathname}${reqModelPart()} src=${srcIp}:${req.socket.remotePort || "-"} ua=${uaShort()}${streamPart()}${imgPart()}${cDim(bodyPart())}`);
     // CMC_DEBUG_PAYLOAD=1: 打印本地请求完整请求头与 body 原文 (排查会话标识等)
     if (process.env.CMC_DEBUG_PAYLOAD === "1") {
@@ -2707,7 +2707,7 @@ const server = http.createServer(async (req, res) => {
     // plan.credits / monthlyCredits; 高峰窗口内以峰值牌价计 (cacheRead 同被覆盖)。
     // 仅在有 usage 且模型目录收录时输出 (cost 照常输出, credit 另需 rated): cost=$N (橙)
     // credit=N (黄) 均 6 位小数, cost 在前; 高峰时段 cost/credit 前缀加 ^ (替代原 peak^ 标记),
-    // 时间戳已同时暗红 (见 peakTsColor), 无需再单列 peak^。
+    // 时间戳已同时亮红 (见 peakTsColor), 无需再单列 peak^。
     const cq = calcCredit(u, req._cmdc.mapped);
     rec.credit = cq.credit;
     rec.cost = cq.cost;
@@ -2766,7 +2766,7 @@ const server = http.createServer(async (req, res) => {
     const stFn = res.statusCode >= 500 ? cRed : res.statusCode >= 400 ? cYellow : res.statusCode >= 300 ? cCyan : cGreen;
     // 标签 S{id}#{req} 用该请求闭包捕获的颜色 (与 REQ 行同色); 状态码保持原波段色
     const tag = sessTag();
-    const tsColor = peakTsColor(req._cmdc.mapped); // 高峰暗红时间戳 (按最终实际转发模型)
+    const tsColor = peakTsColor(req._cmdc.mapped); // 高峰亮红时间戳 (按最终实际转发模型)
     console.log(`${tsColor(`[${logTs(Date.now())}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     // 结构化请求日志 (jsonlLog 开启时): RES 输出时把当前次请求组织成一条 JSON 写入 (仅 model 请求)
     if (JSONL_LOG && session) {

@@ -277,6 +277,7 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 | `reasoningBridge`     | `true`                | **出站回填**：每条 `assistant(tool_calls)` 都补非空 `reasoning_content`，取值优先级 **① 客户端 thinking 块原文 → ② 会话级缓存（键 = `tool_call_id`，上游返回时记录）→ ③ 占位串**。**无条件**回填（不按"本轮是否以 tool 结尾"分支），保证同一历史消息跨请求逐字节一致、不制造前缀分叉 |
 | `thinkingPassthrough` | `true`                | **入站回传**：客户端本次请求了 `thinking`（`body.thinking.type !== "disabled"`）时，把上游 `reasoning` 还原为 thinking 块（`thinking_delta` + 合成 `signature_delta`），让 CC 可见、可在下一轮原样回传。未请求 thinking 的会话**逐字节零变化** |
 | `reasoningPlaceholder`| `"(reasoning omitted)"` | 无真内容可回填时的兜底串（上游只要求非空）。显式配为 `""` = 关闭兜底（宁可 400 也不伪造） |
+| `reasoningMaxChars`   | `0`（不截断）         | 回填 reasoning 的**字符上限**：控制回填文本占用上下文窗口的体积（见下「上下文体积」）。截断确定性，不破坏前缀缓存 |
 
 - **会话缓存**：上游每次返回的 reasoning 都按响应里的 `tool_call_id` 记入 `session.reasoning`（FIFO 上限 128 条）。因此即使客户端**不回传** thinking 块（未开 thinking / 历史被压缩改写 / 反代重启后旧的轮次），也能用**真实**思考文本回填，而不是占位串。
 - **签名**：真实 `signature` 是 Anthropic 的不透明凭据（本链路上游非 Anthropic，不校验），用思考文本的 sha1 生成**确定性**签名（同文本同签名），不抽签、不破坏前缀缓存。
@@ -284,6 +285,33 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 - **仅带 `tool_calls` 的 assistant 轮次**回填（纯文本轮次无此要求，不注入）。
 - **哪些模型会强制**：对目录里全部 70 个模型跑同一探针（`assistant(tool_calls)` + 尾 = tool 结果 + 不回传 reasoning），**只有 2 个**报该 400：`deepseek/deepseek-v4-flash`、`deepseek/deepseek-v4.1-flash`。同系的 `deepseek-v4-flash-vision-exp` / `deepseek-v4-flash-fast` / `deepseek-v4-pro` 以及 `z-ai/glm-5.3-flash`、`MiniMaxAI/*`、`Qwen/*`、`moonshotai/*`、`xai/grok-*`、`thinkingmachines/*` 等**均不要求**（尾部为 `user` 时更是完全不要求，任何模型都不查）。
 - **兼容性**：反向回归同样跑了一遍 —— 给这 42 个能正常响应的模型注入 `reasoning_content`，**全部仍 200**，无一因多出该字段而报错（它不是 OpenAI 标准字段，但本上游网关统一接受）。这正是"无条件回填"能安全落地的依据（见上文：按轮次条件性回填会制造 `pfx~N` 前缀分叉）。
+
+#### 上下文体积（本方案的真实代价）
+
+**会变大。** 回填文本随历史进入每一轮请求，稳态下的净增量 ≈ **该会话内所有 tool-call 轮次的 reasoning tokens 之和**。用实测数据（`requests.jsonl` 的 S3 会话，103 个请求）：
+
+| 指标 | 值 |
+| --- | --- |
+| 会话累计 `rt`（思考 tokens） | 51,781（均值 513 / 中位 90 / 最大 3881）|
+| 末次请求输入 | `in 53,882 + cr 19,712` = **73,594 tokens** |
+| 全量回填后输入 | ≈ **125,375 tokens**（**+70%**）|
+
+**费用影响几乎可以忽略**，因为增量落在**缓存读**一侧：
+
+| 口径 | 单价 | 51,781 tokens 成本 |
+| --- | --- | --- |
+| 缓存读（`cr`） | `$0.003/Mtok` | **$0.00016** |
+| 全价输入 | `$0.15/Mtok` | $0.0078 |
+
+增加的那段前缀是稳定的，除了"首次出现的那一轮"（当作新增 token 计一次全价），其余轮次都是缓存读（比全价输入便宜 **50 倍**）。所以这是**上下文窗口占用**问题，不是账单问题。
+
+控制手段（按代价从低到高）：
+
+1. `reasoningMaxChars: 500`（建议起点）—— 每条回填截到 500 字符，保留思考要点、把增量压到一两个数量级以下；截断确定性 → 缓存不受影响。
+2. `reasoningMaxChars: 20` 左右 —— 增量几乎归零，只保留"非空"语义。
+3. `reasoningBridge: false` —— 完全不回填，但工具循环会重新 400（仅在你不用 thinking 模型时考虑）。
+
+> **副作用提醒**：客户端**不**回传 thinking 块时（未开 thinking），回填依赖会话缓存；缓存是 FIFO 有界（128 条 `tool_call_id`）的，超过后最早的条目被逐出，那些旧消息的回填值会从**真思考文本退化为占位串** → 该位置发生一次 `pfx~N`、那一次请求全价重读一遍前缀。实际影响是一次的（逐出后永久稳定），长会话（>128 个带工具调用的轮次）才可能遇到。客户端**回传** thinking 时（开了 `thinkingPassthrough` 且 CC 请求了 thinking）不受此影响——取值优先客户端原文。
 
 ## 配置项速查
 

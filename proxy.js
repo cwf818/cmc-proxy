@@ -176,6 +176,8 @@ const REASONING_BRIDGE = config.reasoningBridge !== false;
 const THINKING_PASSTHROUGH = config.thinkingPassthrough !== false;
 // 无真内容可回填时的兜底串 (非空即可满足上游); 显式配置为 "" 则关闭兜底 (宁可 400 也不造假)
 const REASONING_PLACEHOLDER = typeof config.reasoningPlaceholder === "string" ? config.reasoningPlaceholder : "(reasoning omitted)";
+// 回填文本的字符上限 (0 = 不截断): 控制 reasoning 占用上下文窗口的体积, 截断确定性、不破坏缓存
+const REASONING_MAX_CHARS = Math.max(0, parseInt(config.reasoningMaxChars ?? "0", 10) || 0);
 const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
 const VISION_AUTO_ROUTE = config.visionAutoRoute !== false; // 带图前置路由: 请求模型判定不支持视觉时, 不发它而改走 defaultVisionModels[0]
 
@@ -882,26 +884,41 @@ function recallReasoning(session, ids) {
 }
 
 /**
+ * 上下文体积护栏: 回填文本按字符数截断 (确定性 —— 同源文本截出同一结果, 不破坏前缀缓存)。
+ * 推理文本会进入每一轮的上下文 (占了上下文窗口 + 预填充成本), 长会话下累计可观;
+ * REASONING_MAX_CHARS=0 表示不截断 (完整保真, 默认)。
+ */
+function capReasoning(s) {
+  if (!s) return s;
+  if (REASONING_MAX_CHARS > 0 && s.length > REASONING_MAX_CHARS) return s.slice(0, REASONING_MAX_CHARS) + "…";
+  return s;
+}
+
+/**
  * 出站回填: 每条带 tool_calls 的 assistant 消息都补上非空 reasoning_content。
  * 必须**无条件**回填 —— 同一历史消息若因"本轮是否以 tool 结果结尾"而时有时无, 字节不一致
  * 会在该条处造成前缀分叉, 使后续整段缓存失效。
+ * 取值优先级: 客户端 thinking 原文 -> 会话缓存 -> 占位串; 无论哪一层都过 capReasoning 截断。
  */
 function backfillReasoning(messages, session) {
   if (!REASONING_BRIDGE || !Array.isArray(messages)) return;
   for (const m of messages) {
     if (!m || m.role !== "assistant" || !Array.isArray(m.tool_calls) || !m.tool_calls.length) continue;
+    // 幂等标记 (不可枚举, JSON.stringify 不会输出): 已处理过的消息不再处理 —— 否则第二轮会把
+    // **截断后**的文本当成"客户端原文"回写进缓存, 后续轮次回填从全文退化成截断版,
+    // 字节变化 → 前缀分叉 (截断本身是确定的, 但缓存被截断值污染后就不再是全文了)
+    if (m.__cmcReasoned) continue;
+    Object.defineProperty(m, "__cmcReasoned", { value: true, enumerable: false, writable: true, configurable: true });
     const ids = m.tool_calls.map((t) => t && t.id).filter(Boolean);
     const own = typeof m.reasoning_content === "string" && m.reasoning_content ? m.reasoning_content : "";
     if (own) {
-      rememberReasoning(session, ids, own);
-      continue;
+      rememberReasoning(session, ids, own); // 缓存保存**全文** (截断只作用于出站序列化)
+    } else {
+      const cached = recallReasoning(session, ids);
+      if (cached) m.reasoning_content = cached;
+      else if (REASONING_PLACEHOLDER) m.reasoning_content = REASONING_PLACEHOLDER;
     }
-    const cached = recallReasoning(session, ids);
-    if (cached) {
-      m.reasoning_content = cached;
-      continue;
-    }
-    if (REASONING_PLACEHOLDER) m.reasoning_content = REASONING_PLACEHOLDER;
+    if (m.reasoning_content) m.reasoning_content = capReasoning(m.reasoning_content);
   }
 }
 
@@ -3474,7 +3491,7 @@ server.listen(PORT, HOST, () => {
   console.log(cBlue(`  tool结果图 : ${TOOL_RESULT_IMAGES ? "保留 (注入 user 消息透传)" : "丢弃 (折叠为 [image])"}`));
   const rbDesc = !REASONING_BRIDGE
     ? "关闭 (thinking 模型工具循环可能 400)"
-    : `开启 (回填 reasoning${REASONING_PLACEHOLDER ? " + 占位兜底" : ""}${THINKING_PASSTHROUGH ? " + thinking 透传" : ""})`;
+    : `开启 (回填 reasoning${REASONING_PLACEHOLDER ? " + 占位兜底" : ""}${THINKING_PASSTHROUGH ? " + thinking 透传" : ""}${REASONING_MAX_CHARS > 0 ? `, 每条≤${REASONING_MAX_CHARS}字符` : ", 不截断"})`;
   console.log(cBlue(`  reasoning  : ${rbDesc}`));
   const catalogTs = modelCatalog && modelCatalog.fetchedAt
     ? new Date(modelCatalog.fetchedAt).toLocaleString("zh-CN", { hour12: false })

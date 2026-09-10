@@ -21,6 +21,8 @@
   "thinkingPassthrough": true,
   "_reasoning占位说明": "reasoningPlaceholder: 无真实 reasoning 可回填时的兜底串 (上游只要求非空, 默认 '(reasoning omitted)')。显式配为空串 '' 则关闭兜底 (宁可 400 也不伪造)。",
   "reasoningPlaceholder": "(reasoning omitted)",
+  "_reasoning上限说明": "reasoningMaxChars: 回填 reasoning 的字符上限 (默认 0 = 不截断, 完整保真)。回填文本会随历史进入每一轮上下文 —— 实测 S3 会话 rt 合计 51781 tokens, 全量回填会把输入从 73594 推到约 125375 tokens (+70%, 即上下文窗口占用)。截断是确定性的 (同源文本截出同一结果), 不破坏前缀缓存; 增长部分落在缓存读一侧时按 $0.003/Mtok 计 (比全价输入便宜 50 倍)。上下文紧张时建议设 500~1000。",
+  "reasoningMaxChars": 0,
   "_冷却说明": "failTTL: 模型失败后的冷却时间 ms, 冷却期内跳过该模型 (默认 30000)。",
   "failTTL": 30000,
   "_模型解析说明": "resolveModel: modelMap 未命中时的解析开关 (默认 true)。true: 按上游目录分层按序匹配 (精确 -> 大小写不敏感 -> 去 provider 前缀按裸名 -> 去 [*] 后缀), 命中即用, 未命中按请求类型回退 defaultModels[0]/defaultVisionModels[0]; false: 原样向上游请求 (不解析不回退)。",

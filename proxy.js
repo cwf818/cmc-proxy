@@ -1923,6 +1923,19 @@ async function upstreamBodyBrief(r, max = 300) {
   }
 }
 
+/**
+ * 丢弃已失败的上游响应体 (轮换到下一个候选前)。
+ * 注意: 响应体被 upstreamBodyBrief 读过 (r.text()) 后流处于 locked, 此时 cancel() 返回的是
+ * **被拒的 Promise** (ERR_INVALID_STATE), try/catch 拦不住同步部分 —— 必须显式 catch 掉,
+ * 否则会变成 unhandled rejection 直接崩掉进程。
+ */
+function discardBody(r) {
+  try {
+    const p = r && r.body && r.body.cancel();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } catch { /* 已消费/已关闭/无 body */ }
+}
+
 /** 底层单次上游请求: 带客户端断开联动与首字节超时看门狗, 不做任何计数/轮换 */
 async function rawUpstreamFetch(url, init, signal) {
   const ac = new AbortController();
@@ -1979,9 +1992,12 @@ const ROTATE_STATUSES = new Set([403, 404, 408, 429, 500, 502, 503, 504]);
  *     默认列表里的后续候选 (index >= 1) 无论哪种情况都照常冷却 (方案 A)。
  * switchOnFail=false: 单次请求不轮换, 与 upstreamFetch 一致 (当次失败原样返回)。
  * hooks.onModel(finalModel): 轮换后回调实际使用的模型, 供 RES 行 model= 展示。
+ * hooks.onAttemptFail({status, model, detail, ms, attempt, total}): 某次尝试失败且将被轮换时回调,
+ *   供调用方补一条与 REQ 配对的失败行 (status: 网络失败=502 / HTTP 失败=上游真实码)。
+ *   仅在"还会继续重试"时触发; 全部候选试完的终态失败不触发 (由调用方 RES 行负责)。
  */
 async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
-  const { sessTag, onModel, isImage = false, isFallback = true } = hooks;
+  const { sessTag, onModel, onAttemptFail, isImage = false, isFallback = true } = hooks;
   const rotateOn = switchOnFailFor(isImage);
   if (!rotateOn) {
     const r = await upstreamFetch(url, init, firstModel, signal, isFallback);
@@ -2019,6 +2035,7 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       console.warn(TAGW, `${pfx}模型 ${model} 冷却中, 跳过`);
       continue;
     }
+    const t0 = Date.now(); // 本次尝试耗时 (仅该候选), 供失败行 took= 使用
     try {
       const r = await rawUpstreamFetch(url, attemptInit(model), signal);
       if (r.ok) {
@@ -2033,8 +2050,9 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       if (isImage && r.status === 400) {
         if (i + 1 < candidates.length) {
           const brief = await upstreamBodyBrief(r);
+          if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: i + 1, total: candidates.length });
           console.warn(TAGW, `${pfx}上游 400 (${model}), 带图轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
-          try { r.body?.cancel(); } catch { /* 丢弃已失败响应 */ }
+          discardBody(r);
           continue;
         }
         if (onModel) onModel(model);
@@ -2046,8 +2064,9 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       }
       if (i + 1 < candidates.length) {
         const brief = await upstreamBodyBrief(r);
+        if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: i + 1, total: candidates.length });
         console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
-        try { r.body?.cancel(); } catch { /* 丢弃已失败响应 */ }
+        discardBody(r);
         continue;
       }
       if (onModel) onModel(model);
@@ -2058,7 +2077,10 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       // 用户显式指定模型失败不冷却, 只轮换; 回退/默认候选照常冷却
       if (!isUserModel) markModelFail(model);
       if (i + 1 < candidates.length) {
-        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${upstreamErrSummary(e)}, 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
+        const summary = upstreamErrSummary(e);
+        // 网络层失败无 HTTP 状态: 按调用方收尾码记 502, 并把 code/msg 摘要写在这条配对行上
+        if (onAttemptFail) onAttemptFail({ status: 502, model, detail: summary, ms: Date.now() - t0, attempt: i + 1, total: candidates.length });
+        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${summary}, 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
         continue;
       }
       throw e; // 全部候选试完: 抛最后一次错误, 调用方按 502 收尾
@@ -2655,6 +2677,16 @@ const server = http.createServer(async (req, res) => {
   // 会话标签前导空格: @ 开头(带新图)不补, 否则补一个空格 —— REQ/RES 行:
   // 无图 "] S1#2", 带新图 "]@S1#3" 紧贴时间戳
   const tagPad = () => (req._cmdc && req._cmdc.imgNew ? "" : " ");
+  // 尝试失败行 (与 REQ 行配对): 轮换到下一个候选前, 为这次失败的尝试补一条 RES 形态的记录,
+  // 否则 REQ 行要等到最终成功/失败才有对应行。网络层失败记 502 (调用方就此收尾会返回的状态),
+  // HTTP 失败记上游真实状态码; try=i/N 标明这是第几个候选, 耗时按该次尝试单独计。
+  // 只在"还会继续重试"时输出, 终态失败由 RES 行负责, 避免重复。
+  const logUpFail = ({ status, model, detail, ms, attempt, total }) => {
+    const stFn = status >= 500 ? cRed : status >= 400 ? cYellow : cCyan;
+    const t = sessTag();
+    const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : `${ms}ms`;
+    console.log(`${peakTsColor(model)(`[${logTs(Date.now())}]`)}${t ? `${tagPad()}${tagColor(t)} ` : " "}${stFn(String(status))} ${req.method} ${pathname}${model ? modelColor(model)(` model=${model}`) : ""}${cDim(` try=${attempt}/${total} took=${took}`)}${detail ? " " + cDim(detail) : ""}`);
+  };
   const logReq = () => {
     if (req._cmdc.reqLogged) return;
     req._cmdc.reqLogged = true;
@@ -2899,7 +2931,7 @@ const server = http.createServer(async (req, res) => {
               "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
             }),
             body: JSON.stringify(body),
-          }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isFallback: mappedFallback });
+          }, mapped, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, onAttemptFail: logUpFail, isFallback: mappedFallback });
         } catch (e) {
           releaseUp();
           upstreamFail(e);
@@ -2954,7 +2986,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(oaiReq),
-        }, oaiReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage: finalImage, isFallback: routed.isFallback });
+        }, oaiReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, onAttemptFail: logUpFail, isImage: finalImage, isFallback: routed.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -3038,7 +3070,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(body),
-        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: routed.isFallback });
+        }, body.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, onAttemptFail: logUpFail, isImage, isFallback: routed.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);
@@ -3107,7 +3139,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: buildUpstreamHeaders(req, { "Content-Type": "application/json" }),
           body: JSON.stringify(chatReq),
-        }, chatReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, isImage, isFallback: routed ? routed.isFallback : decision.isFallback });
+        }, chatReq.model, upstreamAbort.signal, { sessTag, onModel: (m) => { req._cmdc.mapped = m; }, onAttemptFail: logUpFail, isImage, isFallback: routed ? routed.isFallback : decision.isFallback });
       } catch (e) {
         releaseUp();
         upstreamFail(e);

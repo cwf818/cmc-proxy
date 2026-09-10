@@ -282,7 +282,8 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 - **签名**：真实 `signature` 是 Anthropic 的不透明凭据（本链路上游非 Anthropic，不校验），用思考文本的 sha1 生成**确定性**签名（同文本同签名），不抽签、不破坏前缀缓存。
 - **Codex/Responses 链路**：同样处理——`reasoning` 条目文本附着到紧随的 `function_call` 对应的 assistant 消息；出站同样回填（Codex 侧暂不下发 reasoning 条目）。
 - **仅带 `tool_calls` 的 assistant 轮次**回填（纯文本轮次无此要求，不注入）。
-- **兼容性**：实测其余轮换候选（`z-ai/glm-5.3-flash`、`deepseek-v4-flash-vision-exp`、`Qwen/Qwen3.8-*`、`xiaomi/mimo-v2.5`）**都接受**该字段（忽略），所以注入不影响轮换。
+- **哪些模型会强制**：对目录里全部 70 个模型跑同一探针（`assistant(tool_calls)` + 尾 = tool 结果 + 不回传 reasoning），**只有 2 个**报该 400：`deepseek/deepseek-v4-flash`、`deepseek/deepseek-v4.1-flash`。同系的 `deepseek-v4-flash-vision-exp` / `deepseek-v4-flash-fast` / `deepseek-v4-pro` 以及 `z-ai/glm-5.3-flash`、`MiniMaxAI/*`、`Qwen/*`、`moonshotai/*`、`xai/grok-*`、`thinkingmachines/*` 等**均不要求**（尾部为 `user` 时更是完全不要求，任何模型都不查）。
+- **兼容性**：反向回归同样跑了一遍 —— 给这 42 个能正常响应的模型注入 `reasoning_content`，**全部仍 200**，无一因多出该字段而报错（它不是 OpenAI 标准字段，但本上游网关统一接受）。这正是"无条件回填"能安全落地的依据（见上文：按轮次条件性回填会制造 `pfx~N` 前缀分叉）。
 
 ## 配置项速查
 

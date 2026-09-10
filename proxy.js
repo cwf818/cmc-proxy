@@ -1884,6 +1884,45 @@ function upstreamError(message, opts = {}) {
   return Object.assign(new Error(message), opts);
 }
 
+/**
+ * 把上游失败原因压缩成单行摘要 (code + msg), 供轮换/收尾日志与客户端错误体展示:
+ *   code=<错误码> msg=<错误信息>
+ * Node fetch 网络层只抛 TypeError("fetch failed"), 真正的原因 (ECONNREFUSED / ENOTFOUND /
+ * UND_ERR_CONNECT_TIMEOUT / 证书错误等) 挂在 e.cause 链上, 这里逐层下钻取首个 code,
+ * 并取 cause 链上最具体的一条 message。首字节超时/客户端断开用语义化代号标注。
+ */
+function upstreamErrSummary(e) {
+  if (!e) return "未知错误";
+  let code = e.firstByteTimeout ? "FIRST_BYTE_TIMEOUT"
+    : e.clientAbort ? "CLIENT_ABORT"
+    : null;
+  let detail = e.message || "";
+  for (let c = e; c; c = c.cause) {
+    if (!code) {
+      // DOMException 的 code 是无意义数字 (23=TIMEOUT_ERR 等), 取语义化 name 代替
+      if (typeof c.code === "number") code = c.name || `ERR_${c.code}`;
+      else if (c.code) code = c.code;
+      else if (c.name && c.name !== "TypeError" && c.name !== "Error") code = c.name;
+    }
+    if (c !== e && c.message) detail = c.message;
+  }
+  const parts = [];
+  if (code) parts.push(`code=${code}`);
+  if (detail) parts.push(`msg=${detail}`);
+  return parts.join(" ") || e.name || "Error";
+}
+
+/** 读取非 2xx 响应体的单行摘要 (仅日志用, 调用方随后会丢弃该响应); 失败返回空串 */
+async function upstreamBodyBrief(r, max = 300) {
+  try {
+    const t = (await r.text()).replace(/\s+/g, " ").trim();
+    if (!t) return "";
+    return t.length > max ? `${t.slice(0, max)}…(+${t.length - max}B)` : t;
+  } catch {
+    return "";
+  }
+}
+
 /** 底层单次上游请求: 带客户端断开联动与首字节超时看门狗, 不做任何计数/轮换 */
 async function rawUpstreamFetch(url, init, signal) {
   const ac = new AbortController();
@@ -1993,7 +2032,8 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       // 带图请求: 图片不支持的报错就是 400 (This model does not support image), 400 也轮换
       if (isImage && r.status === 400) {
         if (i + 1 < candidates.length) {
-          console.warn(TAGW, `${pfx}上游 400 (${model}), 带图轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
+          const brief = await upstreamBodyBrief(r);
+          console.warn(TAGW, `${pfx}上游 400 (${model}), 带图轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
           try { r.body?.cancel(); } catch { /* 丢弃已失败响应 */ }
           continue;
         }
@@ -2005,7 +2045,8 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
         return r; // 400/401/413 等换模型无济于事的失败: 不轮换, 原样透传 (已计冷却)
       }
       if (i + 1 < candidates.length) {
-        console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
+        const brief = await upstreamBodyBrief(r);
+        console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
         try { r.body?.cancel(); } catch { /* 丢弃已失败响应 */ }
         continue;
       }
@@ -2017,7 +2058,7 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       // 用户显式指定模型失败不冷却, 只轮换; 回退/默认候选照常冷却
       if (!isUserModel) markModelFail(model);
       if (i + 1 < candidates.length) {
-        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${e.message}, 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
+        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${upstreamErrSummary(e)}, 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
         continue;
       }
       throw e; // 全部候选试完: 抛最后一次错误, 调用方按 502 收尾
@@ -2670,7 +2711,7 @@ const server = http.createServer(async (req, res) => {
   });
   // 上游请求异常收尾: 客户端断开时 socket 已死, 只记日志不写响应 (写必抛)
   const upstreamFail = (e) => {
-    const msg = e.clientAbort ? "客户端断开, 放弃上游请求" : `上游请求失败: ${e.message}`;
+    const msg = e.clientAbort ? "客户端断开, 放弃上游请求" : `上游请求失败: ${upstreamErrSummary(e)}`;
     logSevere(req, pathname, session, msg);
     if (e.clientAbort) console.warn(cDim(`[cmc-proxy]${sessTag()} ${msg}`));
     else console.warn(TAGW, msg);
@@ -2864,7 +2905,7 @@ const server = http.createServer(async (req, res) => {
           upstreamFail(e);
           if (e.clientAbort) return;
           res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + e.message } }));
+          res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + upstreamErrSummary(e) } }));
           return;
         }
         if (!up.ok) {
@@ -2919,7 +2960,7 @@ const server = http.createServer(async (req, res) => {
         upstreamFail(e);
         if (e.clientAbort) return;
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + e.message } }));
+        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "上游请求失败: " + upstreamErrSummary(e) } }));
         return;
       }
 
@@ -3003,7 +3044,7 @@ const server = http.createServer(async (req, res) => {
         upstreamFail(e);
         if (e.clientAbort) return;
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "上游请求失败: " + e.message, type: "api_error" } }));
+        res.end(JSON.stringify({ error: { message: "上游请求失败: " + upstreamErrSummary(e), type: "api_error" } }));
         return;
       }
       // upstreamFetch 已处理失败/成功计数 (非 2xx 已计失败并可能切换默认模型)
@@ -3072,7 +3113,7 @@ const server = http.createServer(async (req, res) => {
         upstreamFail(e);
         if (e.clientAbort) return;
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "上游请求失败: " + e.message, type: "api_error" } }));
+        res.end(JSON.stringify({ error: { message: "上游请求失败: " + upstreamErrSummary(e), type: "api_error" } }));
         return;
       }
 

@@ -164,6 +164,18 @@ const SERIALIZE_SESSION = config.serializeSessionRequests !== false; // 同会�
 const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout ?? "120000", 10); // 上游响应头超时 ms (0=关闭; ?? 保证显式 0 不被默认值覆盖)
 const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内嵌图片保留 (注入随后的 user 消息透传上游)
 const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
+// reasoning 桥接。DeepSeek 系 thinking 模型在"历史含 assistant(tool_calls) 且对话以 tool 结果
+// 结尾"时, 要求**每一条** assistant(tool_calls) 都回传非空 reasoning_content, 否则 400
+// "The `reasoning_content` in the thinking mode must be passed back to the API."
+// Anthropic 侧对应 thinking 块, 但转换层此前出/入两个方向都把它丢了 —— 客户端无从回传,
+// 上游直接 400 (工具循环第一步就断)。开启后:
+//   出站 (reasoningBridge): 每条 assistant(tool_calls) 按 thinking 原文 → 会话缓存 → 占位串
+//     三层回填 reasoning_content; **无条件**回填 (不按是否以 tool 结尾分支), 保证前缀字节稳定
+//   入站 (thinkingPassthrough): 客户端请求了 thinking 时, 把上游 reasoning 还原为 thinking 块
+const REASONING_BRIDGE = config.reasoningBridge !== false;
+const THINKING_PASSTHROUGH = config.thinkingPassthrough !== false;
+// 无真内容可回填时的兜底串 (非空即可满足上游); 显式配置为 "" 则关闭兜底 (宁可 400 也不造假)
+const REASONING_PLACEHOLDER = typeof config.reasoningPlaceholder === "string" ? config.reasoningPlaceholder : "(reasoning omitted)";
 const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
 const VISION_AUTO_ROUTE = config.visionAutoRoute !== false; // 带图前置路由: 请求模型判定不支持视觉时, 不发它而改走 defaultVisionModels[0]
 
@@ -803,6 +815,110 @@ function toolResultImageParts(content) {
   return parts;
 }
 
+// ---- reasoning / thinking 桥接 (见文件头 REASONING_BRIDGE 注释) ----
+/**
+ * 上游 reasoning 字段形态不一, 统一抽为纯文本:
+ *   reasoning_content (DeepSeek 原生) / reasoning (AI-SDK 网关) / reasoning_details[].text
+ */
+function extractReasoning(obj) {
+  if (!obj) return "";
+  if (typeof obj.reasoning_content === "string" && obj.reasoning_content) return obj.reasoning_content;
+  if (typeof obj.reasoning === "string" && obj.reasoning) return obj.reasoning;
+  const rd = obj.reasoning_details;
+  if (Array.isArray(rd)) return rd.map((d) => (d && typeof d.text === "string" ? d.text : "")).join("");
+  return "";
+}
+
+/** Anthropic assistant 消息里的 thinking/redacted_thinking 块 -> 纯文本 (redacted 无明文, 返回空) */
+function anthropicThinkingText(msg) {
+  if (!msg || typeof msg.content === "string" || !Array.isArray(msg.content)) return "";
+  let t = "";
+  for (const b of msg.content) {
+    if (b && (b.type === "thinking" || b.type === "redacted_thinking") && typeof b.thinking === "string") t += b.thinking;
+  }
+  return t;
+}
+
+/** Responses 推理条目 -> 纯文本 (summary[].text / content[].text) */
+function responsesReasoningText(item) {
+  let t = "";
+  for (const arr of [item.summary, item.content]) {
+    if (Array.isArray(arr)) for (const p of arr) if (p && typeof p.text === "string") t += p.text;
+  }
+  return t || (typeof item.text === "string" ? item.text : "");
+}
+
+/**
+ * 合成 thinking 块签名。真实 signature 是 Anthropic 的不透明凭据 (本链路上游非 Anthropic,
+ * 不校验), 用文本哈希生成**确定性**签名 —— 同文本同签名, 不抽签、不破坏前缀缓存。
+ */
+function reasoningSignature(text) {
+  return "cmc-" + crypto.createHash("sha1").update(text).digest("base64").slice(0, 48);
+}
+
+/**
+ * 会话级 reasoning 缓存: tool_call_id -> reasoning 原文 (上游返回时记录)。
+ * 客户端未回传 thinking 块 (未开 thinking / 历史被压缩改写 / 跨进程重启) 时, 出站回填优先
+ * 取这里, 避免用占位串顶替真实思考。FIFO 有界, 防长会话无限增长。
+ */
+const REASONING_CACHE_MAX = 128;
+function rememberReasoning(session, ids, text) {
+  if (!REASONING_BRIDGE || !session || !text || !Array.isArray(ids) || !ids.length) return;
+  const m = session.reasoning || (session.reasoning = new Map());
+  for (const id of ids) {
+    if (!id) continue;
+    m.delete(id); // 重新插入到末尾: 最近用到的 tool_call 不易被淘汰
+    m.set(id, text);
+  }
+  while (m.size > REASONING_CACHE_MAX) m.delete(m.keys().next().value);
+}
+function recallReasoning(session, ids) {
+  if (!session || !session.reasoning || !Array.isArray(ids)) return "";
+  for (const id of ids) {
+    const v = id && session.reasoning.get(id);
+    if (v) return v;
+  }
+  return "";
+}
+
+/**
+ * 出站回填: 每条带 tool_calls 的 assistant 消息都补上非空 reasoning_content。
+ * 必须**无条件**回填 —— 同一历史消息若因"本轮是否以 tool 结果结尾"而时有时无, 字节不一致
+ * 会在该条处造成前缀分叉, 使后续整段缓存失效。
+ */
+function backfillReasoning(messages, session) {
+  if (!REASONING_BRIDGE || !Array.isArray(messages)) return;
+  for (const m of messages) {
+    if (!m || m.role !== "assistant" || !Array.isArray(m.tool_calls) || !m.tool_calls.length) continue;
+    const ids = m.tool_calls.map((t) => t && t.id).filter(Boolean);
+    const own = typeof m.reasoning_content === "string" && m.reasoning_content ? m.reasoning_content : "";
+    if (own) {
+      rememberReasoning(session, ids, own);
+      continue;
+    }
+    const cached = recallReasoning(session, ids);
+    if (cached) {
+      m.reasoning_content = cached;
+      continue;
+    }
+    if (REASONING_PLACEHOLDER) m.reasoning_content = REASONING_PLACEHOLDER;
+  }
+}
+
+/** 非流式响应: 把上游返回的 reasoning 记入会话缓存 (供后续轮次出站回填) */
+function recordResponseReasoning(session, obj) {
+  const msg = obj && obj.choices && obj.choices[0] && obj.choices[0].message;
+  if (!msg) return;
+  rememberReasoning(session, (msg.tool_calls || []).map((t) => t && t.id), extractReasoning(msg));
+}
+
+/** 流式响应: 转换器在收流时累积了 reasoning 与 tool_call id, 一并记入会话缓存 */
+function recordStreamReasoning(session, conv) {
+  if (!session || !conv || typeof conv.reasoningRecord !== "function") return;
+  const rec = conv.reasoningRecord();
+  rememberReasoning(session, rec.ids, rec.text);
+}
+
 function anthropicMessageToOpenAI(msg) {
   const role = msg.role;
 
@@ -866,6 +982,12 @@ function anthropicMessageToOpenAI(msg) {
     const omsg = { role: "assistant" };
     if (text) omsg.content = text;
     if (toolCalls.length) omsg.tool_calls = toolCalls;
+    // thinking 块 -> reasoning_content (仅带 tool_calls 的轮次有此要求; 无真内容时留空,
+    // 由 backfillReasoning 统一按 缓存/占位 回填)
+    if (REASONING_BRIDGE && toolCalls.length) {
+      const th = anthropicThinkingText(msg);
+      if (th) omsg.reasoning_content = th;
+    }
     return omsg;
   }
 
@@ -917,7 +1039,7 @@ function affinityUser(sessionKey) {
   return undefined; // src:port|ua 形式的 key 含每次连接都变的端口, 注入反而破坏稳定性
 }
 
-function anthropicToOpenAIRequest(body, sessionKey) {
+function anthropicToOpenAIRequest(body, sessionKey, ctx = {}) {
   const mapped = body.model; // model 由调用方 (pickModel) 决策后覆盖
   const messages = [];
   // 顶层 system: 块数组 1:1 映射为 part 数组 (保结构稳定 + cache_control 透传)
@@ -968,16 +1090,23 @@ function anthropicToOpenAIRequest(body, sessionKey) {
   if (body.stream) req.stream_options = { include_usage: true };
   const user = affinityUser(sessionKey);
   if (user) req.user = user;
+  backfillReasoning(messages, ctx.session); // DeepSeek 系 thinking 模式的硬要求 (见 REASONING_BRIDGE)
   return req;
 }
 
 // ---------------------------------------------------------------------------
 // OpenAI -> Anthropic 响应转换 (非流式)
 // ---------------------------------------------------------------------------
-function openAIToAnthropic(obj, requestedModel) {
+function openAIToAnthropic(obj, requestedModel, opts = {}) {
   const choice = obj.choices && obj.choices[0] ? obj.choices[0] : {};
   const msg = choice.message || {};
   const contentBlocks = [];
+  // 思考块必须排在 content 之前 (Anthropic 顺序: thinking -> text -> tool_use); 仅在客户端
+  // 本次请求了 thinking 时下发 (client 本就期待该块类型, 避免无 thinking 会话凭空多出内容)
+  if (opts.emitThinking) {
+    const th = extractReasoning(msg);
+    if (th) contentBlocks.push({ type: "thinking", thinking: th, signature: reasoningSignature(th) });
+  }
   if (msg.content) contentBlocks.push({ type: "text", text: msg.content });
   for (const tc of msg.tool_calls || []) {
     let input = {};
@@ -1017,9 +1146,13 @@ function openAIToAnthropic(obj, requestedModel) {
 // OpenAI SSE 流 -> Anthropic SSE 流 转换
 // ---------------------------------------------------------------------------
 class StreamConverter {
-  constructor(requestedModel, estimateInputTokens = 0) {
+  constructor(requestedModel, estimateInputTokens = 0, emitThinking = false) {
     this.requestedModel = requestedModel;
     this.estimateInputTokens = estimateInputTokens; // message_start 用的估算输入 tokens
+    this.emitThinking = emitThinking; // 客户端请求了 thinking 才下发 thinking 块
+    this.thinkBlock = null; // thinking 块索引 (null=未创建)
+    this.thinkText = ""; // 累积思考文本 (合成签名 + 会话缓存)
+    this.reasoningText = ""; // 上游 reasoning 原文 (总是累积, 供会话缓存, 与是否下发无关)
     this.started = false; // 是否已发 message_start
     this.nextBlockIndex = 0; // 统一自增的块索引 (文本与工具共用, 修复旧版 index 冲突)
     this.toolState = {}; // 上游 tool_call index -> {id, name, buffer, blockIndex}
@@ -1114,6 +1247,39 @@ class StreamConverter {
       );
     }
 
+    // 思考增量 (DeepSeek 系 thinking 模型 / AI-SDK 网关的 reasoning)
+    const rdelta = extractReasoning(delta);
+    if (rdelta) {
+      this.reasoningText += rdelta;
+      if (this.emitThinking) {
+        if (this.thinkBlock == null) {
+          this.thinkBlock = this.nextBlockIndex++;
+          this.activeBlocks.push(this.thinkBlock);
+          events.push(
+            sse(
+              "content_block_start",
+              JSON.stringify({
+                type: "content_block_start",
+                index: this.thinkBlock,
+                content_block: { type: "thinking", thinking: "" },
+              })
+            )
+          );
+        }
+        this.thinkText += rdelta;
+        events.push(
+          sse(
+            "content_block_delta",
+            JSON.stringify({
+              type: "content_block_delta",
+              index: this.thinkBlock,
+              delta: { type: "thinking_delta", thinking: rdelta },
+            })
+          )
+        );
+      }
+    }
+
     // 文本增量
     if (delta.content) {
       if (this.textBlock == null) {
@@ -1190,6 +1356,11 @@ class StreamConverter {
     }
   }
 
+  /** 供调用方记录会话缓存: reasoning 原文 + 本次响应的 tool_call id */
+  reasoningRecord() {
+    return { text: this.reasoningText, ids: Object.values(this.toolState).map((s) => s.id).filter(Boolean) };
+  }
+
   /** 流结束时调用, 返回收尾 SSE */
   finish() {
     if (!this.started) {
@@ -1225,6 +1396,17 @@ class StreamConverter {
       return out;
     }
     let out = "";
+    // thinking 块的签名必须在 block 关闭前补发 (Anthropic 的 signature_delta)
+    if (this.thinkBlock != null) {
+      out += sse(
+        "content_block_delta",
+        JSON.stringify({
+          type: "content_block_delta",
+          index: this.thinkBlock,
+          delta: { type: "signature_delta", signature: reasoningSignature(this.thinkText) },
+        })
+      );
+    }
     for (const bi of this.activeBlocks) {
       out += sse("content_block_stop", JSON.stringify({ type: "content_block_stop", index: bi }));
     }
@@ -1305,6 +1487,14 @@ function responsesInputToChatMessages(input) {
   // codex 0.150 alpha 会把附加工具定义 (deferred 工具加载结果等) 以 additional_tools
   // 条目内联在对话历史中, 收集后合并进请求 tools (见 responsesToChatRequest)
   const additionalTools = [];
+  // reasoning 条目 (Codex 回传的思考): 取文本附着到紧随的 assistant 消息上, 满足 DeepSeek 系
+  // thinking 模式对历史 assistant(tool_calls) 的 reasoning_content 要求
+  let pendingReasoning = "";
+  const attachReasoning = (m) => {
+    if (!pendingReasoning || !m || m.reasoning_content) return;
+    m.reasoning_content = pendingReasoning;
+    pendingReasoning = "";
+  };
   // input 可以是字符串
   if (typeof input === "string") {
     if (input) messages.push({ role: "user", content: input });
@@ -1355,6 +1545,7 @@ function responsesInputToChatMessages(input) {
           .join("");
         const m = { role: "assistant" };
         if (text) m.content = text;
+        attachReasoning(m);
         messages.push(m);
       } else if (role === "developer" || role === "system") {
         const text = blocks
@@ -1376,6 +1567,7 @@ function responsesInputToChatMessages(input) {
           arguments: stringifyMaybeJSON(item.arguments ?? {}),
         },
       });
+      attachReasoning(messages[messages.length - 1]);
       continue;
     }
 
@@ -1399,6 +1591,7 @@ function responsesInputToChatMessages(input) {
           arguments: JSON.stringify({ input: typeof item.input === "string" ? item.input : stringifyMaybeJSON(item.input ?? "") }),
         },
       });
+      attachReasoning(messages[messages.length - 1]);
       continue;
     }
 
@@ -1418,6 +1611,7 @@ function responsesInputToChatMessages(input) {
         type: "function",
         function: { name: "tool_search", arguments: stringifyMaybeJSON(item.arguments ?? {}) },
       });
+      attachReasoning(messages[messages.length - 1]);
       continue;
     }
 
@@ -1435,7 +1629,13 @@ function responsesInputToChatMessages(input) {
       continue;
     }
 
-    if (type === "reasoning") continue; // 思考条目: 自定义模型无对应概念, 跳过
+    if (type === "reasoning") {
+      // 思考条目: 自定义模型无 thinking 概念, 但 DeepSeek 系要求历史 assistant(tool_calls)
+      // 回传 reasoning —— 取文本附着到随后的 assistant 消息 (encrypted_content 无明文, 取不到则留空)
+      const t = responsesReasoningText(item);
+      if (t) pendingReasoning = t;
+      continue;
+    }
 
     if (type === "item_reference") {
       warnSkippedItemType(type);
@@ -1448,12 +1648,13 @@ function responsesInputToChatMessages(input) {
 }
 
 /** 把 Responses 请求体转换为 chat/completions 请求体 */
-function responsesToChatRequest(body, sessionKey) {
+function responsesToChatRequest(body, sessionKey, ctx = {}) {
   const mapped = body.model; // model 由调用方 (pickModel) 决策后覆盖
   const messages = [];
   if (body.instructions) messages.push({ role: "system", content: body.instructions });
   const { messages: inputMessages, additionalTools } = responsesInputToChatMessages(body.input);
   messages.push(...inputMessages);
+  backfillReasoning(messages, ctx.session); // 同 Anthropic 链路 (见 REASONING_BRIDGE)
   const req = { model: mapped, messages, stream: !!body.stream };
   // 钳制 max_output_tokens 到最小 16 (部分上游模型要求, 如 gpt-5.6-sol)
   if (body.max_output_tokens != null) req.max_tokens = Math.max(16, body.max_output_tokens);
@@ -1678,6 +1879,12 @@ class ResponsesStreamConverter {
     this.stopReason = "completed";
     this.pending = "";
     this.rawUsage = null; // 最后一次完整 usage 对象 (供日志输出)
+    this.reasoningText = ""; // 上游 reasoning 原文 (供会话缓存; Codex 侧暂不下发 reasoning 条目)
+  }
+
+  /** 供调用方记录会话缓存: reasoning 原文 + 本次响应的 tool_call id */
+  reasoningRecord() {
+    return { text: this.reasoningText, ids: Object.values(this.toolStates).map((s) => s.callId).filter(Boolean) };
   }
 
   push(rawText) {
@@ -1713,6 +1920,10 @@ class ResponsesStreamConverter {
     if (!json.choices || !json.choices.length) return;
     const choice = json.choices[0];
     const delta = choice.delta || {};
+
+    // 思考增量: 仅累积供会话缓存 (Codex 侧的 reasoning 条目暂不下发)
+    const rdelta = extractReasoning(delta);
+    if (rdelta) this.reasoningText += rdelta;
 
     if (!this.started) {
       this.started = true;
@@ -1978,6 +2189,27 @@ async function upstreamFetch(url, init, requestedModel, signal, isFallback = tru
 const ROTATE_STATUSES = new Set([403, 404, 408, 429, 500, 502, 503, 504]);
 
 /**
+ * 400 的例外白名单: 一般 400 (请求体非法/key 无效/超限) 换任何模型结果一样, 不轮换;
+ * 但"**模型状态/能力错配**"类 400 换模型确实可解 (如 thinking 模型的 reasoning 回传要求、
+ * 模型不支持图片), 单列出来允许轮换。匹配错误体摘要 (upstreamBodyBrief)。
+ */
+const ROTATE_400_PATTERNS = [
+  /reasoning_content.*must be passed back/i,
+  /thinking mode/i,
+  /does not support (?:image|vision|multimodal)/i,
+  /(?:image|vision|multimodal).*not supported/i,
+];
+
+/** 用已读出的文本重建 Response (400 探测错误体时原流已被消费, 不轮换需原样透传) */
+function rebuildResponse(r, text) {
+  try {
+    return new Response(text, { status: r.status, statusText: r.statusText, headers: r.headers });
+  } catch {
+    return r; // 重建失败 (旧运行时无全局 Response): 退回原响应
+  }
+}
+
+/**
  * 上游请求统一入口 (四个转发路径共用)。
  * 轮换语义 (switchOnFail=true 时):
  *   - 候选列表按请求类型: 文本请求 -> defaultModels, 带图请求 (isImage) -> defaultVisionModels;
@@ -2046,21 +2278,21 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       lastErr = r;
       // 用户显式指定模型失败不冷却 (不去猜测能力), 只轮换; 回退/默认候选照常冷却
       if (!isUserModel) markModelFail(model);
-      // 带图请求: 图片不支持的报错就是 400 (This model does not support image), 400 也轮换
-      if (isImage && r.status === 400) {
-        if (i + 1 < candidates.length) {
-          const brief = await upstreamBodyBrief(r);
+      // 400 例外: 带图请求 (图片不支持的报错就是 400) 与状态/能力错配类 400 也轮换
+      if (r.status === 400) {
+        const brief = await upstreamBodyBrief(r); // 已消费 body: 不轮换时必须重建响应再透传
+        const stateMiss = ROTATE_400_PATTERNS.some((re) => re.test(brief));
+        if ((isImage || stateMiss) && i + 1 < candidates.length) {
           if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: i + 1, total: candidates.length });
-          console.warn(TAGW, `${pfx}上游 400 (${model}), 带图轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
-          discardBody(r);
+          console.warn(TAGW, `${pfx}上游 400 (${model}), ${isImage ? "带图" : "状态错配"}轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
           continue;
         }
         if (onModel) onModel(model);
-        return r; // 全部候选试完: 透传最后一次上游响应给客户端
+        return rebuildResponse(r, brief); // 不轮换 / 候选已试完: 原样透传 (含全部候选带图都失败)
       }
       if (!ROTATE_STATUSES.has(r.status)) {
         if (onModel) onModel(model);
-        return r; // 400/401/413 等换模型无济于事的失败: 不轮换, 原样透传 (已计冷却)
+        return r; // 401/413/422 等换模型无济于事的失败: 不轮换, 原样透传 (已计冷却)
       }
       if (i + 1 < candidates.length) {
         const brief = await upstreamBodyBrief(r);
@@ -2536,7 +2768,7 @@ let nextSessionId = 1;
 function getSession(key) {
   let s = sessions.get(key);
   if (!s) {
-    s = { id: nextSessionId++, reqSeq: 0, pending: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null };
+    s = { id: nextSessionId++, reqSeq: 0, pending: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null, reasoning: null };
     sessions.set(key, s);
   }
   return s;
@@ -2960,7 +3192,9 @@ const server = http.createServer(async (req, res) => {
       const routed = visionRoute(finalDecision, finalImage);
       warnVisionRoute(routed, sessTag);
       body.model = routed.model;
-      const oaiReq = anthropicToOpenAIRequest(body, sessionKey);
+      // 客户端本次是否请求了 thinking (决定入站是否把上游 reasoning 还原成 thinking 块)
+      const wantThinking = THINKING_PASSTHROUGH && !!body.thinking && body.thinking.type !== "disabled";
+      const oaiReq = anthropicToOpenAIRequest(body, sessionKey, { session });
       // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选是最终决策的模型
       const upstreamBodyJson = JSON.stringify(oaiReq);
       req._cmdc.mapped = oaiReq.model;
@@ -3009,7 +3243,8 @@ const server = http.createServer(async (req, res) => {
         try {
           const oai = JSON.parse(text);
           req._cmdc.usage = normalizeUsage(oai.usage);
-          const anthropic = openAIToAnthropic(oai, requested);
+          const anthropic = openAIToAnthropic(oai, requested, { emitThinking: wantThinking });
+          recordResponseReasoning(session, oai); // 记入会话缓存, 供后续轮次出站回填
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(anthropic));
         } catch (e) {
@@ -3027,8 +3262,9 @@ const server = http.createServer(async (req, res) => {
         res.end(text);
         return;
       }
-      const conv = new StreamConverter(requested, estimateInputTokens(body));
+      const conv = new StreamConverter(requested, estimateInputTokens(body), wantThinking);
       await pumpConvertedStream(up, conv, res, "messages", releaseUp);
+      recordStreamReasoning(session, conv); // 记入会话缓存, 供后续轮次出站回填
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
       return;
     }
@@ -3103,7 +3339,7 @@ const server = http.createServer(async (req, res) => {
       if (session) session.pending = (session.pending || 0) + 1;
       logReq();
 
-      const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey);
+      const { chat: chatReq, customToolNames } = responsesToChatRequest(body, sessionKey, { session });
       // 带图请求: 按请求类型 (text/image) 选择轮换列表; 首个候选仍是解析后的模型
       const isImage = openAIMessagesHaveImages(chatReq.messages);
       // 带图前置路由 (visionAutoRoute): 转换后确认带图, 且模型判定不支持视觉时改走 defaultVisionModels[0]
@@ -3162,6 +3398,7 @@ const server = http.createServer(async (req, res) => {
           const oai = JSON.parse(text);
           req._cmdc.usage = normalizeUsage(oai.usage);
           const respObj = chatResponseToResponses(oai, requested, customToolNames);
+          recordResponseReasoning(session, oai); // 记入会话缓存, 供后续轮次出站回填
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(respObj));
         } catch (e) {
@@ -3180,6 +3417,7 @@ const server = http.createServer(async (req, res) => {
       }
       const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body), customToolNames);
       await pumpConvertedStream(up, conv, res, "responses", releaseUp);
+      recordStreamReasoning(session, conv); // 记入会话缓存, 供后续轮次出站回填
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
       return;
     }
@@ -3234,6 +3472,10 @@ server.listen(PORT, HOST, () => {
   console.log(cBlue(`  失败轮换   : ${defaultModels.length < 2 && defaultVisionModels.length < 2 ? "不适用 (列表仅一个模型, 不轮换)" : `${sofDesc} (失败1次即切换 + ${FAIL_TTL / 1000}s 冷却)`}`));
   console.log(cBlue(`  历史图清理 : ${CLEAN_HISTORY_IMAGES ? "开启 (无新图请求时剥离历史图, 回流请求指定模型)" : "关闭 (历史图随上下文保留)"}`));
   console.log(cBlue(`  tool结果图 : ${TOOL_RESULT_IMAGES ? "保留 (注入 user 消息透传)" : "丢弃 (折叠为 [image])"}`));
+  const rbDesc = !REASONING_BRIDGE
+    ? "关闭 (thinking 模型工具循环可能 400)"
+    : `开启 (回填 reasoning${REASONING_PLACEHOLDER ? " + 占位兜底" : ""}${THINKING_PASSTHROUGH ? " + thinking 透传" : ""})`;
+  console.log(cBlue(`  reasoning  : ${rbDesc}`));
   const catalogTs = modelCatalog && modelCatalog.fetchedAt
     ? new Date(modelCatalog.fetchedAt).toLocaleString("zh-CN", { hour12: false })
     : "";

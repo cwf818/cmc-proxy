@@ -208,8 +208,8 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 2. **候选序列**：`pickModel` 决策出的模型（尊重客户端显式意图，含 `blockedModels` 中的模型）作为**首个候选**，随后按类型列表顺序补全并去重。每次尝试都会重写请求体里的 `model` 字段——上游实际收到的模型跟着变。
 3. **失败 1 次即切换**：不再区分"首个模型/后续模型"，失败立刻换下一个候选。
 4. **TTL 冷却（只对回退到默认的模型生效）**：失败模型进入冷却（`config.failTTL`，默认 30000ms），冷却期内**跨请求**也跳过该模型并打印 `模型 X 冷却中, 跳过`；成功即清除冷却。`failTTL: 0` 关闭冷却。**用户显式指定的模型（经 `modelMap` / 目录解析命中，未落到回退点）不冷却**——不去猜测用户指定模型的能力（如纯文本模型收到带图请求），失败即轮换，下次请求仍从它开始；只有**未带 model 或指定模型解析失败、回退到 `defaultForType` 的模型**（`defaultModels[0]` / `defaultVisionModels[0]`）失败才进入冷却。默认列表里的后续候选（轮换到的 index ≥ 1）无论何种情况都照常冷却。
-5. **哪些失败才轮换**：`403 / 404 / 408 / 429 / 500 / 502 / 503 / 504` 与网络层错误（含首字节超时）。`400 / 401 / 413 / 422` 等（请求体非法、key 无效、body 超限）换任何模型结果都一样，不轮换、直接透传，避免一个失败放大成 N 个——**唯一例外：带图请求的 400 也轮换**（图片不支持的报错就是 400）。注意**任何**非 2xx 都会记入冷却表（用户显式指定模型除外），不轮换的那几类也会让该模型冷却一个 TTL。
-6. **成功即停**：任一候选返回 2xx 即用该响应继续原有流程（流式转换/透传），并把 RES 行的 `model=` 更新为实际生效的模型。
+5. **哪些失败才轮换**：`403 / 404 / 408 / 429 / 500 / 502 / 503 / 504` 与网络层错误（含首字节超时）。`400 / 401 / 413 / 422` 等（请求体非法、key 无效、body 超限）换任何模型结果都一样，不轮换、直接透传，避免一个失败放大成 N 个。**两类 400 例外**：(a) **带图请求的 400**（图片不支持的报错就是 400）；(b) **状态/能力错配类 400** —— 错误体匹配 `reasoning_content ... must be passed back` / `thinking mode` / `does not support image|vision` 等（换模型确实可解，见「reasoning / thinking 桥接」），日志打印 `上游 400 (<model>), 状态错配轮换 → <next>`。为判断是否属于 (b)，400 的响应体会被读取一次用于匹配；**不轮换时用读到的文本重建 Response 原样透传**（body 不丢失）。注意**任何**非 2xx 都会记入冷却表（用户显式指定模型除外），不轮换的那几类也会让该模型冷却一个 TTL。
+6. **成功即停**：任一候选返回 2xx 即用该响应继续原有流程（流式转换/透传），并把 RES 行的 `model=` 更新为实际生效的模型（`reasoningBridge` 的回填在候选切换后依然生效——注入字段被所有候选接受）。
 7. **全部试完**：把**最后一次**尝试的上游响应（状态码 + body）或错误透传给客户端，客户端看到的是真实收尾结果。**每次将被轮换掉的失败尝试都会先补一条 RES 形态的行**（与 REQ 行配对，不必等到最终结果）：`[ts] S1#2 <status> POST /v1/messages model=<model> try=i/N took=<该次耗时> [code=... msg=...]` —— 网络层失败记 `502`（调用方就此收尾会返回的状态）并带 `code=` / `msg=` 摘要，HTTP 失败记上游**真实**状态码（错误体摘要留在随后的 `[cmc-proxy]` 动作行）。随后打印动作行：`上游 <status> (<model>), 轮换 → <next> (i/N): <错误体摘要>` 或 `上游请求失败 (<model>): code=<错误码> msg=<错误信息>, 轮换 → <next> (i/N)`。错误码/信息来自 `e.cause` 链（Node fetch 只抛 `fetch failed`，真正原因是 `ECONNREFUSED` / `ENOTFOUND` / `UND_ERR_CONNECT_TIMEOUT` 等），首字节超时/客户端断开分别标注 `FIRST_BYTE_TIMEOUT` / `CLIENT_ABORT`；502 收尾与客户端错误体同样带 `code=` / `msg=` 摘要，便于定位。终态失败不再补尝试行（由 RES 行负责），避免重复。
 8. **全部在冷却期**：不再发起请求，直接把冷却错误交给调用方（502 收尾）。
 9. **客户端断开立即终止**：不再重试，也不计失败。
@@ -251,6 +251,39 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 - 日志侧：REQ 行显示 `img=N(新M)`——`N` 为请求体中的图片块总数，`新M` 为最后一条 user 消息（本轮）中的新图数；本轮有新图时会话标签加 `@` 前缀（`@S3#3`）。
 - **已知限制**：文本链路的历史图占位符是 `[历史图片已清理]`，而 `tool_result` 折叠用的占位符是 `[image]`。带图轮次的图在下一轮变成占位文本时，tool 消息内容与上一轮不同（`[image]` → `[历史图片已清理]`）、其后的 user 消息里注入的真图也消失，RES 行会触发一次 `pfx~N` 分叉（缓存断一次）。统一两处占位符只能让 tool 消息跨轮字节一致（分叉点后移一条消息），**消除不了这次缓存断**——真图从上下文消失是剥离历史图的固有代价。
 
+### reasoning / thinking 桥接（DeepSeek 工具循环 400）
+
+DeepSeek 系 thinking 模型有一条**硬要求**：当历史里出现 `assistant(tool_calls)` 且**对话以 tool 结果结尾**（即模型正在续写工具循环）时，`messages` 里**每一条** `assistant(tool_calls)` 都必须回传**非空** `reasoning_content`，否则上游直接 400：
+
+```
+The `reasoning_content` in the thinking mode must be passed back to the API.
+```
+
+实测边界（`deepseek/deepseek-v4.1-flash`）：
+
+| 历史形态 | 结果 |
+| --- | --- |
+| `user, a(call), tool`（尾 = tool 结果） | ❌ 400 |
+| `user, a(call), tool, user`（尾 = user，循环已闭合） | ✅ 200（无要求） |
+| 两条 `a(call)`，只给**最后**一条带 reasoning | ❌ 400（**每一条都要**） |
+| 两条 `a(call)`，只给**第一**条带 reasoning | ❌ 400 |
+| `reasoning_content: ""` 空串 | ❌ 400（等同没带） |
+| 全部带（`reasoning_content` / `reasoning` / `reasoning_details` 任一形态） | ✅ 200 |
+
+Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thinking, signature}`），但转换层此前**出站和入站两个方向都把它丢掉了**：客户端拿不到 thinking（无从回传），上游拿不到 reasoning（直接 400）——表现为"工具循环第一跳就 400，日志 `rt:N` 明明有思考量"。修复分三层：
+
+| 开关（config.json）   | 默认                  | 作用 |
+| --------------------- | --------------------- | ---- |
+| `reasoningBridge`     | `true`                | **出站回填**：每条 `assistant(tool_calls)` 都补非空 `reasoning_content`，取值优先级 **① 客户端 thinking 块原文 → ② 会话级缓存（键 = `tool_call_id`，上游返回时记录）→ ③ 占位串**。**无条件**回填（不按"本轮是否以 tool 结尾"分支），保证同一历史消息跨请求逐字节一致、不制造前缀分叉 |
+| `thinkingPassthrough` | `true`                | **入站回传**：客户端本次请求了 `thinking`（`body.thinking.type !== "disabled"`）时，把上游 `reasoning` 还原为 thinking 块（`thinking_delta` + 合成 `signature_delta`），让 CC 可见、可在下一轮原样回传。未请求 thinking 的会话**逐字节零变化** |
+| `reasoningPlaceholder`| `"(reasoning omitted)"` | 无真内容可回填时的兜底串（上游只要求非空）。显式配为 `""` = 关闭兜底（宁可 400 也不伪造） |
+
+- **会话缓存**：上游每次返回的 reasoning 都按响应里的 `tool_call_id` 记入 `session.reasoning`（FIFO 上限 128 条）。因此即使客户端**不回传** thinking 块（未开 thinking / 历史被压缩改写 / 反代重启后旧的轮次），也能用**真实**思考文本回填，而不是占位串。
+- **签名**：真实 `signature` 是 Anthropic 的不透明凭据（本链路上游非 Anthropic，不校验），用思考文本的 sha1 生成**确定性**签名（同文本同签名），不抽签、不破坏前缀缓存。
+- **Codex/Responses 链路**：同样处理——`reasoning` 条目文本附着到紧随的 `function_call` 对应的 assistant 消息；出站同样回填（Codex 侧暂不下发 reasoning 条目）。
+- **仅带 `tool_calls` 的 assistant 轮次**回填（纯文本轮次无此要求，不注入）。
+- **兼容性**：实测其余轮换候选（`z-ai/glm-5.3-flash`、`deepseek-v4-flash-vision-exp`、`Qwen/Qwen3.8-*`、`xiaomi/mimo-v2.5`）**都接受**该字段（忽略），所以注入不影响轮换。
+
 ## 配置项速查
 
 | 键                         | 默认                                  | 说明                                                                                                                                                   |
@@ -268,6 +301,9 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 | `modelCatalog`             | 未配置（无默认）                      | 模型参数数据文件路径（相对 `proxy.js` 目录），仅显式配置时加载；存在且解析成功时用于计算单次请求的额度，文件缺失/解析失败静默跳过                      |
 | `blockedModels`            | `[]`                                  | 从 `/v1/models` 列表隐藏（避免客户端误选）；**转发时不拦截**，命中只打印一次性告警                                                                     |
 | `cleanHistoryImages`       | `false`                               | 本轮无新图时把历史图片块替换为 `[历史图片已清理]`（见「多模态」）                                                                                      |
+| `reasoningBridge`          | `true`                                | thinking 模型工具循环的 `reasoning_content` 出站回填（见「reasoning / thinking 桥接」）                                                                |
+| `thinkingPassthrough`      | `true`                                | 客户端请求了 `thinking` 时把上游 `reasoning` 还原为 thinking 块（同上）                                                                                |
+| `reasoningPlaceholder`     | `"(reasoning omitted)"`                | 无真内容可回填时的兜底串；`""` 关闭兜底（同上）                                                                                                       |
 | `toolResultImages`         | `true`                                | `tool_result` 内嵌图片保留并注入后续 user 消息；`false` 折叠为 `[image]`                                                                               |
 | `visionAutoRoute`          | `true`                                | 带图请求前置路由：模型判定不支持视觉则改走 `defaultVisionModels[0]`（见「多模态」）                                                                    |
 | `jsonlLog`                 | 关闭                                  | 结构化 JSONL 请求日志：`true` 写 `requests.jsonl`，字符串为自定义路径；`false`/缺省关闭（见「结构化请求日志 (JSONL)」）                                |

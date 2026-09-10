@@ -272,12 +272,25 @@ The `reasoning_content` in the thinking mode must be passed back to the API.
 
 Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thinking, signature}`），但转换层此前**出站和入站两个方向都把它丢掉了**：客户端拿不到 thinking（无从回传），上游拿不到 reasoning（直接 400）——表现为"工具循环第一跳就 400，日志 `rt:N` 明明有思考量"。修复分三层：
 
-| 开关（config.json）   | 默认                  | 作用 |
-| --------------------- | --------------------- | ---- |
-| `reasoningBridge`     | `true`                | **出站回填**：每条 `assistant(tool_calls)` 都补非空 `reasoning_content`，取值优先级 **① 客户端 thinking 块原文 → ② 会话级缓存（键 = `tool_call_id`，上游返回时记录）→ ③ 占位串**。**无条件**回填（不按"本轮是否以 tool 结尾"分支），保证同一历史消息跨请求逐字节一致、不制造前缀分叉 |
-| `thinkingPassthrough` | `true`                | **入站回传**：客户端本次请求了 `thinking`（`body.thinking.type !== "disabled"`）时，把上游 `reasoning` 还原为 thinking 块（`thinking_delta` + 合成 `signature_delta`），让 CC 可见、可在下一轮原样回传。未请求 thinking 的会话**逐字节零变化** |
-| `reasoningPlaceholder`| `"(reasoning omitted)"` | 无真内容可回填时的兜底串（上游只要求非空）。显式配为 `""` = 关闭兜底（宁可 400 也不伪造） |
-| `reasoningMaxChars`   | `0`（不截断）         | 回填 reasoning 的**字符上限**：控制回填文本占用上下文窗口的体积（见下「上下文体积」）。截断确定性，不破坏前缀缓存 |
+**只有一个开关**（两个方向是同一件事，拆成多个键只会费解）：
+
+```jsonc
+"reasoningBridge": true                      // 默认：出站回填 + 入站 thinking 透传，不截断
+"reasoningBridge": false                     // 关闭（恢复旧行为：工具循环会 400）
+"reasoningBridge": { "maxChars": 500 }        // 细调：每条回填最多 500 字符
+"reasoningBridge": { "passthrough": false }   // 细调：只修 400，不下发 thinking 块
+```
+
+| 字段 | 默认 | 作用 |
+| ---- | ---- | ---- |
+| （布尔值） | `true` | 开/关总闸。开启后：**出站**每条 `assistant(tool_calls)` 都补非空 `reasoning_content`，取值优先级 **① 客户端 thinking 块原文 → ② 会话级缓存（键 = `tool_call_id`，上游返回时记录）→ ③ 占位串**（**无条件**回填，不按"本轮是否以 tool 结尾"分支，保证同一历史消息跨请求逐字节一致、不制造前缀分叉）；**入站**客户端请求了 `thinking`（`body.thinking.type !== "disabled"`）时把上游 `reasoning` 还原为 thinking 块（`thinking_delta` + 合成 `signature_delta`）。未请求 thinking 的会话**逐字节零变化** |
+| `maxChars` | `0`（不截断） | 回填 reasoning 的**字符上限**：控制回填文本占用上下文窗口的体积（见下「上下文体积」）。截断确定性，不破坏前缀缓存 |
+| `passthrough` | `true` | `false` = 只做出站回填（修 400）、不下发 thinking 块。入库的 thinking 块只进客户端历史 |
+| `placeholder` | `"(reasoning omitted)"` | 无真内容可回填时的兜底串（上游只要求非空）。配 `""` = 关闭兜底（宁可 400 也不伪造） |
+
+> **入站方向为什么不需要单独开关**：客户端自己的 `thinking` 设置已经决定要不要 thinking（CC 2.1.241 实测默认发 `{"type":"adaptive","display":"omitted"}`），反代只负责“要就给”，无需再加一个维度。
+>
+> **真实 CC 端到端验证**（2.1.241，2026-09）：CC 请求 thinking 时，反代下发的 `thinking` 块（含合成签名 `cmc-…`）**被 CC 接受**（无报错、exit 0），且 CC **会在下一轮原样回传**该块（`thinking_msgs_in_request=1`）—— 回填因此优先拿到客户端原文，占位串只是最后兜底。
 
 - **会话缓存**：上游每次返回的 reasoning 都按响应里的 `tool_call_id` 记入 `session.reasoning`（FIFO 上限 128 条）。因此即使客户端**不回传** thinking 块（未开 thinking / 历史被压缩改写 / 反代重启后旧的轮次），也能用**真实**思考文本回填，而不是占位串。
 - **签名**：真实 `signature` 是 Anthropic 的不透明凭据（本链路上游非 Anthropic，不校验），用思考文本的 sha1 生成**确定性**签名（同文本同签名），不抽签、不破坏前缀缓存。
@@ -330,9 +343,7 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 | `modelCatalog`             | 未配置（无默认）                      | 模型参数数据文件路径（相对 `proxy.js` 目录），仅显式配置时加载；存在且解析成功时用于计算单次请求的额度，文件缺失/解析失败静默跳过                      |
 | `blockedModels`            | `[]`                                  | 从 `/v1/models` 列表隐藏（避免客户端误选）；**转发时不拦截**，命中只打印一次性告警                                                                     |
 | `cleanHistoryImages`       | `false`                               | 本轮无新图时把历史图片块替换为 `[历史图片已清理]`（见「多模态」）                                                                                      |
-| `reasoningBridge`          | `true`                                | thinking 模型工具循环的 `reasoning_content` 出站回填（见「reasoning / thinking 桥接」）                                                                |
-| `thinkingPassthrough`      | `true`                                | 客户端请求了 `thinking` 时把上游 `reasoning` 还原为 thinking 块（同上）                                                                                |
-| `reasoningPlaceholder`     | `"(reasoning omitted)"`                | 无真内容可回填时的兜底串；`""` 关闭兜底（同上）                                                                                                       |
+| `reasoningBridge`          | `true`                                | reasoning/thinking 桥接总开关：`true`/`false`，或对象细调 `{maxChars, passthrough, placeholder}`（见「reasoning / thinking 桥接」）                    |
 | `toolResultImages`         | `true`                                | `tool_result` 内嵌图片保留并注入后续 user 消息；`false` 折叠为 `[image]`                                                                               |
 | `visionAutoRoute`          | `true`                                | 带图请求前置路由：模型判定不支持视觉则改走 `defaultVisionModels[0]`（见「多模态」）                                                                    |
 | `jsonlLog`                 | 关闭                                  | 结构化 JSONL 请求日志：`true` 写 `requests.jsonl`，字符串为自定义路径；`false`/缺省关闭（见「结构化请求日志 (JSONL)」）                                |

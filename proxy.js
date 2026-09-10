@@ -164,20 +164,25 @@ const SERIALIZE_SESSION = config.serializeSessionRequests !== false; // 同会�
 const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout ?? "120000", 10); // 上游响应头超时 ms (0=关闭; ?? 保证显式 0 不被默认值覆盖)
 const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内嵌图片保留 (注入随后的 user 消息透传上游)
 const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
-// reasoning 桥接。DeepSeek 系 thinking 模型在"历史含 assistant(tool_calls) 且对话以 tool 结果
-// 结尾"时, 要求**每一条** assistant(tool_calls) 都回传非空 reasoning_content, 否则 400
+// reasoning 桥接 (单一开关, 见 README「reasoning / thinking 桥接」)。DeepSeek 系 thinking 模型在
+// "历史含 assistant(tool_calls) 且对话以 tool 结果结尾"时, 要求**每一条** assistant(tool_calls)
+// 都回传非空 reasoning_content, 否则 400
 // "The `reasoning_content` in the thinking mode must be passed back to the API."
-// Anthropic 侧对应 thinking 块, 但转换层此前出/入两个方向都把它丢了 —— 客户端无从回传,
-// 上游直接 400 (工具循环第一步就断)。开启后:
-//   出站 (reasoningBridge): 每条 assistant(tool_calls) 按 thinking 原文 → 会话缓存 → 占位串
-//     三层回填 reasoning_content; **无条件**回填 (不按是否以 tool 结尾分支), 保证前缀字节稳定
-//   入站 (thinkingPassthrough): 客户端请求了 thinking 时, 把上游 reasoning 还原为 thinking 块
-const REASONING_BRIDGE = config.reasoningBridge !== false;
-const THINKING_PASSTHROUGH = config.thinkingPassthrough !== false;
-// 无真内容可回填时的兜底串 (非空即可满足上游); 显式配置为 "" 则关闭兜底 (宁可 400 也不造假)
-const REASONING_PLACEHOLDER = typeof config.reasoningPlaceholder === "string" ? config.reasoningPlaceholder : "(reasoning omitted)";
+// Anthropic 侧对应 thinking 块, 但转换层此前出/入两个方向都把它丢了 —— 客户端无从回传, 上游直接 400。
+// 一个开关管两个方向 (两者是同一件事, 拆开只会让人费解):
+//   出站: 每条 assistant(tool_calls) 按 thinking 原文 → 会话缓存 → 占位串 三层回填 reasoning_content;
+//         **无条件**回填 (不按是否以 tool 结尾分支), 保证前缀字节稳定
+//   入站: 客户端请求了 thinking 时, 把上游 reasoning 还原为 thinking 块 (客户端自己的 thinking 设置
+//         已经决定要不要, 无需再单设一个开关)
+//   config: true/缺省 = 开; false = 关; {maxChars, passthrough, placeholder} = 细调 (均可选)
+const RB_CFG = config.reasoningBridge;
+const RB_OBJ = RB_CFG && typeof RB_CFG === "object" ? RB_CFG : {};
+const REASONING_BRIDGE = RB_CFG !== false;
+const THINKING_PASSTHROUGH = REASONING_BRIDGE && RB_OBJ.passthrough !== false;
+// 无真内容可回填时的兜底串 (非空即可满足上游); 配 "" 则关闭兜底 (宁可 400 也不伪造)
+const REASONING_PLACEHOLDER = typeof RB_OBJ.placeholder === "string" ? RB_OBJ.placeholder : "(reasoning omitted)";
 // 回填文本的字符上限 (0 = 不截断): 控制 reasoning 占用上下文窗口的体积, 截断确定性、不破坏缓存
-const REASONING_MAX_CHARS = Math.max(0, parseInt(config.reasoningMaxChars ?? "0", 10) || 0);
+const REASONING_MAX_CHARS = Math.max(0, parseInt(RB_OBJ.maxChars ?? "0", 10) || 0);
 const RESOLVE_MODEL = config.resolveModel !== false; // modelMap 未命中时是否目录解析+回退默认 (false=原样向上游请求)
 const VISION_AUTO_ROUTE = config.visionAutoRoute !== false; // 带图前置路由: 请求模型判定不支持视觉时, 不发它而改走 defaultVisionModels[0]
 

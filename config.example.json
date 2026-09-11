@@ -12,7 +12,7 @@
   "_带图前置路由说明": "visionAutoRoute: 带图请求前置路由开关 (默认 true)。true 时, 请求带图且决策出的模型判定不支持视觉 (判定为 modelCatalog 的 vision 字段与 defaultVisionModels 白名单的并集: 在名单内 / catalog vision:true 视为支持), 则不发该模型、改走 defaultVisionModels[0]; false 时保持现状 (先按原模型发, 失败靠 switchOnFail 轮换)。",
   "visionAutoRoute": true,
   "_历史图清理说明": "cleanHistoryImages: true 时, /v1/messages 转换链路检测到本轮(最后一条 user 消息)无新图, 会把历史里的图片块原位替换为占位文本 [历史图片已清理] 再转发 —— 历史图上游同样 400, 剥离后请求可安全回流默认模型, 带图路由只看新图, 会话不再被历史图钉死在视觉模型。替换确定性, 不破坏前缀缓存。默认 false。",
-  "cleanHistoryImages": true,
+  "cleanHistoryImages": false,
   "_tool结果图说明": "toolResultImages: false 时丢弃 tool_result 内嵌图片 (折叠为 [image] 占位), 默认保留 (注入随后 user 消息透传)。",
   "toolResultImages": true,
   "_reasoning桥接说明": "reasoningBridge: 单个开关管两个方向 (默认 true)。DeepSeek 系 thinking 模型在'历史含 assistant(tool_calls) 且对话以 tool 结果结尾'时, 要求每条 assistant(tool_calls) 都回传非空 reasoning_content, 否则 400。true/缺省 = 出站回填 (thinking 原文 -> 会话缓存 -> 占位串) + 入站把上游 reasoning 还原为 thinking 块 (仅当客户端请求了 thinking); false = 关闭 (恢复旧行为)。细调用对象: {maxChars: 500 = 每条回填的字符上限(默认 0 不截断, 控制上下文体积, 截断确定性不破坏缓存), passthrough: false = 只修 400 不下发 thinking 块, placeholder: '(reasoning omitted)' = 无真内容时的兜底串, '' 则宁可 400 也不伪造}。",
@@ -51,13 +51,13 @@
   "_默认模型说明": "defaultModels: 文本请求的轮换列表, 第一个作为文本默认模型。失败 1 次即切换, TTL 冷却后重试。模型 id 见 /v1/models。",
   "defaultModels": [
     "deepseek/deepseek-v4.1-flash",
-    "deepseek/deepseek-v4-flash-vision-exp",
     "z-ai/glm-5.3-flash",
     "Qwen/Qwen3.8-27B",
     "xiaomi/mimo-v2.5"
   ],
   "_视觉模型说明": "defaultVisionModels: 带图请求的轮换列表, 第一个作为视觉默认模型 (未带 model 的带图请求直接用它)。带图请求按此列表轮换找能处理图片的模型。",
   "defaultVisionModels": [
+    "deepseek/deepseek-v4.1-flash",
     "xiaomi/mimo-v2.5",
     "z-ai/glm-5.3-flash",
     "Qwen/Qwen3.8-27B"

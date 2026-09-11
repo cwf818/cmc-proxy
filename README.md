@@ -20,6 +20,7 @@
 - **会话级访问日志**：按 `x-claude-code-session-id` / `session-id` / `thread-id` 稳定归因，两行日志（REQ/RES）配对 + 缓存命中率 / 生成速度 / 前缀分叉 / 累计用量统计
 - **结构化 JSONL 请求日志**（`config.json` `jsonlLog`）：把与 REQ/RES 两行同源的当次请求数据在 RES 输出时写一条 JSON 到 `requests.jsonl`，供离线分析（独立于 `CMC_LOGGING_FILE` 分级落盘）
 - 支持流式 SSE 透传、token 用量上报、模型列表过滤、分级请求落盘（环境变量 `CMC_LOGGING_FILE`）
+- 配置文件默认模型改成了最新的 deepseek-v4.1-flash，已经支持视觉，所以顺便把清历史图也关掉了（需要仍然可以打开，但token节约不大）。
 
 ---
 
@@ -83,10 +84,10 @@ node build.js --out dist       # 自定义输出目录
   cmc-proxy 已启动
   监听地址   : http://127.0.0.1:5411
   上游端点   : https://api.commandcode.ai/provider
-  默认模型   : deepseek/deepseek-v4-flash(默认) → deepseek/deepseek-v4-flash-vision-exp → …
-  视觉模型   : xiaomi/mimo-v2.5(默认) → z-ai/glm-5.3-flash → Qwen/Qwen3.8-27B
+  默认模型   : deepseek/deepseek-v4.1-flash(默认) → z-ai/glm-5.3-flash → Qwen/Qwen3.8-27B
+  视觉模型   : deepseek/deepseek-v4.1-flash(默认) → xiaomi/mimo-v2.5 → z-ai/glm-5.3-flash → Qwen/Qwen3.8-27B
   失败轮换   : 对象 {text:true, image:true} (失败1次即切换 + 30s 冷却)
-  历史图清理 : 开启 (无新图请求时剥离历史图, 回流请求指定模型)
+  历史图清理 : 关闭 (历史图随上下文保留)
   tool结果图 : 保留 (注入 user 消息透传)
 ----------------------------------------------------------
   Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:5411
@@ -151,22 +152,23 @@ export OPENAI_MODEL=deepseek-v4-flash
 
 GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider），也不含 GPT-5.5 及以下。实测可用的模型（2026-08）：
 
-| 模型 ID                                            | 视觉                    | 说明                                            |
-| -------------------------------------------------- | ----------------------- | ----------------------------------------------- |
-| `deepseek/deepseek-v4-flash`                       | ❌ 纯文本（带图必 400） | **默认模型**，DeepSeek V4 Flash，速度快性价比高 |
-| `deepseek/deepseek-v4-flash-vision-exp`            | ✅                      | DeepSeek V4 Flash Vision（实验版，支持视觉）    |
-| `deepseek/deepseek-v4-pro`                         | 未实测                  | DeepSeek V4 Pro                                 |
-| `z-ai/glm-5.3-flash`                               | ✅                      | 智谱 GLM-5.3 Flash                              |
-| `Qwen/Qwen3.8-27B`                                 | ✅                      | 阿里 Qwen 3.8 27B                               |
-| `xiaomi/mimo-v2.5`                                 | ✅                      | 小米 MiMo V2.5                                  |
-| `gpt-5.6-sol`                                      | 未实测                  | GPT 编码/智能体能力强，Codex 系                 |
-| `moonshotai/Kimi-K2.7-Code` / `moonshotai/Kimi-K3` | 未实测                  | Kimi 编码系                                     |
-| `zai-org/GLM-5.3` / `zai-org/GLM-5.2`              | 未实测                  | 智谱 GLM                                        |
-| `Qwen/Qwen3.8-Max` / `Qwen/Qwen3.7-Flash`          | 未实测                  | 阿里 Qwen                                       |
-| `MiniMaxAI/MiniMax-M3`                             | 未实测                  | MiniMax                                         |
-| `xai/grok-4.6`                                     | 未实测                  | Grok                                            |
-| `xiaomi/mimo-v2.5-pro`                             | 未实测                  | 小米，限时高折扣                                |
-| `tencent/hy3-paid`                                 | 未实测                  | 腾讯                                            |
+| 模型 ID                                            | 视觉                    | 说明                                             |
+| -------------------------------------------------- | ----------------------- | ------------------------------------------------ |
+| `deepseek/deepseek-v4.1-flash`                     | ✅                      | **默认模型**（文本 + 带图），DeepSeek V4.1 Flash |
+| `deepseek/deepseek-v4-flash`                       | ❌ 纯文本（带图必 400） | DeepSeek V4 Flash，速度快性价比高                |
+| `deepseek/deepseek-v4-flash-vision-exp`            | ✅                      | DeepSeek V4 Flash Vision（实验版，支持视觉）     |
+| `deepseek/deepseek-v4-pro`                         | 未实测                  | DeepSeek V4 Pro                                  |
+| `z-ai/glm-5.3-flash`                               | ✅                      | 智谱 GLM-5.3 Flash                               |
+| `Qwen/Qwen3.8-27B`                                 | ✅                      | 阿里 Qwen 3.8 27B                                |
+| `xiaomi/mimo-v2.5`                                 | ✅                      | 小米 MiMo V2.5                                   |
+| `gpt-5.6-sol`                                      | 未实测                  | GPT 编码/智能体能力强，Codex 系                  |
+| `moonshotai/Kimi-K2.7-Code` / `moonshotai/Kimi-K3` | 未实测                  | Kimi 编码系                                      |
+| `zai-org/GLM-5.3` / `zai-org/GLM-5.2`              | 未实测                  | 智谱 GLM                                         |
+| `Qwen/Qwen3.8-Max` / `Qwen/Qwen3.7-Flash`          | 未实测                  | 阿里 Qwen                                        |
+| `MiniMaxAI/MiniMax-M3`                             | 未实测                  | MiniMax                                          |
+| `xai/grok-4.6`                                     | 未实测                  | Grok                                             |
+| `xiaomi/mimo-v2.5-pro`                             | 未实测                  | 小米，限时高折扣                                 |
+| `tencent/hy3-paid`                                 | 未实测                  | 腾讯                                             |
 
 - 完整列表：`curl http://127.0.0.1:5411/v1/models`（已过滤 `blockedModels`，`?raw=1` 看全量）。上游模型目录 60s 缓存，启动时会预热并打印 `刷新上游模型列表成功: N 条`。
 - 换模型：文本请求改 `config.json` 的 `defaultModels`（数组，第一个为文本默认模型），带图请求改 `defaultVisionModels`；或在 `modelMap` 里把特定模型名映射到目标模型后重启。
@@ -365,28 +367,28 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 
 ## 环境变量
 
-| 变量                | 默认   | 作用                                                                                                                          |
-| ------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| `CMDC_API_KEY`      | 未设置 | 优先于 `config.json` 的 `apiKey`                                                                                              |
+| 变量                | 默认   | 作用                                                                                                                                              |
+| ------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CMDC_API_KEY`      | 未设置 | 优先于 `config.json` 的 `apiKey`                                                                                                                  |
 | `CMC_LOGGING_FILE`  | `0`    | 请求落盘分级（写入 `fulllog.log`，滚动只留最近 50 条，见「缓存优化」表）：`0`/未设置 关闭；`1` 严重事件；`2` 1 + 前缀分叉请求；`3` 全部模型类请求 |
-| `CMC_STATS_EVERY`   | `10`   | 每 N 个请求打印一次 TOD/ALL 累计统计                                                                                          |
-| `CMC_DEBUG`         | 未设置 | 设为 `1`：把上游原始流逐 chunk 打到 stderr（`[DBG-UP-messages]` / `[DBG-UP-responses]`，每条截 300 字符）                     |
-| `CMC_DEBUG_PAYLOAD` | 未设置 | 设为 `1`：打印本地请求的完整 headers、`bodyKeys` 与 body 原文（超 8000B 截断）                                                |
-| `NO_COLOR`          | 未设置 | 设置后日志无色（输出非 TTY 时也自动无色）                                                                                     |
+| `CMC_STATS_EVERY`   | `10`   | 每 N 个请求打印一次 TOD/ALL 累计统计                                                                                                              |
+| `CMC_DEBUG`         | 未设置 | 设为 `1`：把上游原始流逐 chunk 打到 stderr（`[DBG-UP-messages]` / `[DBG-UP-responses]`，每条截 300 字符）                                         |
+| `CMC_DEBUG_PAYLOAD` | 未设置 | 设为 `1`：打印本地请求的完整 headers、`bodyKeys` 与 body 原文（超 8000B 截断）                                                                    |
+| `NO_COLOR`          | 未设置 | 设置后日志无色（输出非 TTY 时也自动无色）                                                                                                         |
 
 ## 缓存优化（前缀缓存友好转换）
 
 DeepSeek 等上游的前缀缓存要求**同会话请求的消息前缀逐字节一致**。反代在转换层做了以下保障，默认全部开启：
 
-| 开关（config.json）            | 默认     | 作用                                                                                                                                                                                                                                                               |
-| ------------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `stripSystemReminders`         | `true`   | 整条剥离 Claude Code 2.1.251+ 注入到 `messages` 里的 `role:"system"` 提醒（`<total_tokens>` 配额计数、任务工具催促）——数值随轮次回溯改写，是前缀缓存失效的元凶。仅提示性内容，不影响编码能力，CC 下一轮会重新注入；顶层 `system`（系统提示词 + CLAUDE.md）原样保留 |
-| `stabilizeCounters`            | `true`   | 文本中 `<total_tokens>N tokens left</total_tokens>` 计数就近取整到 100 万（`14977212` → `15000000`），使回溯改写前后字节一致；作为剥离的兜底（防计数出现在其他位置）                                                                                               |
-| `cacheControlPassthrough`      | `true`   | Anthropic `cache_control` 标记透传为 OpenAI content part（对支持显式缓存的后端生效，已验证不影响本上游的缓存键）                                                                                                                                                   |
-| `cacheAffinity`                | `true`   | 按会话注入稳定 `user` / `prompt_cache_key`（Claude Code 取会话 UUID，Codex 透传其自带值），便于上游按会话做缓存路由                                                                                                                                                |
-| `CMC_LOGGING_FILE`（环境变量） | 未设置   | 请求落盘分级：`0`/未设置 关闭；`1` 严重事件（上游失败/超时、客户端中途断开）；`2` 1 + 前缀分叉时落盘该请求（client/upstream 双 body）；`3` 全部模型类请求。写入 `fulllog.log`，分叉/失败条目带标注；**滚动记录，最多保留最近 50 条**（覆盖写，不会持续增长）；记录内不留空行（正文中的多余空行一并压掉），两条记录之间空一行，每条记录头部标签为终端同款 `S{会话}#{请求}`（如 `S5#90`），便于与 REQ/RES 行对照                                       |
-| `serializeSessionRequests`     | `true`   | 同会话上游请求**串行发送**：CC 的会话标题探测请求（4KB，自动起名）与主请求毫秒级并发到达时，中转侧出现过主请求长时间无响应头悬挂；串行化规避并发，排队中的请求若客户端断开会立即出队                                                                               |
-| `firstByteTimeout`             | `120000` | 上游超过该毫秒数未返回响应头时主动中止并返回 502（`0` 关闭）。替代 undici 隐性的 300s 黑盒超时，悬挂请求 2 分钟内可见明确错误                                                                                                                                      |
+| 开关（config.json）            | 默认     | 作用                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stripSystemReminders`         | `true`   | 整条剥离 Claude Code 2.1.251+ 注入到 `messages` 里的 `role:"system"` 提醒（`<total_tokens>` 配额计数、任务工具催促）——数值随轮次回溯改写，是前缀缓存失效的元凶。仅提示性内容，不影响编码能力，CC 下一轮会重新注入；顶层 `system`（系统提示词 + CLAUDE.md）原样保留                                                                                                                                             |
+| `stabilizeCounters`            | `true`   | 文本中 `<total_tokens>N tokens left</total_tokens>` 计数就近取整到 100 万（`14977212` → `15000000`），使回溯改写前后字节一致；作为剥离的兜底（防计数出现在其他位置）                                                                                                                                                                                                                                           |
+| `cacheControlPassthrough`      | `true`   | Anthropic `cache_control` 标记透传为 OpenAI content part（对支持显式缓存的后端生效，已验证不影响本上游的缓存键）                                                                                                                                                                                                                                                                                               |
+| `cacheAffinity`                | `true`   | 按会话注入稳定 `user` / `prompt_cache_key`（Claude Code 取会话 UUID，Codex 透传其自带值），便于上游按会话做缓存路由                                                                                                                                                                                                                                                                                            |
+| `CMC_LOGGING_FILE`（环境变量） | 未设置   | 请求落盘分级：`0`/未设置 关闭；`1` 严重事件（上游失败/超时、客户端中途断开）；`2` 1 + 前缀分叉时落盘该请求（client/upstream 双 body）；`3` 全部模型类请求。写入 `fulllog.log`，分叉/失败条目带标注；**滚动记录，最多保留最近 50 条**（覆盖写，不会持续增长）；记录内不留空行（正文中的多余空行一并压掉），两条记录之间空一行，每条记录头部标签为终端同款 `S{会话}#{请求}`（如 `S5#90`），便于与 REQ/RES 行对照 |
+| `serializeSessionRequests`     | `true`   | 同会话上游请求**串行发送**：CC 的会话标题探测请求（4KB，自动起名）与主请求毫秒级并发到达时，中转侧出现过主请求长时间无响应头悬挂；串行化规避并发，排队中的请求若客户端断开会立即出队                                                                                                                                                                                                                           |
+| `firstByteTimeout`             | `120000` | 上游超过该毫秒数未返回响应头时主动中止并返回 502（`0` 关闭）。替代 undici 隐性的 300s 黑盒超时，悬挂请求 2 分钟内可见明确错误                                                                                                                                                                                                                                                                                  |
 
 配套的**前缀分叉探测**：RES 行在检测到与该会话上一次请求相比前缀发生变化时输出红色标记——`pfx~N`（第 N 条消息变化，索引含 system）、`pfx~tools`（工具定义变化）、`pfx~params`（顶层参数变化，附字段名）、`pfx<N`（历史变短，压缩）；纯追加（健康）不输出。同时打印分叉内容预览（旧/新 JSON 各起一行，便于对齐比较；总预算 140 字符——分叉点在 100 字符内则头部截断 140（140 含尾部 `…`），分叉点在 100 之外则头 49 字符 + `…` + 自分叉点前 20 字符起的 90 字符定位子串（前 20 + 后 70，三段合计恰为 140）；分叉起点至行尾以橙色高亮，其余红色），可直接看出客户端改写了什么。分叉基线按 `tools` 哈希分桶（最多 4 桶），主请求与并发小探测请求互不污染。前缀纯追加时同会话缓存应稳定在 95%+；若出现 `pfx~` 标记即该位置之后本轮必然后缀缓存失效。
 

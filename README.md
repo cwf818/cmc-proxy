@@ -4,7 +4,9 @@
 ![stars](https://img.shields.io/github/stars/cwf818/cmc-proxy)
 ![issues](https://img.shields.io/github/issues/cwf818/cmc-proxy)
 
-把 commandcode 的 Provider API 反代到本机 `127.0.0.1:5411`，让本地 **Claude Code** 和 **Codex** 直接接入你的 GOAT 订阅。大部分其他 Agent （Pi，zcode等）本身可以直连，无需此代理。当然加一层可以更智能些，比如图片请求可以**自动路由**,或上游失败时**自动切换**，还可以看到一些token用量、缓存命中的统计——我喜欢看 tps，快慢自知容易心里踏实。
+把 commandcode 的 Provider API 反代到本机 `127.0.0.1:5411`，让本地 **Claude Code** 和 **Codex** 直接接入你的 GOAT 订阅。大部分其他 Agent （Pi，zcode等）本身可以直连，无需此代理。当然加一层可以更智能些，比如图片请求可以**自动路由**，或上游失败时**自动切换**，还可以看到一些token用量、缓存命中的统计——我喜欢看 tps，快慢自知容易心里踏实。
+
+单笔**消费成本/消耗额度**也可以看了，区分峰谷期计算（时间颜色和^符号），运行前 `node goat-prices.js` 先拉取一下价格，并确保 `"modelCatalog": "goat-prices.json"` 配置项存在。
 
 - **极简**单文件 `proxy.js`，零第三方依赖，无需安装 npm 包，仅需 Node.js ≥ 18（内置 `fetch`/`ReadableStream`），`node proxy.js` 即可启动（都知道要反代了，想必`node` 早就配备了）。
 - **代码安全**，不含任何后门或远程调用，所有请求仅在本机转发到 commandcode 上游；基本上是 AI 代写，使用前可以让 AI 再审查一遍。本身 AI 写一个不难，难的是如何避坑以及设计实用功能，github 找了一圈没找到合适的，所以自己让 AI 帮忙写了一个。遇到的坑包括：CC改历史、变换版本后缀、Codex只支持Responses、鬼知道什么时候配置了记忆生成导致token额外消耗等。反正这里暂时解决了。
@@ -13,11 +15,15 @@
 - **统一模型决策** `pickModel`：`modelMap` 显式映射 → 上游模型目录解析（`resolveModel`）→ 按请求类型回退默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）
 - **失败轮换** `switchOnFail`（支持布尔或 `{text, image}`）：失败 1 次即切换 + `failTTL` 冷却（**只对回退到默认的模型生效**，用户显式指定模型失败不冷却、下次仍从它开始）；文本请求按 `defaultModels`、带图请求按 `defaultVisionModels` 轮换（带图请求 400 也轮换，图片不支持的报错就是 400）
 - **多模态**：`visionAutoRoute` （2026-9-6新增）在带图请求决策出"判定不支持视觉"的模型时**前置改走** `defaultVisionModels[0]`（免上游 400错误请求/200静默盲视）；因为最近调deepseek v4 flash时已经从之前的400变成了200，导致仅靠失败轮换失效；`tool_result` 内嵌图片抽出注入同轮 user 消息透传；`cleanHistoryImages` 可在本轮无新图时清理历史图片，让请求安全回流纯文本模型；REQ 行 `img=N(新M)` 标记 + 会话标签 `@` 前缀
-- **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源
+- **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源。此类信息主要用于调试，正常使用请忽略。
 - **Codex 新协议全兼容**：`custom`（apply_patch freeform）/ `tool_search`（延迟工具发现）/ `namespace` 工具组 / 顶层 `function_call` 历史等新形态全链路支持
 - **会话级访问日志**：按 `x-claude-code-session-id` / `session-id` / `thread-id` 稳定归因，两行日志（REQ/RES）配对 + 缓存命中率 / 生成速度 / 前缀分叉 / 累计用量统计
 - **结构化 JSONL 请求日志**（`config.json` `jsonlLog`）：把与 REQ/RES 两行同源的当次请求数据在 RES 输出时写一条 JSON 到 `requests.jsonl`，供离线分析（独立于 `CMC_LOGGING_FILE` 分级落盘）
 - 支持流式 SSE 透传、token 用量上报、模型列表过滤、分级请求落盘（环境变量 `CMC_LOGGING_FILE`）
+
+---
+
+> 以下内容主要由AI维护
 
 ## 文件说明
 
@@ -261,14 +267,14 @@ The `reasoning_content` in the thinking mode must be passed back to the API.
 
 实测边界（`deepseek/deepseek-v4.1-flash`）：
 
-| 历史形态 | 结果 |
-| --- | --- |
-| `user, a(call), tool`（尾 = tool 结果） | ❌ 400 |
-| `user, a(call), tool, user`（尾 = user，循环已闭合） | ✅ 200（无要求） |
-| 两条 `a(call)`，只给**最后**一条带 reasoning | ❌ 400（**每一条都要**） |
-| 两条 `a(call)`，只给**第一**条带 reasoning | ❌ 400 |
-| `reasoning_content: ""` 空串 | ❌ 400（等同没带） |
-| 全部带（`reasoning_content` / `reasoning` / `reasoning_details` 任一形态） | ✅ 200 |
+| 历史形态                                                                   | 结果                     |
+| -------------------------------------------------------------------------- | ------------------------ |
+| `user, a(call), tool`（尾 = tool 结果）                                    | ❌ 400                   |
+| `user, a(call), tool, user`（尾 = user，循环已闭合）                       | ✅ 200（无要求）         |
+| 两条 `a(call)`，只给**最后**一条带 reasoning                               | ❌ 400（**每一条都要**） |
+| 两条 `a(call)`，只给**第一**条带 reasoning                                 | ❌ 400                   |
+| `reasoning_content: ""` 空串                                               | ❌ 400（等同没带）       |
+| 全部带（`reasoning_content` / `reasoning` / `reasoning_details` 任一形态） | ✅ 200                   |
 
 Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thinking, signature}`），但转换层此前**出站和入站两个方向都把它丢掉了**：客户端拿不到 thinking（无从回传），上游拿不到 reasoning（直接 400）——表现为"工具循环第一跳就 400，日志 `rt:N` 明明有思考量"。修复分三层：
 
@@ -281,12 +287,12 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 "reasoningBridge": { "passthrough": false }   // 细调：只修 400，不下发 thinking 块
 ```
 
-| 字段 | 默认 | 作用 |
-| ---- | ---- | ---- |
-| （布尔值） | `true` | 开/关总闸。开启后：**出站**每条 `assistant(tool_calls)` 都补非空 `reasoning_content`，取值优先级 **① 客户端 thinking 块原文 → ② 会话级缓存（键 = `tool_call_id`，上游返回时记录）→ ③ 占位串**（**无条件**回填，不按"本轮是否以 tool 结尾"分支，保证同一历史消息跨请求逐字节一致、不制造前缀分叉）；**入站**客户端请求了 `thinking`（`body.thinking.type !== "disabled"`）时把上游 `reasoning` 还原为 thinking 块（`thinking_delta` + 合成 `signature_delta`）。未请求 thinking 的会话**逐字节零变化** |
-| `maxChars` | `0`（不截断） | 回填 reasoning 的**字符上限**：控制回填文本占用上下文窗口的体积（见下「上下文体积」）。截断确定性，不破坏前缀缓存 |
-| `passthrough` | `true` | `false` = 只做出站回填（修 400）、不下发 thinking 块。入库的 thinking 块只进客户端历史 |
-| `placeholder` | `"(reasoning omitted)"` | 无真内容可回填时的兜底串（上游只要求非空）。配 `""` = 关闭兜底（宁可 400 也不伪造） |
+| 字段          | 默认                    | 作用                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| （布尔值）    | `true`                  | 开/关总闸。开启后：**出站**每条 `assistant(tool_calls)` 都补非空 `reasoning_content`，取值优先级 **① 客户端 thinking 块原文 → ② 会话级缓存（键 = `tool_call_id`，上游返回时记录）→ ③ 占位串**（**无条件**回填，不按"本轮是否以 tool 结尾"分支，保证同一历史消息跨请求逐字节一致、不制造前缀分叉）；**入站**客户端请求了 `thinking`（`body.thinking.type !== "disabled"`）时把上游 `reasoning` 还原为 thinking 块（`thinking_delta` + 合成 `signature_delta`）。未请求 thinking 的会话**逐字节零变化** |
+| `maxChars`    | `0`（不截断）           | 回填 reasoning 的**字符上限**：控制回填文本占用上下文窗口的体积（见下「上下文体积」）。截断确定性，不破坏前缀缓存                                                                                                                                                                                                                                                                                                                                                                                     |
+| `passthrough` | `true`                  | `false` = 只做出站回填（修 400）、不下发 thinking 块。入库的 thinking 块只进客户端历史                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `placeholder` | `"(reasoning omitted)"` | 无真内容可回填时的兜底串（上游只要求非空）。配 `""` = 关闭兜底（宁可 400 也不伪造）                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 > **入站方向为什么不需要单独开关**：客户端自己的 `thinking` 设置已经决定要不要 thinking（CC 2.1.241 实测默认发 `{"type":"adaptive","display":"omitted"}`），反代只负责“要就给”，无需再加一个维度。
 >
@@ -303,18 +309,18 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 
 **会变大。** 回填文本随历史进入每一轮请求，稳态下的净增量 ≈ **该会话内所有 tool-call 轮次的 reasoning tokens 之和**。用实测数据（`requests.jsonl` 的 S3 会话，103 个请求）：
 
-| 指标 | 值 |
-| --- | --- |
-| 会话累计 `rt`（思考 tokens） | 51,781（均值 513 / 中位 90 / 最大 3881）|
-| 末次请求输入 | `in 53,882 + cr 19,712` = **73,594 tokens** |
-| 全量回填后输入 | ≈ **125,375 tokens**（**+70%**）|
+| 指标                         | 值                                          |
+| ---------------------------- | ------------------------------------------- |
+| 会话累计 `rt`（思考 tokens） | 51,781（均值 513 / 中位 90 / 最大 3881）    |
+| 末次请求输入                 | `in 53,882 + cr 19,712` = **73,594 tokens** |
+| 全量回填后输入               | ≈ **125,375 tokens**（**+70%**）            |
 
 **费用影响几乎可以忽略**，因为增量落在**缓存读**一侧：
 
-| 口径 | 单价 | 51,781 tokens 成本 |
-| --- | --- | --- |
-| 缓存读（`cr`） | `$0.003/Mtok` | **$0.00016** |
-| 全价输入 | `$0.15/Mtok` | $0.0078 |
+| 口径           | 单价          | 51,781 tokens 成本 |
+| -------------- | ------------- | ------------------ |
+| 缓存读（`cr`） | `$0.003/Mtok` | **$0.00016**       |
+| 全价输入       | `$0.15/Mtok`  | $0.0078            |
 
 增加的那段前缀是稳定的，除了"首次出现的那一轮"（当作新增 token 计一次全价），其余轮次都是缓存读（比全价输入便宜 **50 倍**）。所以这是**上下文窗口占用**问题，不是账单问题。
 

@@ -57,7 +57,8 @@
  *      (改为文本提取, 块数组与拼接字符串两种客户端形态产生相同字节)。
  *   9. stripSystemReminders (默认 true): 整条剥离 history 中注入的 system 提醒
  *      (配额计数/任务催促), 提示性内容不影响编码能力; 请求落盘由环境变量
- *      CMC_LOGGING_FILE 分级控制 (见下方注释), 文件固定为 ROOT/fulllog.log。
+ *      CMC_LOGGING_FILE 分级控制 (见下方注释), 文件固定为 ROOT/fulllog.log;
+ *      滚动记录: 仅保留最近 50 条 (标签同终端 S{id}#{req}), 不再无限增长。
  *      jsonlLog (可选): 独立的结构化 JSONL 请求日志开关 (与 CMC_LOGGING_FILE 无关),
  *      记录与终端 REQ/RES 两行同源的当前次请求数据, 在 RES 输出时写一条 JSON,
  *      供离线分析 (滚动/累计不入档)。详见 README「结构化请求日志 (JSONL)」。
@@ -224,22 +225,56 @@ try {
 //   1 = 严重事件落盘 (上游请求失败/超时、客户端中途断开 ABT)
 //   2 = 1 + 前缀分叉时落盘该请求 (client/upstream 双 body, 便于定位分叉来源)
 //   3 = 全部模型类请求落盘 (原 config.fulllog=true 行为)
-// 文件固定为 ROOT/fulllog.log (已在 .gitignore)
+// 文件固定为 ROOT/fulllog.log (已在 .gitignore), **滚动记录**: 内存保留最近 FULLLOG_MAX 条,
+// 落盘时覆盖写入整个窗口 —— 文件恒为最近 50 条, 不会像旧实现那样无限增长。
+// 每条记录的头部标签沿用终端 REQ/RES 行的 S{会话}#{请求} 格式 (如 S5#90, 见请求入口
+// req._cmdcTag), 便于与终端日志逐条对照。
+// 版式: 记录内不留空行 (头标签 + ---- client/upstream ---- 分隔 + 正文紧凑相连),
+// 记录之间空一行 (flush 时用 "\n\n" 拼接), 扫日志时一条记录一块。
 const LOG_LEVEL = Math.max(0, parseInt(process.env.CMC_LOGGING_FILE || "0", 10) || 0);
 const FULLLOG_PATH = LOG_LEVEL > 0 ? path.join(ROOT, "fulllog.log") : null;
-let fulllogChain = Promise.resolve();
+const FULLLOG_MAX = 50; // 滚动窗口: 最多保留的记录条数
+// 启动即清空历史文件: 旧实现可能已留下超大文件, 新窗口从空开始 (滚动语义, 不跨进程累积)
+if (FULLLOG_PATH) {
+  try { fs.truncateSync(FULLLOG_PATH); } catch { /* 文件不存在等, 忽略 */ }
+}
+const fulllogRing = []; // 最近 FULLLOG_MAX 条记录 (含头部与分隔的字符串)
+let fulllogWriting = false; // 是否正在覆盖写: 期间的写入请求合并为一次 (始终写最新窗口)
+let fulllogPending = false; // 覆盖写期间有新记录, 写完后需再写一次
+function fulllogFlush() {
+  if (!FULLLOG_PATH) return;
+  if (fulllogWriting) {
+    fulllogPending = true; // 有写在途: 合并, 写完后用最新窗口再写一次
+    return;
+  }
+  fulllogWriting = true;
+  fulllogPending = false;
+  // 覆盖写入当前窗口: 文件内容 = ring 内容, 天然满足“最多 FULLLOG_MAX 条”;
+  // 记录间以空行分隔 (记录内已无空行), 末尾补一个换行
+  fs.promises.writeFile(FULLLOG_PATH, fulllogRing.join("\n\n") + "\n")
+    .catch((e) => console.error(TAGE, "fulllog 写入失败:", e.message))
+    .finally(() => {
+      fulllogWriting = false;
+      if (fulllogPending) fulllogFlush(); // 写入期间有新记录: 用最新窗口再写一次
+    });
+}
 function fulllogDump(req, pathname, session, entries, note) {
   if (!FULLLOG_PATH) return;
   const ts = new Date().toISOString();
-  const head = `\n[${ts}]#${session ? session.id : "-"} ${req.method} ${pathname} src=${req.socket.remotePort || "-"}${note ? ` [${note}]` : ""}\n`;
+  // 标签与终端一致: req._cmdcTag = S{id}#{reqNo} (请求入口处赋值); 非 model 请求回退为 "-"
+  const tag = req._cmdcTag || (session ? `S${session.id}#${session.reqSeq}` : "-");
+  const head = `[${ts}] ${tag} ${req.method} ${pathname} src=${req.socket.remotePort || "-"}${note ? ` [${note}]` : ""}`;
   const body = entries
     .filter(([, text]) => text != null)
-    .map(([label, text]) => `---- ${label} (${Buffer.byteLength(text)}B) ----\n${text}\n`)
+    .map(([label, text]) => `---- ${label} (${Buffer.byteLength(text)}B) ----\n${text}`)
     .join("\n");
-  // 串行追加, 保证写入顺序与到达顺序一致
-  fulllogChain = fulllogChain
-    .then(() => fs.promises.appendFile(FULLLOG_PATH, head + body))
-    .catch((e) => console.error(TAGE, "fulllog 写入失败:", e.message));
+  // 记录内去除多余空行 (正文里的连续空行/首尾空行一并压掉), 记录间空行由 flush 负责
+  const record = (head + (body ? "\n" + body : ""))
+    .replace(/\n(?:[ \t]*\n)+/g, "\n")
+    .replace(/^\n+|\n+$/g, "");
+  fulllogRing.push(record);
+  if (fulllogRing.length > FULLLOG_MAX) fulllogRing.splice(0, fulllogRing.length - FULLLOG_MAX);
+  fulllogFlush();
 }
 /** 请求落盘判断: 3=全部; 2=仅前缀分叉的请求 */
 function shouldDumpRequest(pfxMark) {
@@ -2887,6 +2922,9 @@ const server = http.createServer(async (req, res) => {
   // 非 model 请求无会话, 编号为 null 不输出。
   // 标签颜色按请求轮转取色 (非会话哈希), 闭包捕获保证 REQ/RES 两行同色
   const reqNo = session ? ++session.reqSeq : null;
+  // fulllog 记录用标签 (与终端 REQ/RES 行同格式 S{id}#{reqSeq}, 如 S5#90)。
+  // 存到 req 独立属性而非 req._cmdc —— 路由分支会重建 _cmdc, 直接赋值会丢失
+  req._cmdcTag = session ? `S${session.id}#${reqNo}` : null;
   const tagColor = session ? TAG_COLORS[nextTagColor++ % TAG_COLORS.length] : null;
   let outBytes = 0;
   const uaShort = () => (req.headers["user-agent"] || "-").slice(0, 48);
@@ -2926,7 +2964,7 @@ const server = http.createServer(async (req, res) => {
   const sessTag = () => {
     if (!session) return "";
     const at = req._cmdc && req._cmdc.imgNew ? "@" : "";
-    return at + `S${session.id}#${reqNo}`;
+    return at + req._cmdcTag;
   };
   // 会话标签前导空格: @ 开头(带新图)不补, 否则补一个空格 —— REQ/RES 行:
   // 无图 "] S1#2", 带新图 "]@S1#3" 紧贴时间戳

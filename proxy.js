@@ -783,6 +783,27 @@ function parseSSEEvent(raw) {
   return { event, data: dataLines.join("\n") };
 }
 
+/** 判定一个已解析的 SSE 事件是否携带「生成内容」(用于首内容 TTFT), 兼容三种上游方言:
+ *   - Anthropic: content_block_delta.delta.{text|thinking|partial_json}
+ *   - OpenAI chat: choices[0].delta.{content|reasoning_content|reasoning|tool_calls}
+ *   - Responses: type 以 ".delta" 结尾 + 字符串 delta
+ *  仅看生成增量, message_start / role 空帧 / ping / usage 帧均返回 false。 */
+function sseHasContent(json) {
+  if (!json || typeof json !== "object") return false;
+  const d = json.delta;
+  if (d && typeof d === "object") {
+    if (d.text || d.thinking || d.partial_json || d.content || d.reasoning_content || d.reasoning) return true;
+    if (Array.isArray(d.tool_calls) && d.tool_calls.length) return true;
+  }
+  const cd = json.choices && json.choices[0] && json.choices[0].delta;
+  if (cd) {
+    if (cd.content || cd.reasoning_content || cd.reasoning) return true;
+    if (Array.isArray(cd.tool_calls) && cd.tool_calls.length) return true;
+  }
+  if (typeof json.type === "string" && json.type.endsWith(".delta") && typeof json.delta === "string" && json.delta) return true;
+  return false;
+}
+
 function sse(event, data) {
   return `event: ${event}\ndata: ${data}\n\n`;
 }
@@ -1222,6 +1243,7 @@ class StreamConverter {
     this.rawUsage = null; // 最后一次完整 usage 对象 (供日志输出)
     this.localToolSeq = 0;
     this.pending = "";
+    this.contentStarted = false; // 是否已产出首个生成内容 (text/thinking/tool_calls), 供 TTFT 采样
     this.textBlock = null; // 文本块索引, null=未创建 (0 是合法索引, 判断必须用 == null 而非 !textBlock, 否则第 2 个内容 chunk 会误建新块把消息拆成两截)
   }
 
@@ -1281,6 +1303,11 @@ class StreamConverter {
     }
     const choice = json.choices[0];
     const delta = choice.delta || {};
+    // 首内容标记 (TTFT): reasoning / 文本 / 工具调用任一出现即算;
+    // reasoning 即便因未请求 thinking 而不下发也计入, 与 out 含 rt 的速度口径一致
+    if (!this.contentStarted && (extractReasoning(delta) || delta.content || (Array.isArray(delta.tool_calls) && delta.tool_calls.length))) {
+      this.contentStarted = true;
+    }
 
     if (!this.started) {
       this.started = true;
@@ -1937,6 +1964,7 @@ class ResponsesStreamConverter {
     this.pending = "";
     this.rawUsage = null; // 最后一次完整 usage 对象 (供日志输出)
     this.reasoningText = ""; // 上游 reasoning 原文 (供会话缓存; Codex 侧暂不下发 reasoning 条目)
+    this.contentStarted = false; // 是否已产出首个生成内容 (reasoning/文本/工具调用), 供 TTFT 采样
   }
 
   /** 供调用方记录会话缓存: reasoning 原文 + 本次响应的 tool_call id */
@@ -1981,6 +2009,10 @@ class ResponsesStreamConverter {
     // 思考增量: 仅累积供会话缓存 (Codex 侧的 reasoning 条目暂不下发)
     const rdelta = extractReasoning(delta);
     if (rdelta) this.reasoningText += rdelta;
+    // 首内容标记 (TTFT): reasoning / 文本 / 工具调用任一出现即算; reasoning 不下发也计入 (与 out 含 rt 口径一致)
+    if (!this.contentStarted && (rdelta || delta.content || (Array.isArray(delta.tool_calls) && delta.tool_calls.length))) {
+      this.contentStarted = true;
+    }
 
     if (!this.started) {
       this.started = true;
@@ -2390,40 +2422,52 @@ function warnBlockedModel(model) {
  * 通用透传: 把上游响应(含流式)转发给客户端。
  * opts.collectUsage 存在时, 顺带从响应中提取 usage 对象 (流式扫描 SSE 事件, 非流式解析 JSON),
  * 不改变转发语义, 仅用于访问日志输出。
+ * opts.timing 存在时 (传 req._cmdc), 记录首字节 ttfbAt (首个数据包到达) 与首内容 ttftAt
+ * (首个携带生成内容的 SSE 事件), 供速度口径与日志使用。
  */
 async function passThrough(res, upstreamResp, opts) {
   const collectUsage = opts && opts.collectUsage;
   const onDone = opts && opts.onDone;
+  const timing = opts && opts.timing;
   const hdrs = upstreamResp.headers || {};
   // Node fetch 的 headers 是 Headers 实例 (支持 .get), 也可能是普通对象, 兼容两者
   const ctype = typeof hdrs.get === "function" ? hdrs.get("content-type") : hdrs["content-type"];
   const isSse = (ctype || "").includes("text/event-stream");
+  const scanSse = isSse && (collectUsage || timing); // 需要扫事件: 收集 usage 和/或判定首内容
   let acc = "";
   let sseBuf = "";
   res.writeHead(upstreamResp.status, upstreamResp.statusText || "", upstreamResp.headers);
   if (upstreamResp.body) {
     for await (const chunk of upstreamResp.body) {
+      if (timing && !timing.ttfbAt) timing.ttfbAt = Date.now(); // 首字节: 首个数据包到达
       res.write(chunk);
-      if (collectUsage) {
-        if (isSse) {
-          // 按 \n\n 切出完整 SSE 事件, 命中 usage 键时解析 (跨 chunk 截断的事件丢弃, usage 事件一般完整)
-          sseBuf += Buffer.from(chunk).toString("utf8");
-          let idx;
-          while ((idx = sseBuf.indexOf("\n\n")) >= 0) {
-            const evt = sseBuf.slice(0, idx);
-            sseBuf = sseBuf.slice(idx + 2);
-            const parsed = parseSSEEvent(evt);
-            if (parsed && parsed.data && parsed.data.indexOf('"usage"') >= 0) {
-              try {
-                collectUsage(JSON.parse(parsed.data).usage);
-              } catch {
-                /* 忽略坏事件 */
-              }
+      if (scanSse) {
+        // 按 \n\n 切出完整 SSE 事件, 命中 usage 键时解析 (跨 chunk 截断的事件丢弃, usage 事件一般完整)
+        sseBuf += Buffer.from(chunk).toString("utf8");
+        let idx;
+        while ((idx = sseBuf.indexOf("\n\n")) >= 0) {
+          const evt = sseBuf.slice(0, idx);
+          sseBuf = sseBuf.slice(idx + 2);
+          const parsed = parseSSEEvent(evt);
+          if (!parsed || !parsed.data) continue;
+          if (timing && !timing.ttftAt) {
+            // 首内容: 第一个携带生成内容的事件 (reasoning/文本/工具调用, 均计入)
+            try {
+              if (sseHasContent(JSON.parse(parsed.data))) timing.ttftAt = Date.now();
+            } catch {
+              /* 忽略坏事件 */
             }
           }
-        } else {
-          acc += Buffer.from(chunk).toString("utf8");
+          if (collectUsage && parsed.data.indexOf('"usage"') >= 0) {
+            try {
+              collectUsage(JSON.parse(parsed.data).usage);
+            } catch {
+              /* 忽略坏事件 */
+            }
+          }
         }
+      } else if (collectUsage) {
+        acc += Buffer.from(chunk).toString("utf8");
       }
     }
     if (collectUsage && !isSse && acc) {
@@ -2439,8 +2483,9 @@ async function passThrough(res, upstreamResp, opts) {
   res.end();
 }
 
-/** 转换路径共用的上游流消费 + SSE 转换 + usage 收集 (onDone: 上游流结束/中断后回调, 用于释放会话锁) */
-async function pumpConvertedStream(up, conv, res, tag, onDone) {
+/** 转换路径共用的上游流消费 + SSE 转换 + usage 收集 (onDone: 上游流结束/中断后回调, 用于释放会话锁)
+ *  timing (传 req._cmdc) 时记录首字节 ttfbAt 与首内容 ttftAt (conv.contentStarted 首次为真) */
+async function pumpConvertedStream(up, conv, res, tag, onDone, timing) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -2449,10 +2494,12 @@ async function pumpConvertedStream(up, conv, res, tag, onDone) {
   });
   try {
     for await (const chunk of up.body) {
+      if (timing && !timing.ttfbAt) timing.ttfbAt = Date.now(); // 首字节
       // undici 流式 chunk 是 Uint8Array, 必须经 Buffer.from 才能正确 utf8 解码
       const raw = Buffer.from(chunk).toString("utf8");
       if (process.env.CMC_DEBUG === "1") process.stderr.write(`[DBG-UP-${tag}] ` + raw.replace(/\n/g, "\\n").slice(0, 300) + "\n");
       const outText = conv.push(raw);
+      if (timing && !timing.ttftAt && conv.contentStarted) timing.ttftAt = Date.now(); // 首内容
       if (outText) res.write(outText);
     }
   } catch (e) {
@@ -2484,7 +2531,7 @@ const dayKey = () => {
 };
 const fmtNum = (n) =>
   n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(n);
-const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms: 0, credit: 0, cost: 0 });
+const zeroAgg = () => ({ req: 0, in: 0, out: 0, rt: 0, cr: 0, cw: 0, gen: 0, credit: 0, cost: 0 });
 const stats = { day: null, today: zeroAgg(), total: zeroAgg(), recent: [] };
 
 // ---- 模型目录: 单次请求成本 / 额度计算 ----
@@ -2580,22 +2627,25 @@ function calcCredit(usage, mapped) {
   return { credit, cost, peak, rated: mc > 0 };
 }
 
-/** 最近 n 个请求的聚合 */
+/** 最近 n 个请求的聚合 (gen 为解码窗口: 首内容之后到流结束的耗时) */
 function winAgg(n) {
   const slice = stats.recent.slice(-n);
-  const agg = { in: 0, out: 0, rt: 0, cr: 0, ms: 0 };
+  const agg = { in: 0, out: 0, rt: 0, cr: 0, gen: 0 };
   for (const r of slice) {
     agg.in += r.in;
     agg.out += r.out;
     agg.rt += r.rt;
     agg.cr += r.cr;
-    agg.ms += r.ms;
+    agg.gen += r.gen;
   }
   return agg;
 }
 
 /** 速度数字格式化: 整数去 .0 */
 const fmtSpeed = (v) => (v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, ""));
+
+/** 时长格式化: >=1000ms 用秒(2 位小数), 否则毫秒 (took/ttfb/ttft 共用) */
+const fmtDur = (ms) => (ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms");
 
 /** 百分比格式化: 最多 1 位小数, 整数不带小数点 (99% / 98.7%) */
 const fmtPct = (p) => p.toFixed(1).replace(/\.0$/, "") + "%";
@@ -2614,9 +2664,9 @@ function movingStatsStr(session, costStr, creditStr) {
   const levels = n >= 11 ? [1, 10, 50] : n >= 2 ? [1, 10] : [1];
   const tsParts = levels.map((win, i) => {
     const w = winAgg(win);
-    // 输出 token 含思考量 (out 已含 rt), 直接用 out 计速度
-    const v = w.ms > 0 ? w.out / (w.ms / 1000) : 0;
-    const text = (i === 0 ? "ts:" : ",") + (w.ms > 0 ? fmtSpeed(v) + "/s" : "-");
+    // 输出 token 含思考量 (out 已含 rt); 分母为解码窗口 gen (首内容之后), 不含首包等待
+    const v = w.gen > 0 ? w.out / (w.gen / 1000) : 0;
+    const text = (i === 0 ? "ts:" : ",") + (w.gen > 0 ? fmtSpeed(v) + "/s" : "-");
     return speedSegment(text, v);
   });
   return ` ${chStr}${costStr}${creditStr} ${tsParts.join("")}`;
@@ -2628,9 +2678,9 @@ function statsLine(label, agg) {
   const totalIn = agg.in + agg.cr;
   const pct = totalIn > 0 ? (agg.cr / totalIn) * 100 : 0;
   const chStr = cacheSegment("ch:" + (totalIn > 0 ? fmtPct(pct) : "-"), pct);
-  // 输出 token 含思考量 (out 已含 rt), 直接用 out 计速度
-  const v = agg.ms > 0 ? agg.out / (agg.ms / 1000) : 0;
-  const tsStr = speedSegment("ts:" + (agg.ms > 0 ? fmtSpeed(v) + "/s" : "-"), v);
+  // 输出 token 含思考量 (out 已含 rt); 分母为解码窗口 gen (首内容之后), 不含首包等待
+  const v = agg.gen > 0 ? agg.out / (agg.gen / 1000) : 0;
+  const tsStr = speedSegment("ts:" + (agg.gen > 0 ? fmtSpeed(v) + "/s" : "-"), v);
   // cost/credit/avg 用默认色 (不再单独着色), 顺序与 RES 行一致 (ch 之后)
   const costStr = agg.cost > 0 ? ` cost:$${agg.cost.toFixed(6)}` : "";
   const credStr = agg.credit > 0 ? ` credit:${agg.credit.toFixed(6)}` : "";
@@ -2645,7 +2695,7 @@ function logStats() {
   statsLine("TOD", stats.today);
   const same =
     stats.today.req === stats.total.req &&
-    ["in", "out", "rt", "cr", "cw", "ms", "credit", "cost"].every((k) => stats.today[k] === stats.total[k]);
+    ["in", "out", "rt", "cr", "cw", "gen", "credit", "cost"].every((k) => stats.today[k] === stats.total[k]);
   if (!same) statsLine("ALL", stats.total);
 }
 
@@ -2653,7 +2703,7 @@ function logStats() {
 function accumulate(rec, trackRolling) {
   stats.today.req += 1;
   stats.total.req += 1;
-  for (const k of ["in", "out", "rt", "cr", "cw", "ms", "credit", "cost"]) {
+  for (const k of ["in", "out", "rt", "cr", "cw", "gen", "credit", "cost"]) {
     stats.today[k] += rec[k];
     stats.total[k] += rec[k];
   }
@@ -2673,7 +2723,7 @@ function rollingJsonlMetrics(session) {
   const chTotal = chIn + chCr;
   const ch = chTotal > 0 ? Math.round((chCr / chTotal) * 1000) / 10 : null; // 1 位小数 (99 / 98.7)
   const last = stats.recent[stats.recent.length - 1];
-  const ts = last && last.ms > 0 ? Math.round((last.out / (last.ms / 1000)) * 10) / 10 : null;
+  const ts = last && last.gen > 0 ? Math.round((last.out / (last.gen / 1000)) * 10) / 10 : null;
   return { ch, ts };
 }
 
@@ -2718,6 +2768,7 @@ function jsonlRecord(o) {
       peak: !!o.cq.peak, // 高峰窗口 (工作日 UTC) —— 终端 ^cost/^credit/时间戳亮红同口径
       outBytes: o.outBytes,
       ms: o.ms, qwaitMs: o.qwaitMs,
+      ttfb: o.ttfb ?? null, ttft: o.ttft ?? null, // 首字节/首内容延迟 ms (未采样为 null)
       usage, // null = 本次未解析到 usage
       ch: rolling ? rolling.ch : null, // 会话累计缓存命中率 % (同 RES 行 ch:, 仅本次有 usage 时算)
       ts: rolling ? rolling.ts : null, // 最近 1 次生成速度 tokens/s (同 RES 行 ts: 窗口 1)
@@ -3047,12 +3098,16 @@ const server = http.createServer(async (req, res) => {
     const ms = dispatchAt ? Date.now() - dispatchAt : Date.now() - startAt;
     const qwaitMs = dispatchAt ? dispatchAt - startAt : 0;
     const qwaitStr = qwaitMs > 500 ? ` ${cMagenta(`qwait:${(qwaitMs / 1000).toFixed(1)}s`)}` : "";
-    const took = ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : ms + "ms";
+    const took = fmtDur(ms);
+    // 首字节 (ttfb) / 首内容 (ttft): 相对 dispatchAt 的毫秒数; 未采样到 (非流式/非 SSE) 为 null
+    const ttfbMs = dispatchAt && req._cmdc.ttfbAt ? req._cmdc.ttfbAt - dispatchAt : null;
+    const ttftMs = dispatchAt && req._cmdc.ttftAt ? req._cmdc.ttftAt - dispatchAt : null;
+    // 解码窗口 gen: 首内容之后到流结束的耗时, 作为速度分母; 无 ttft 时退化为总耗时 ms
+    const genMs = ttftMs != null ? Math.max(0, ms - ttftMs) : ms;
     // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
     const u = req._cmdc && req._cmdc.usage;
     let usageStr = "";
-    const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, ms, credit: 0, cost: 0 };
-    rec.ms = ms; // 统计口径与 took 一致: 仅计发往上游之后的耗时 (排队等待单列 qwait)
+    const rec = { in: 0, out: 0, rt: 0, cr: 0, cw: 0, gen: genMs, credit: 0, cost: 0 };
     if (u) {
       // usage 摘要配色: in/out/cw 青色 (和谐), rt 紫色, cr 亮青突出 (缓存命中量)
       const parts = [];
@@ -3129,16 +3184,21 @@ const server = http.createServer(async (req, res) => {
       console.warn(cRed(`[cmc-proxy] ${sessTag()} 前缀分叉: `) + colored);
     }
     const stFn = res.statusCode >= 500 ? cRed : res.statusCode >= 400 ? cYellow : res.statusCode >= 300 ? cCyan : cGreen;
+    // 首字节/首内容标记 (仅 2xx 输出; 错误响应无参考意义); 紧随 took 之后
+    const timingStr = res.statusCode < 300
+      ? (ttfbMs != null ? ` ttfb=${fmtDur(ttfbMs)}` : "") + (ttftMs != null ? ` ttft=${fmtDur(ttftMs)}` : "")
+      : "";
     // 标签 S{id}#{req} 用该请求闭包捕获的颜色 (与 REQ 行同色); 状态码保持原波段色
     const tag = sessTag();
     const tsColor = peakTsColor(req._cmdc.mapped); // 高峰亮红时间戳 (按最终实际转发模型)
-    console.log(`${tsColor(`[${logTs(Date.now())}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
+    console.log(`${tsColor(`[${logTs(Date.now())}]`)}${tag ? `${tagPad()}${tagColor(tag)} ` : " "}${stFn(`${res.statusCode}`)} ${req.method} ${pathname}${resModelPart()} ${cDim(`took=${took}${timingStr} out=${outBytes}B`)}${qwaitStr}${usageStr}${gapStr}${pfxMark}${movingStr}`);
     // 结构化请求日志 (jsonlLog 开启时): RES 输出时把当前次请求组织成一条 JSON 写入 (仅 model 请求)
     if (JSONL_LOG && session) {
       jsonlWrite(jsonlRecord({
         req, res, pathname, session, sessionKey, sessionIdType, reqNo,
         status: res.statusCode, method: req.method, queued: willQueue,
         startAt, endAt: Date.now(), dispatchAt, ms, qwaitMs, outBytes,
+        ttfb: ttfbMs, ttft: ttftMs,
         rec, cq, pfx, gap: gapVal,
       }));
     }
@@ -3237,7 +3297,7 @@ const server = http.createServer(async (req, res) => {
           await passThrough(res, up, { onDone: releaseUp });
           return;
         }
-        await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); }, onDone: releaseUp });
+        await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); }, onDone: releaseUp, timing: req._cmdc });
         return;
       }
 
@@ -3323,7 +3383,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const conv = new StreamConverter(requested, estimateInputTokens(body), wantThinking);
-      await pumpConvertedStream(up, conv, res, "messages", releaseUp);
+      await pumpConvertedStream(up, conv, res, "messages", releaseUp, req._cmdc);
       recordStreamReasoning(session, conv); // 记入会话缓存, 供后续轮次出站回填
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
       return;
@@ -3376,7 +3436,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       // upstreamFetch 已处理失败/成功计数 (非 2xx 已计失败并可能切换默认模型)
-      await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); }, onDone: releaseUp });
+      await passThrough(res, up, { collectUsage: (u) => { req._cmdc.usage = normalizeUsage(u); }, onDone: releaseUp, timing: req._cmdc });
       return;
     }
 
@@ -3476,7 +3536,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const conv = new ResponsesStreamConverter(requested, estimateInputTokens(body), customToolNames);
-      await pumpConvertedStream(up, conv, res, "responses", releaseUp);
+      await pumpConvertedStream(up, conv, res, "responses", releaseUp, req._cmdc);
       recordStreamReasoning(session, conv); // 记入会话缓存, 供后续轮次出站回填
       req._cmdc.usage = normalizeUsage(conv.rawUsage);
       return;
@@ -3493,7 +3553,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (FULLLOG_PATH && init.body != null) fulllogDump(req, pathname, null, [["client", init.body], ["upstream", init.body]]);
       const up = await fetch(`${UPSTREAM}${upstreamPath}${url.search}`, init);
-      await passThrough(res, up);
+      await passThrough(res, up, { timing: req._cmdc });
       return;
     }
 

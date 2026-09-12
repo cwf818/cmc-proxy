@@ -17,7 +17,7 @@
 - **多模态**：`visionAutoRoute` （2026-9-6新增）在带图请求决策出"判定不支持视觉"的模型时**前置改走** `defaultVisionModels[0]`（免上游 400错误请求/200静默盲视）；因为最近调deepseek v4 flash时已经从之前的400变成了200，导致仅靠失败轮换失效；`tool_result` 内嵌图片抽出注入同轮 user 消息透传；`cleanHistoryImages` 可在本轮无新图时清理历史图片，让请求安全回流纯文本模型；REQ 行 `img=N(新M)` 标记 + 会话标签 `@` 前缀
 - **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源。此类信息主要用于调试，正常使用请忽略。
 - **Codex 新协议全兼容**：`custom`（apply_patch freeform）/ `tool_search`（延迟工具发现）/ `namespace` 工具组 / 顶层 `function_call` 历史等新形态全链路支持
-- **会话级访问日志**：按 `x-claude-code-session-id` / `session-id` / `thread-id` 稳定归因，两行日志（REQ/RES）配对 + 缓存命中率 / 生成速度 / 前缀分叉 / 累计用量统计
+- **会话级访问日志**：按 `x-claude-code-session-id` / `session-id` / `thread-id` 稳定归因，两行日志（REQ/RES）配对 + 缓存命中率 / 首字节(ttfb)与首内容(ttft)延迟 / 生成速度（按解码窗口计） / 前缀分叉 / 累计用量统计
 - **结构化 JSONL 请求日志**（`config.json` `jsonlLog`）：把与 REQ/RES 两行同源的当次请求数据在 RES 输出时写一条 JSON 到 `requests.jsonl`，供离线分析（独立于 `CMC_LOGGING_FILE` 分级落盘）
 - 支持流式 SSE 透传、token 用量上报、模型列表过滤、分级请求落盘（环境变量 `CMC_LOGGING_FILE`）
 - 配置文件默认模型改成了最新的 deepseek-v4.1-flash，已经支持视觉，所以顺便把清历史图也关掉了（需要仍然可以打开，但token节约不大）。
@@ -421,9 +421,9 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 
 ```
 [20:15:55.877] S3#1 REQ POST /v1/messages model=deepseek-v4-flash src=127.0.0.1:54321 ua=claude-cli/2.0.0 stream=1 body=186.5KB
-[20:15:58.232] S3#1 200 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ch:87% cost=$0.011571 credit=0.013500 ts:241.3/s
+[20:15:58.232] S3#1 200 POST /v1/messages model=deepseek/deepseek-v4-flash took=2.35s ttfb=0.42s ttft=0.95s out=1736B in:1234 out:567 rt:480 cr:890 cw:0 ch:87% cost=$0.011571 credit=0.013500 ts:241.3/s
 [20:15:58.822]@S3#2 REQ POST /v1/messages model=mimo-v2.5 src=127.0.0.1:54321 ua=claude-cli/2.0.0 stream=1 img=2(新1) body=321.4KB
-[20:16:00.510]@S3#2 200 POST /v1/messages took=1.69s out=567B qwait:1.2s in:987 out:45 cr:0 cw:0 ch:40% ^cost=$0.026786 ^credit=0.031250 gap:10 ts:26.6/s
+[20:16:00.510]@S3#2 200 POST /v1/messages took=1.69s ttfb=0.38s ttft=0.61s out=567B qwait:1.2s in:987 out:45 cr:0 cw:0 ch:40% ^cost=$0.026786 ^credit=0.031250 gap:10 ts:26.6/s
 [20:16:30.000] S5#7 REQ* POST /v1/chat/completions model=gpt-5.6-sol src=127.0.0.1:48721 ua=codex/1.0.0 stream=0 body=88B
 [20:17:30.000] S5#7 502 POST /v1/chat/completions took=60.01s out=112B pfx~3
 ```
@@ -442,6 +442,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | `img`                                       | 请求体中检测到的图片块数（Anthropic `image` 块 + OpenAI `image_url` / `input_image` part），仅 `REQ` 行。`/v1/messages` 链路额外显示 `新M` —— 最后一条 user 消息（本轮）中的新图数，如 `img=2(新1)`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `body`                                      | 请求体大小（仅 `REQ` 行；用于区分两条请求是否完全相同：工具循环的请求体会递增，客户端重试的请求体一致）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `took`                                      | 上游耗时：从**真正发往上游**起算到响应完成（排队等待不计入，与 provider 侧 API 耗时对齐，仅 `RES` 行）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `ttfb` / `ttft`                             | **首字节 / 首内容延迟**（相对真正发往上游的时刻，仅 `RES` 行、仅 2xx 输出）：`ttfb` = 上游第一个数据包到达（首包落点）；`ttft` = 第一个携带**生成内容**的事件（文本 / 思考 / 工具调用，谁先到算谁，**含思考量**，与 `out:` 含 `rt:` 口径一致）；非 SSE（非流式）无 `ttft`，仅显示 `ttfb`。二者之差即「元数据帧/预填充」段位，`ttft` 与 `took` 之差即解码窗口 |
 | `qwait:`                                    | 排队等待时长：同会话串行化时在本请求之前等待的时间，超过 0.5s 才显示；`took + qwait ≈ 总耗时`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `out`                                       | 响应输出字节数（仅 `RES` 行，含 `res.end()` 直写的 body）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `in:` / `out:`                              | 输入 / 输出 tokens。**`in:` 为净输入**（已扣除缓存命中部分，即按原价计费的量；流式与非流式、转换与透传路径均解析；上游未返回时不显示）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -467,13 +468,14 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 
 - `ch:` 为**会话累计**命中率（该会话所有有 usage 请求的 `cr ÷ (in + cr)`，最多带 1 位小数，如 `ch:98.7%`），单值输出——同会话正常工作时应稳定在 95%+；若长期偏低，结合 `pfx~` 标记定位前缀分叉来源
 - `ts:` 值个数随历史请求数变化：**1 次显示 1 值 → 2–10 次显示 2 值 → ≥11 次显示 3 值**（第 1 个 = 最近 1 次，第 2 个 = 最近 10 次，第 3 个 = 最近 50 次，仅计入有 usage 的请求）
+- `ts:` 速度 = **输出 tokens ÷ 解码窗口**，解码窗口为该请求**首内容（`ttft`）之后**到流结束的耗时（`took − ttft`），**不含首包等待**；这样可把「排队/预填充慢」与「生成慢」分开看。无 `ttft` 采样（非流式）时退化为按 `took` 计算
 - `gap:` 出现在 `ch` 之前：仅当**本次**缓存命中率 < 50% 时输出，值为与同会话最近一次低缓存命中请求的序号差（首次低缓存只记录基准、不输出）
 
 | 字段  | 含义                                                                                                                                                            |
 | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gap` | 两次 `cachehit < 50%` 请求的**序号差**（会话内、仅计有 usage 的请求），如 `gap:10` 表示距上一次低缓存命中间隔了 10 次有效请求。红色高亮，便于快速定位低缓存频率 |
 | `ch`  | 会话累计缓存命中率 = `cr ÷ (in + cr)`，**波段色**：<60 红 / 60–79 橙 / 80–89 黄 / 90–94 绿 / ≥95 亮绿                                                           |
-| `ts`  | 生成速度（输出 tokens/s，输出含思考量，滚动窗口），**波段色**：<20 红 / 20–39 橙 / 40–59 黄 / 60–79 绿 / ≥80 亮绿                                               |
+| `ts`  | 生成速度（输出 tokens/s，输出含思考量，滚动窗口；分母为**首内容之后的解码窗口**，不含 ttft），**波段色**：<20 红 / 20–39 橙 / 40–59 黄 / 60–79 绿 / ≥80 亮绿                                               |
 
 > 波段色按逗号分段：逗号跟随其后的数值一起着色（如 `ts:33/s`、`,40/s`、`,50/s` 各自独立着色）。
 
@@ -524,10 +526,11 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | `res.peak`                        | 高峰窗口（工作日 UTC）：终端 `^cost`/`^credit`/时间戳亮红同口径的布尔                    |
 | `res.outBytes`                    | RES 行 `out=`（响应字节数）                                                              |
 | `res.ms` / `qwaitMs`              | RES 行 `took=` / `qwait:`（ms；`took + qwait ≈ 总耗时`）                                 |
+| `res.ttfb` / `res.ttft`           | RES 行 `ttfb=` / `ttft=`（ms；首字节 / 首内容延迟，相对 `dispatchAt`；未采样为 `null`，仅 2xx 终端显示） |
 | `res.usage`                       | RES 行 `in:/out:/rt:/cr:/cw:`；**本次未解析到 usage 为 `null`**（同 RES 行不显示）       |
 | `res.cost` / `credit`             | RES 行 `cost=` / `credit=`（0 / 未收录模型为 0）                                         |
 | `res.ch`                          | 会话累计缓存命中率 %（同 RES 行尾 `ch:`，会话累计口径）；本次无 usage 为 `null`          |
-| `res.ts`                          | 最近 1 次生成速度 tokens/s（同 RES 行尾 `ts:` 窗口 1）；本次无 usage 为 `null`           |
+| `res.ts`                          | 最近 1 次生成速度 tokens/s（同 RES 行尾 `ts:` 窗口 1；分母为**首内容之后的解码窗口**，不含 `ttft`）；本次无 usage 为 `null` |
 | `res.lowCache` / `gap`            | RES 行 `gap:` —— 本次缓存命中率 <50% 时为 `true` 并给出与上次低缓存的序号差              |
 | `res.pfx`                         | RES 行 `pfx~N`/`pfx~tools`/`pfx~params`/`pfx<N`（纯追加健康时为 `null`）                 |
 
@@ -570,6 +573,8 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
     "outBytes": 1736,
     "ms": 2350,
     "qwaitMs": 0,
+    "ttfb": 420,
+    "ttft": 950,
     "usage": { "in": 1234, "out": 567, "rt": 480, "cr": 890, "cw": 0 },
     "cost": 0.011571,
     "credit": 0.0135,

@@ -31,6 +31,8 @@
   "serializeSessionRequests": true,
   "_首字节超时说明": "firstByteTimeout: 上游超过该毫秒数未返回响应头时主动中止并返回 502 (0=关闭, 兜底 undici 的 300s)。默认 120000。",
   "firstByteTimeout": 120000,
+  "_速度基准说明": "speedBase: RES 行 ts 生成速度分母的扣减锚点 (默认 ttfb)。took=总耗时(速度含首包等待, 端到端口径); ttfb=扣除首字节延迟(默认, 剔除建连/prefill 段); ttft=扣除首内容延迟(纯解码窗口, 数值最高)。锚点未采样(如非流式)时自动退化: ttft->ttfb->took。",
+  "speedBase": "ttfb",
   "_模型映射说明": "modelMap: 客户端请求模型名的显式映射, 命中即用, 不区分请求类型 (文本/带图), 优先级最高, 置空即关闭。key 是客户端请求名, value 是转发到上游的模型名。",
   "modelMap": {
     "claude-sonnet-4-6": "deepseek/deepseek-v4.1-flash",

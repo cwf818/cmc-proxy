@@ -165,6 +165,11 @@ const SERIALIZE_SESSION = config.serializeSessionRequests !== false; // 同会�
 const FIRST_BYTE_TIMEOUT = parseInt(config.firstByteTimeout ?? "120000", 10); // 上游响应头超时 ms (0=关闭; ?? 保证显式 0 不被默认值覆盖)
 const TOOL_RESULT_IMAGES = config.toolResultImages !== false; // tool_result 内嵌图片保留 (注入随后的 user 消息透传上游)
 const CLEAN_HISTORY_IMAGES = config.cleanHistoryImages === true; // 本轮无新图时清理历史图片, 使请求可回流纯文本模型
+// 速度基准 (speedBase): ts 生成速度分母的扣减锚点, 锚点未采样时逐级退化 (ttft<->ttfb, 最终退化总耗时):
+//   took: 不扣减 —— 速度含首包等待 (端到端口径, 旧版行为)
+//   ttfb: 扣除首字节延迟 (默认) —— 剔除建连/prefill 段, 保留元数据帧间隙
+//   ttft: 扣除首内容延迟 —— 纯解码窗口, 数值最高 (含思考 token 也算产出)
+const SPEED_BASE = ["took", "ttfb", "ttft"].includes(config.speedBase) ? config.speedBase : "ttfb";
 // reasoning 桥接 (单一开关, 见 README「reasoning / thinking 桥接」)。DeepSeek 系 thinking 模型在
 // "历史含 assistant(tool_calls) 且对话以 tool 结果结尾"时, 要求**每一条** assistant(tool_calls)
 // 都回传非空 reasoning_content, 否则 400
@@ -3102,8 +3107,15 @@ const server = http.createServer(async (req, res) => {
     // 首字节 (ttfb) / 首内容 (ttft): 相对 dispatchAt 的毫秒数; 未采样到 (非流式/非 SSE) 为 null
     const ttfbMs = dispatchAt && req._cmdc.ttfbAt ? req._cmdc.ttfbAt - dispatchAt : null;
     const ttftMs = dispatchAt && req._cmdc.ttftAt ? req._cmdc.ttftAt - dispatchAt : null;
-    // 解码窗口 gen: 首内容之后到流结束的耗时, 作为速度分母; 无 ttft 时退化为总耗时 ms
-    const genMs = ttftMs != null ? Math.max(0, ms - ttftMs) : ms;
+    // 解码窗口 gen (速度分母): 按 SPEED_BASE 锚点从总耗时中扣减; 锚点未采样时退化另一锚点, 再退化总耗时
+    let genMs;
+    if (SPEED_BASE === "took") genMs = ms;
+    else {
+      const a1 = SPEED_BASE === "ttfb" ? ttfbMs : ttftMs;
+      const a2 = SPEED_BASE === "ttfb" ? ttftMs : ttfbMs;
+      const anchor = a1 != null ? a1 : a2;
+      genMs = anchor != null ? Math.max(0, ms - anchor) : ms;
+    }
     // usage 摘要: in / out / rt(思考) / cr(缓存读) / cw(缓存写)
     const u = req._cmdc && req._cmdc.usage;
     let usageStr = "";
@@ -3601,6 +3613,7 @@ server.listen(PORT, HOST, () => {
     : "";
   console.log(cBlue(`  模型目录   : ${modelCatalog ? `已加载 (${modelCatalog.index.size} 个模型, 更新于 ${catalogTs}, ${MODEL_CATALOG_PATH})` : (config.modelCatalog ? "未加载 (文件缺失或解析失败)" : "未配置 (不统计额度)")}`));
   console.log(cBlue(`  结构化日志 : ${JSONL_LOG ? `开启 (写入 ${JSONL_LOG})${jsonlRotateOn() ? ` · 按日切分 (保留 ${JSONL_ROTATE_KEEP} 天)` : JSONL_ROTATE_OFF ? " · 按日切分: 已关闭" : ""}` : "关闭 (config.json jsonlLog)"}`));
+  console.log(cBlue(`  速度基准   : ${SPEED_BASE === "took" ? "took (速度含首包等待)" : SPEED_BASE === "ttfb" ? "ttfb (扣除首字节延迟)" : "ttft (纯解码窗口)"}`));
   console.log(cBlue("-".repeat(58)));
   console.log(cBlue("  Claude Code 接入:  export ANTHROPIC_BASE_URL=http://localhost:" + PORT));
   console.log(cBlue("  Codex 接入:        base_url = http://localhost:" + PORT + "/v1  (wire_api = responses)"));

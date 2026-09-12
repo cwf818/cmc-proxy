@@ -228,7 +228,9 @@ try {
 
 // 请求落盘分级 (环境变量 CMC_LOGGING_FILE, 未设置或 0 = 关闭):
 //   1 = 严重事件落盘 (上游请求失败/超时、客户端中途断开 ABT)
-//   2 = 1 + 前缀分叉时落盘该请求 (client/upstream 双 body, 便于定位分叉来源)
+//   2 = 1 + 前缀分叉时落盘该请求 (client/upstream 双 body, 便于定位分叉来源);
+//       另: RES 时缓存低命中 (ch<50%) 也落盘 (无分叉标记时多为上游/中转侧问题);
+//       二者均附上次请求消息基线 (prev-msgs) 供对照 —— level 3 全量落盘已含上次请求, 不重复
 //   3 = 全部模型类请求落盘 (原 config.fulllog=true 行为)
 // 文件固定为 ROOT/fulllog.log (已在 .gitignore), **滚动记录**: 内存保留最近 FULLLOG_MAX 条,
 // 落盘时覆盖写入整个窗口 —— 文件恒为最近 50 条, 不会像旧实现那样无限增长。
@@ -281,9 +283,19 @@ function fulllogDump(req, pathname, session, entries, note) {
   if (fulllogRing.length > FULLLOG_MAX) fulllogRing.splice(0, fulllogRing.length - FULLLOG_MAX);
   fulllogFlush();
 }
-/** 请求落盘判断: 3=全部; 2=仅前缀分叉的请求 */
+/** 请求落盘判断: 3=全部; 2=仅前缀分叉的请求 (缓存低命中落盘在 RES 侧单独判断) */
 function shouldDumpRequest(pfxMark) {
   return LOG_LEVEL >= 3 || (LOG_LEVEL >= 2 && !!pfxMark);
+}
+/** level 2 落盘 (前缀分叉/缓存低命中): client/upstream 双 body + 上一次请求消息基线 (prev-msgs)。
+ *  基线取自分叉检测内存中的上次请求消息 (转换后上游形态, 分叉对照正是发生在这份序列上);
+ *  仅 level 2 附加 —— level 3 全量落盘已含上次请求, 再写即重复 */
+function fulllogDumpL2(req, pathname, session, pfx, note, clientBody, upstreamBody) {
+  const entries = [["client", clientBody], ["upstream", upstreamBody]];
+  if (LOG_LEVEL === 2 && pfx && Array.isArray(pfx.prevMsgs)) {
+    entries.push(["prev-msgs", pfx.prevMsgs.join("\n")]);
+  }
+  fulllogDump(req, pathname, session, entries, note);
 }
 /** 严重事件落盘 (level>=1): 上游失败/超时、客户端断开等, 附请求双 body 便于定位 */
 function logSevere(req, pathname, session, message) {
@@ -2810,7 +2822,7 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
   while (i < common && prev.msgs[i] === curMsgsJson[i]) i++;
   if (i === common) {
     if (curMsgsJson.length < prev.msgs.length) {
-      return { mark: `pfx<${curMsgsJson.length}`, detail: "历史变短 (压缩/重写)" };
+      return { mark: `pfx<${curMsgsJson.length}`, detail: "历史变短 (压缩/重写)", prevMsgs: prev.msgs };
     }
     // 消息纯追加: 再查 messages 之外的顶层参数 (max_tokens/temperature/tool_choice 等)
     if (prev.params !== paramsJson) {
@@ -2822,9 +2834,10 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
           .filter((k) => JSON.stringify(a[k]) !== JSON.stringify(b[k]))
           .join(",");
       } catch { keys = "?"; }
-      return { mark: "pfx~params", detail: `顶层参数变化: ${keys || "?"}` };
+      return { mark: "pfx~params", detail: `顶层参数变化: ${keys || "?"}`, prevMsgs: prev.msgs };
     }
-    return { mark: "", detail: "" }; // 纯追加且参数一致, 健康
+    // 纯追加且参数一致, 健康 (prevMsgs 仍带出: level 2 低命中落盘时作对照基线)
+    return { mark: "", detail: "", prevMsgs: prev.msgs };
   }
   const role = (j) => {
     try { const m = JSON.parse(j); return m.role || m.type || "?"; } catch { return "?"; }
@@ -2856,6 +2869,7 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
   return {
     mark: `pfx~${i}`,
     detail: `消息 ${i} (${role(a)}) 分叉:\n旧 ${brief(a, d)}\n新 ${brief(b, d)}`,
+    prevMsgs: prev.msgs,
   };
 }
 
@@ -3158,7 +3172,9 @@ const server = http.createServer(async (req, res) => {
     accumulate(rec, !!usageStr);
     // 会话请求序号: 仅对有 usage 的请求递增 (与 ch 统计同口径)。
     // 会话累计 in/cr 用于 ch 输出; 当前次 cachehit<50% 时计算与最近一次低缓存命中请求的
-    // 序号差 gap, 输出在 ch 前 (首次低缓存只记录基准, 不输出 gap)
+    // 序号差 gap, 输出在 ch 前 (首次低缓存只记录基准, 不输出 gap)。
+    // level 2 时低命中也落盘 (参照前缀分叉处理): 无 pfx~ 标记的低命中多为上游/中转侧问题,
+    // 落盘 client/upstream 双 body + 上次消息基线对照 (level 3 已全量落盘, 不重复)
     let gapStr = "";
     let gapVal = null; // gap 数值 (JSONL 用); 先存再更新 lastLowCacheSeq, 否则减后恒为 0
     if (usageStr && session) {
@@ -3173,6 +3189,10 @@ const server = http.createServer(async (req, res) => {
           gapStr = ` ${cRed(`gap:${gapVal}`)}`;
         }
         session.lastLowCacheSeq = session.seq;
+        if (LOG_LEVEL === 2) {
+          const c = req._cmdc || {};
+          fulllogDumpL2(req, pathname, session, req._cmdc.pfx, `缓存低命中 ${pct}%`, c.rawBody, c.upstreamBody);
+        }
       }
     }
     // 滚动统计仅在 200 且本次请求解析到 usage (输出 in/out/rt/cr/cw) 时追加;
@@ -3334,7 +3354,7 @@ const server = http.createServer(async (req, res) => {
       const pfx = prefixDivergeMark(session, oaiReq.messages, JSON.stringify(oaiReq.tools || ""), JSON.stringify({ ...oaiReq, messages: undefined }));
       req._cmdc.pfx = pfx;
       if (shouldDumpRequest(pfx.mark)) {
-        fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]], pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined);
+        fulllogDumpL2(req, pathname, session, pfx, pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined, bodyRaw, upstreamBodyJson);
       }
       const releaseUp0 = await acquireSessionLock(session);
       req._cmdc.dispatchAt = Date.now(); // took 从真正发往上游起算, 排队等待单列 qwait
@@ -3489,7 +3509,7 @@ const server = http.createServer(async (req, res) => {
       const pfx = prefixDivergeMark(session, chatReq.messages, JSON.stringify(chatReq.tools || ""), JSON.stringify({ ...chatReq, messages: undefined }));
       req._cmdc.pfx = pfx;
       if (shouldDumpRequest(pfx.mark)) {
-        fulllogDump(req, pathname, session, [["client", bodyRaw], ["upstream", upstreamBodyJson]], pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined);
+        fulllogDumpL2(req, pathname, session, pfx, pfx.mark ? `前缀分叉 ${pfx.mark}` : undefined, bodyRaw, upstreamBodyJson);
       }
       const releaseUp0 = await acquireSessionLock(session);
         req._cmdc.dispatchAt = Date.now(); // took 从真正发往上游起算, 排队等待单列 qwait

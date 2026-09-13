@@ -57,7 +57,7 @@
  *      (改为文本提取, 块数组与拼接字符串两种客户端形态产生相同字节)。
  *   9. stripSystemReminders (默认 true): 整条剥离 history 中注入的 system 提醒
  *      (配额计数/任务催促), 提示性内容不影响编码能力; 请求落盘由环境变量
- *      CMC_LOGGING_FILE 分级控制 (见下方注释), 文件固定为 ROOT/fulllog.log;
+ *      CMC_LOGGING_FILE 分级控制 (见下方注释), 文件固定为 ROOT/logs/fulllog.log;
  *      滚动记录: 仅保留最近 50 条 (标签同终端 S{id}#{req}), 不再无限增长。
  *      jsonlLog (可选): 独立的结构化 JSONL 请求日志开关 (与 CMC_LOGGING_FILE 无关),
  *      记录与终端 REQ/RES 两行同源的当前次请求数据, 在 RES 输出时写一条 JSON,
@@ -232,17 +232,18 @@ try {
 //       另: RES 时缓存低命中 (ch<50%) 也落盘 (无分叉标记时多为上游/中转侧问题);
 //       二者均附上次请求消息基线 (prev-msgs) 供对照 —— level 3 全量落盘已含上次请求, 不重复
 //   3 = 全部模型类请求落盘 (原 config.fulllog=true 行为)
-// 文件固定为 ROOT/fulllog.log (已在 .gitignore), **滚动记录**: 内存保留最近 FULLLOG_MAX 条,
+// 文件固定为 ROOT/logs/fulllog.log (与 jsonl 日志同放 logs/ 目录, 已在 .gitignore), **滚动记录**: 内存保留最近 FULLLOG_MAX 条,
 // 落盘时覆盖写入整个窗口 —— 文件恒为最近 50 条, 不会像旧实现那样无限增长。
 // 每条记录的头部标签沿用终端 REQ/RES 行的 S{会话}#{请求} 格式 (如 S5#90, 见请求入口
 // req._cmdcTag), 便于与终端日志逐条对照。
 // 版式: 记录内不留空行 (头标签 + ---- client/upstream ---- 分隔 + 正文紧凑相连),
 // 记录之间空一行 (flush 时用 "\n\n" 拼接), 扫日志时一条记录一块。
 const LOG_LEVEL = Math.max(0, parseInt(process.env.CMC_LOGGING_FILE || "0", 10) || 0);
-const FULLLOG_PATH = LOG_LEVEL > 0 ? path.join(ROOT, "fulllog.log") : null;
+const FULLLOG_PATH = LOG_LEVEL > 0 ? path.join(ROOT, "logs", "fulllog.log") : null;
 const FULLLOG_MAX = 50; // 滚动窗口: 最多保留的记录条数
 // 启动即清空历史文件: 旧实现可能已留下超大文件, 新窗口从空开始 (滚动语义, 不跨进程累积)
 if (FULLLOG_PATH) {
+  try { fs.mkdirSync(path.dirname(FULLLOG_PATH), { recursive: true }); } catch {}
   try { fs.truncateSync(FULLLOG_PATH); } catch { /* 文件不存在等, 忽略 */ }
 }
 const fulllogRing = []; // 最近 FULLLOG_MAX 条记录 (含头部与分隔的字符串)
@@ -307,7 +308,7 @@ function logSevere(req, pathname, session, message) {
 // 结构化 JSONL 请求日志 (config.json jsonlLog, 独立于 CMC_LOGGING_FILE 分级落盘):
 //   与终端 REQ/RES 两行同源的**当前次**请求数据, 在 RES 输出时组织成一条 JSON 记录追加写入
 //   (滚动统计/累计数据不入档), 供后续离线分析。启用方式:
-//     jsonlLog: true        -> 写 ROOT/requests.jsonl
+//     jsonlLog: true        -> 写 ROOT/logs/requests.jsonl (按日切片归档文件多, 集中放 logs/ 目录)
 //     jsonlLog: "<路径>"    -> 相对 proxy.js 目录解析 (如 "log/requests.jsonl", 自动建目录)
 //     未设置 / false        -> 关闭
 //
@@ -326,7 +327,7 @@ const JSONL_ROTATE_KEEP = JSONL_ROTATE_OFF ? 0 : Math.max(1, parseInt(jsonlRotat
 const JSONL_LOG = (() => {
   const v = config.jsonlLog;
   if (v === false || v == null) return null;
-  const p = typeof v === "string" ? path.resolve(ROOT, v) : path.join(ROOT, "requests.jsonl");
+  const p = typeof v === "string" ? path.resolve(ROOT, v) : path.join(ROOT, "logs", "requests.jsonl");
   try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {}
   return p;
 })();

@@ -940,15 +940,22 @@ function reasoningSignature(text) {
 /**
  * 会话级 reasoning 缓存: tool_call_id -> reasoning 原文 (上游返回时记录)。
  * 客户端未回传 thinking 块 (未开 thinking / 历史被压缩改写 / 跨进程重启) 时, 出站回填优先
- * 取这里, 避免用占位串顶替真实思考。FIFO 有界, 防长会话无限增长。
+ * 取这里, 避免用占位串顶替真实思考。
+ *
+ * 容量必须覆盖**整段会话**, 不能"够用就好": 条目一旦被淘汰, 对应消息的 reasoning_content
+ * 就从实文翻转成占位串, 出站字节随之改变 —— 该消息之后的前缀缓存整段失效 (实测单次代价
+ * 约 19x: $0.0454 vs $0.0024), 且淘汰边界会随会话增长逐条前爬, 每隔一两个请求复发一次。
+ * 上限取一个真实会话到不了的大值: 实测约 0.85 个 tool_call / 1K 上下文 token, 4096 条约
+ * 对应 4M token 的会话, 远超客户端压缩前的实际长度。内存与"会话内 reasoning 原文总量"
+ * 同阶 (实测 ~0.3MB / 长会话, 且这份文本每轮请求体本身就在传), 另由会话空闲回收兜底。
  */
-const REASONING_CACHE_MAX = 128;
+const REASONING_CACHE_MAX = 4096;
 function rememberReasoning(session, ids, text) {
   if (!REASONING_BRIDGE || !session || !text || !Array.isArray(ids) || !ids.length) return;
   const m = session.reasoning || (session.reasoning = new Map());
   for (const id of ids) {
     if (!id) continue;
-    m.delete(id); // 重新插入到末尾: 最近用到的 tool_call 不易被淘汰
+    m.delete(id); // 重新插入到末尾: 最近用到的 tool_call 最后被淘汰
     m.set(id, text);
   }
   while (m.size > REASONING_CACHE_MAX) m.delete(m.keys().next().value);
@@ -2896,11 +2903,25 @@ let nextSessionId = 1;
 function getSession(key) {
   let s = sessions.get(key);
   if (!s) {
-    s = { id: nextSessionId++, reqSeq: 0, pending: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null, reasoning: null };
+    s = { id: nextSessionId++, reqSeq: 0, pending: 0, seq: 0, lastLowCacheSeq: null, in: 0, cr: 0, pfx: null, reasoning: null, seen: 0 };
     sessions.set(key, s);
   }
+  s.seen = Date.now(); // 每次请求刷新, 供空闲回收判断
   return s;
 }
+
+// 会话空闲回收: reasoning 缓存按会话常驻 (见 rememberReasoning), 长跑进程需兜底回收。
+// 阈值取 12h —— 客户端午休/断线重连回来仍复用同一份缓存 (实测隔 2h 的上游前缀缓存仍全
+// 命中), 只有隔夜级别的空闲才回收, 避免"回收 → 会话重建 → 前缀一次性失效"的副作用。
+// 在途请求的 seen 时间必定很新, 不会被误删。
+const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
+const SESSION_SWEEP_MS = 30 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, s] of sessions) {
+    if (now - (s.seen || 0) > SESSION_IDLE_MS) sessions.delete(key);
+  }
+}, SESSION_SWEEP_MS).unref();
 
 // 同会话上游请求串行化: CC 的探测请求 (会话标题生成) 与主请求毫秒级并发到达,
 // 中转侧曾出现主请求 300s 无响应头悬挂; 同会话改为排队发送规避并发

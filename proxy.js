@@ -642,6 +642,23 @@ function warnVisionRoute(routed, sessTag) {
   console.warn(TAGW, `${tag ? tag + " " : ""}带图请求模型 ${routed.from} 判定不支持视觉 (${routed.reason || "defaultVisionModels 白名单"}), 前置路由 → ${routed.model}`);
 }
 
+/** 模型解析失败回退默认 (pickModelWithFlag isFallback) 的 warn 提示 (三条转发路径共用)。
+ *  只在回退换成了"另一个模型"时输出: 文本请求回退到 defaultModels[0] 常与请求的裸名是同一个
+ *  模型 (如 deepseek-v4.1-flash -> deepseek/deepseek-v4.1-flash, 仅差 provider 前缀), 这种静默
+ *  —— 否则每轮都刷一行。回退到不同模型 (典型是带图请求落到 defaultVisionModels[0]) 必须提示:
+ *  该路径原本没有任何输出, 现象就是"模型莫名被换掉, 日志里找不到原因"。
+ *  reason 附上游目录状态, 区分"列表为空 (启动时拉取失败)"与"列表中没有该模型"。 */
+function warnModelFallback(decision, requested, isImage, sessTag) {
+  if (!decision || !decision.isFallback || !requested) return;
+  const bare = (s) => String(s).replace(/^[^/]*\//, "").toLowerCase();
+  if (bare(decision.model) === bare(requested)) return; // 仅 provider 前缀差异 = 同一个模型: 静默
+  const tag = typeof sessTag === "function" ? sessTag() : "";
+  const listLen = upstreamModelsCache.list.length;
+  const reason = listLen ? `上游目录 ${listLen} 个模型里无匹配项` : "上游模型列表为空 (启动时拉取失败?)";
+  const slot = isImage ? "defaultVisionModels[0]" : "defaultModels[0]";
+  console.warn(TAGW, `${tag ? tag + " " : ""}模型 ${requested} 解析失败 (${reason}) → 按${isImage ? "带图" : "文本"}类型回退 ${slot} = ${decision.model}`);
+}
+
 /** OpenAI messages 数组是否含 image_url part (任意角色) */
 function openAIMessagesHaveImages(messages) {
   if (!Array.isArray(messages)) return false;
@@ -3314,6 +3331,7 @@ const server = http.createServer(async (req, res) => {
 
       if (useAnthropicEndpoint) {
         // Claude 模型 -> 直接走上游 /messages
+        warnModelFallback({ model: mapped, isFallback: mappedFallback }, body.model, isImage, sessTag);
         body.model = mapped;
         const upstreamBodyJson = JSON.stringify(body);
         req._cmdc.upstreamBody = upstreamBodyJson;
@@ -3362,6 +3380,7 @@ const server = http.createServer(async (req, res) => {
       // 用"剥离后的最终请求类型"重新决策模型并覆盖, 转换函数使用
       const finalImage = imgCount > 0 && !(CLEAN_HISTORY_IMAGES && imgNew === 0);
       const finalDecision = pickModelWithFlag(body.model, finalImage);
+      warnModelFallback(finalDecision, body.model, finalImage, sessTag);
       // 带图前置路由 (visionAutoRoute): 最终模型判定不支持视觉时改走 defaultVisionModels[0]
       const routed = visionRoute(finalDecision, finalImage);
       warnVisionRoute(routed, sessTag);
@@ -3451,6 +3470,7 @@ const server = http.createServer(async (req, res) => {
       const isImage = imgCount > 0;
       const requested = body.model || defaultForType(isImage);
       const decision = pickModelWithFlag(body.model, isImage);
+      warnModelFallback(decision, body.model, isImage, sessTag);
       // 带图前置路由 (visionAutoRoute): 决策模型判定不支持视觉时改走 defaultVisionModels[0]
       const routed = visionRoute(decision, isImage);
       warnVisionRoute(routed, sessTag);
@@ -3504,6 +3524,7 @@ const server = http.createServer(async (req, res) => {
       const imgCount = countImagesDeep(body);
       const requested = body.model || defaultForType(imgCount > 0);
       const decision = pickModelWithFlag(body.model, imgCount > 0);
+      warnModelFallback(decision, body.model, imgCount > 0, sessTag);
       const mapped = decision.model;
       body.model = mapped; // 转换函数使用
       req._cmdc = { model: requested, mapped, stream: isStream, img: imgCount };

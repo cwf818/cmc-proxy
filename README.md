@@ -239,7 +239,7 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
    2. 大小写不敏感匹配；
    3. **去 provider 前缀按裸名匹配**（`deepseek-v4-flash` → `deepseek/deepseek-v4-flash`、`qwen3.8-max` → `Qwen/Qwen3.8-Max`）；
    4. **去 `[*]` 后缀匹配**（`deepseek-v4-flash[1m]` → `deepseek/deepseek-v4-flash`，视为同模型的不同上下文窗口变体）。
-3. **无任何匹配** → 按请求类型回退默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）。
+3. **无任何匹配** → 按请求类型回退默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）。回退**换成了另一个模型**时打印一行 warn：`模型 <请求名> 解析失败 (<上游目录 N 个模型里无匹配项 | 上游模型列表为空 (启动时拉取失败?)>) → 按带图/文本类型回退 defaultVisionModels[0] = <模型>`；回退后与请求名仅有 provider 前缀差异（同一个模型，如 `deepseek-v4.1-flash` → `deepseek/deepseek-v4.1-flash`）时静默，避免每轮刷屏。上游模型列表只在启动时预热一次（失败仅 warn，之后靠客户端请求 `/v1/models` 重试），列表为空时上述回退会覆盖该进程的**全部**请求。
 
 因此本地客户端（尤其 Claude Code）可以直接用**不带前缀**的模型名，例如 `/model` 输入 `deepseek-v4-flash`、`kimi-k2.7-code` 等，都会被自动映射。
 

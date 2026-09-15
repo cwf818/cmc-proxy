@@ -13,7 +13,7 @@
 - 同时提供 **OpenAI 兼容**（`/v1/chat/completions`）、**Anthropic 兼容**（`/v1/messages`，供 Claude Code）与 **Responses 兼容**（`/v1/responses`，供 Codex）三类端点；看上去 `opencode-go` 套餐也可以拿来改一下 `EndPoint`(`upstream` 和 `apikey`) 直接用，可能需要适应性修改，目前停了 ocgo 套餐，不去折腾了。
 - **协议转换**：GOAT 订阅不含任何 Claude 模型，Claude Code 请求自动 `Anthropic → OpenAI` 转换；Codex 的 Responses 请求自动 `Responses → Chat Completions` 转换（上游只有 chat/completions）；流式 + 工具调用全链路支持
 - **统一模型决策** `pickModel`：`modelMap` 显式映射 → 上游模型目录解析（`resolveModel`）→ 按请求类型回退默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）
-- **失败轮换** `switchOnFail`（支持布尔或 `{text, image}`）：失败 1 次即切换 + `failTTL` 冷却（**只对回退到默认的模型生效**，用户显式指定模型失败不冷却、下次仍从它开始）；文本请求按 `defaultModels`、带图请求按 `defaultVisionModels` 轮换（带图请求 400 也轮换，图片不支持的报错就是 400）
+- **失败轮换** `switchOnFail`（支持布尔或 `{text, image}`）：首个选定模型（显式指定/兜底默认）先按 `firstModelAttempts` 尝试（默认 2 次 = 首发 + 1 次重试，**仅瞬时故障** 408/429/5xx/网络错误才原地重试，400 能力错配/403/404 直接轮换），其后的轮换候选各 1 次机会，失败模型进 `failTTL` 冷却（**只对回退到默认的模型生效**，用户显式指定模型失败不冷却、下次仍从它开始）；文本请求按 `defaultModels`、带图请求按 `defaultVisionModels` 轮换（带图请求 400 也轮换，图片不支持的报错就是 400）。关闭时本 proxy 不重试、失败原样返回，重试交由 agent 管理
 - **多模态**：`visionAutoRoute` （2026-9-6新增）在带图请求决策出"判定不支持视觉"的模型时**前置改走** `defaultVisionModels[0]`（免上游 400错误请求/200静默盲视）；因为最近调deepseek v4 flash时已经从之前的400变成了200，导致仅靠失败轮换失效；`tool_result` 内嵌图片抽出注入同轮 user 消息透传；`cleanHistoryImages` 可在本轮无新图时清理历史图片，让请求安全回流纯文本模型；REQ 行 `img=N(新M)` 标记 + 会话标签 `@` 前缀
 - **前缀缓存优化**：注入提醒剥离、易变计数器取整、`cache_control` 透传、会话缓存亲和——同会话 Claude Code / Codex 的上游前缀缓存可稳定在 95%+；RES 行内置前缀分叉探测（`pfx~` 标记）可定位缓存失效来源。此类信息主要用于调试，正常使用请忽略。
 - **Codex 新协议全兼容**：`custom`（apply_patch freeform）/ `tool_search`（延迟工具发现）/ `namespace` 工具组 / 顶层 `function_call` 历史等新形态全链路支持
@@ -86,7 +86,7 @@ node build.js --out dist       # 自定义输出目录
   上游端点   : https://api.commandcode.ai/provider
   默认模型   : deepseek/deepseek-v4.1-flash(默认) → z-ai/glm-5.3-flash → Qwen/Qwen3.8-27B
   视觉模型   : deepseek/deepseek-v4.1-flash(默认) → xiaomi/mimo-v2.5 → z-ai/glm-5.3-flash → Qwen/Qwen3.8-27B
-  失败轮换   : 对象 {text:true, image:true} (失败1次即切换 + 30s 冷却)
+  失败轮换   : 对象 {text:true, image:true} (首个模型 2 次尝试, 仅瞬时故障原地重试; 轮换候选各 1 次 + 30s 冷却)
   历史图清理 : 关闭 (历史图随上下文保留)
   tool结果图 : 保留 (注入 user 消息透传)
 ----------------------------------------------------------
@@ -212,22 +212,22 @@ GOAT 订阅**不包含 Claude 全系**（Sonnet 需 Pro、Opus 需 Provider）�
 
 开启后的精确语义（`proxy.js` 的 `upstreamFetchRotate`）：
 
-1. **轮换列表按请求类型**：文本请求 → `defaultModels`，带图请求 → `defaultVisionModels`。去重后候选只剩 1 个时（典型情况：该类型列表只有 1 个模型，且首个候选就是它）不轮换；banner 在两个列表都不足 2 个时会显示"不适用 (列表仅一个模型, 不轮换)"。
+1. **轮换列表按请求类型**：文本请求 → `defaultModels`，带图请求 → `defaultVisionModels`。去重后候选只剩 1 个时（典型情况：该类型列表只有 1 个模型，且首个候选就是它）**没有轮换候选**，但该模型仍享受首个候选的重试次数（`firstModelAttempts`）。
 2. **候选序列**：`pickModel` 决策出的模型（尊重客户端显式意图，含 `blockedModels` 中的模型）作为**首个候选**，随后按类型列表顺序补全并去重。每次尝试都会重写请求体里的 `model` 字段——上游实际收到的模型跟着变。
-3. **失败 1 次即切换**：不再区分"首个模型/后续模型"，失败立刻换下一个候选。
+3. **首个候选先原地重试，才轮换**：候选序列的 `i === 0`（客户端显式指定模型，或未带 model / 解析失败后兜底到 `defaultForType` 的默认模型）在换模型前最多尝试 `firstModelAttempts` 次（默认 `2`，即首发 + 1 次重试；支持数字或 `{text, image}`，非正整数按 2 处理）。**只有瞬时故障才原地重试**（见第 5 条），确定性失败（400 能力错配 / 403 订阅不可用 / 404 模型不存在）同模型重试必然复现，直接跳到下一个候选、不浪费次数。`i >= 1` 的轮换候选**恒 1 次机会**，失败即继续下一个候选（不会再重试）。`firstModelAttempts: 1` 即回到「失败 1 次就轮换」的旧行为。
 4. **TTL 冷却（只对回退到默认的模型生效）**：失败模型进入冷却（`config.failTTL`，默认 30000ms），冷却期内**跨请求**也跳过该模型并打印 `模型 X 冷却中, 跳过`；成功即清除冷却。`failTTL: 0` 关闭冷却。**用户显式指定的模型（经 `modelMap` / 目录解析命中，未落到回退点）不冷却**——不去猜测用户指定模型的能力（如纯文本模型收到带图请求），失败即轮换，下次请求仍从它开始；只有**未带 model 或指定模型解析失败、回退到 `defaultForType` 的模型**（`defaultModels[0]` / `defaultVisionModels[0]`）失败才进入冷却。默认列表里的后续候选（轮换到的 index ≥ 1）无论何种情况都照常冷却。
-5. **哪些失败才轮换**：`403 / 404 / 408 / 429 / 500 / 502 / 503 / 504` 与网络层错误（含首字节超时）。`400 / 401 / 413 / 422` 等（请求体非法、key 无效、body 超限）换任何模型结果都一样，不轮换、直接透传，避免一个失败放大成 N 个。**两类 400 例外**：(a) **带图请求的 400**（图片不支持的报错就是 400）；(b) **状态/能力错配类 400** —— 错误体匹配 `reasoning_content ... must be passed back` / `thinking mode` / `does not support image|vision` 等（换模型确实可解，见「reasoning / thinking 桥接」），日志打印 `上游 400 (<model>), 状态错配轮换 → <next>`。为判断是否属于 (b)，400 的响应体会被读取一次用于匹配；**不轮换时用读到的文本重建 Response 原样透传**（body 不丢失）。注意**任何**非 2xx 都会记入冷却表（用户显式指定模型除外），不轮换的那几类也会让该模型冷却一个 TTL。
-6. **成功即停**：任一候选返回 2xx 即用该响应继续原有流程（流式转换/透传），并把 RES 行的 `model=` 更新为实际生效的模型（`reasoningBridge` 的回填在候选切换后依然生效——注入字段被所有候选接受）。
-7. **全部试完**：把**最后一次**尝试的上游响应（状态码 + body）或错误透传给客户端，客户端看到的是真实收尾结果。**每次将被轮换掉的失败尝试都会先补一条 RES 形态的行**（与 REQ 行配对，不必等到最终结果）：`[ts] S1#2 <status> POST /v1/messages model=<model> try=i/N took=<该次耗时> [code=... msg=...]` —— 网络层失败记 `502`（调用方就此收尾会返回的状态）并带 `code=` / `msg=` 摘要，HTTP 失败记上游**真实**状态码（错误体摘要留在随后的 `[cmc-proxy]` 动作行）。随后打印动作行：`上游 <status> (<model>), 轮换 → <next> (i/N): <错误体摘要>` 或 `上游请求失败 (<model>): code=<错误码> msg=<错误信息>, 轮换 → <next> (i/N)`。错误码/信息来自 `e.cause` 链（Node fetch 只抛 `fetch failed`，真正原因是 `ECONNREFUSED` / `ENOTFOUND` / `UND_ERR_CONNECT_TIMEOUT` 等），首字节超时/客户端断开分别标注 `FIRST_BYTE_TIMEOUT` / `CLIENT_ABORT`；502 收尾与客户端错误体同样带 `code=` / `msg=` 摘要，便于定位。终态失败不再补尝试行（由 RES 行负责），避免重复。
+5. **哪些失败才轮换 / 才重试**：`403 / 404 / 408 / 429 / 500 / 502 / 503 / 504` 与网络层错误（含首字节超时）都会**离开当前候选**（换下一个模型）。其中属于**瞬时故障**的 `408 / 429 / 500 / 502 / 503 / 504` 与网络层错误，在首个候选还有剩余次数时会**原地重试**（同模型再发一次），重试有概率自愈；`403`（订阅不可用）/ `404`（模型不存在）是确定性结果，不重试、直接轮换。`400 / 401 / 413 / 422` 等（请求体非法、key 无效、body 超限）换任何模型结果都一样，不轮换也不重试、直接透传，避免一个失败放大成 N 个。**两类 400 例外**：(a) **带图请求的 400**（图片不支持的报错就是 400）；(b) **状态/能力错配类 400** —— 错误体匹配 `reasoning_content ... must be passed back` / `thinking mode` / `does not support image|vision` 等（换模型确实可解，见「reasoning / thinking 桥接」），日志打印 `上游 400 (<model>), 状态错配轮换 → <next>`。这两类 400 属确定性失败，会跳过当前候选剩余的重试次数、立即轮换。为判断是否属于 (b)，400 的响应体会被读取一次用于匹配；**不轮换时用读到的文本重建 Response 原样透传**（body 不丢失）。注意**任何**非 2xx 都会记入冷却表（用户显式指定模型除外），不轮换的那几类也会让该模型冷却一个 TTL。
+6. **成功即停**：任一次尝试（含首个候选的原地重试）返回 2xx 即用该响应继续原有流程（流式转换/透传），并把 RES 行的 `model=` 更新为实际生效的模型（`reasoningBridge` 的回填在候选切换后依然生效——注入字段被所有候选接受）。
+7. **全部试完**：把**最后一次**尝试的上游响应（状态码 + body）或错误透传给客户端，客户端看到的是真实收尾结果。**每次后面还有尝试（原地重试或轮换）的失败尝试都会先补一条 RES 形态的行**（与 REQ 行配对，不必等到最终结果）：`[ts] S1#2 <status> POST /v1/messages model=<model> try=i/N took=<该次耗时> [code=... msg=...]` —— 这里 `try=i/N` 是**本请求的第 `i` 次尝试 / 总尝试次数 `N`**（`N = firstModelAttempts + 轮换候选数`，冷却跳过的候选也计入分母），不是"第几个候选"。网络层失败记 `502`（调用方就此收尾会返回的状态）并带 `code=` / `msg=` 摘要，HTTP 失败记上游**真实**状态码（错误体摘要留在随后的 `[cmc-proxy]` 动作行）。随后打印动作行：`上游 <status> (<model>), 原地重试 (尝试 i/N): <错误体摘要>`（瞬时故障，同模型重试）或 `上游 <status> (<model>), 轮换 → <next> (尝试 i/N): <错误体摘要>`；网络层失败对应 `上游请求失败 (<model>): code=<错误码> msg=<错误信息>, 原地重试 (尝试 i/N)` / `..., 轮换 → <next> (尝试 i/N)`。错误码/信息来自 `e.cause` 链（Node fetch 只抛 `fetch failed`，真正原因是 `ECONNREFUSED` / `ENOTFOUND` / `UND_ERR_CONNECT_TIMEOUT` 等），首字节超时/客户端断开分别标注 `FIRST_BYTE_TIMEOUT` / `CLIENT_ABORT`；502 收尾与客户端错误体同样带 `code=` / `msg=` 摘要，便于定位。终态失败不再补尝试行（由 RES 行负责），避免重复。
 8. **全部在冷却期**：不再发起请求，直接把冷却错误交给调用方（502 收尾）。
 9. **客户端断开立即终止**：不再重试，也不计失败。
 10. **边界**：轮换只覆盖**响应头阶段**的失败（拿到响应头之后、向客户端写任何字节之前，重试是安全的）；**中途断流不可重试**（字节已发出）。重试期间全程持有该会话串行锁，同会话后续请求会排队。
 11. **没有活动模型指针**：默认模型恒为 `defaultModels[0]` / `defaultVisionModels[0]`，一次成功的轮换**不会**改变后续请求的默认模型；跨请求规避已死模型只靠 TTL 冷却。
 
-**代价须知**：最坏耗时 ≈ 候选数 × 各自的首字节超时（`firstByteTimeout`，默认 120s），5 个模型的配置最坏可拖数分钟。通常配较小的 `firstByteTimeout`（如 15~30s）使用。
+**代价须知**：最坏耗时 ≈ **总尝试次数** × 各自的首字节超时（`firstByteTimeout`，默认 120s），总尝试次数 = `firstModelAttempts + 轮换候选数`（默认配置下 2 + 4 = 6），5 个模型的配置最坏可拖十数分钟。通常配较小的 `firstByteTimeout`（如 15~30s）使用；想彻底避免重试放大耗时就把 `firstModelAttempts` 设为 `1`。
 
 > 钉死单模型的语义请只保留 `defaultModels` 中的一个模型。旧配置中的 `defaultModel` 字段仍兼容（视为单元素列表），`imageCapableModels` 自动迁移为 `defaultVisionModels`。
-> `switchOnFail: false` 时单次请求不轮换，但回退到默认的模型失败仍会记入冷却表（`onRequestFail`），成功清除；用户显式指定的模型不记入。
+> `switchOnFail: false` 时单次请求不轮换也**不重试**（当次失败原样返回，重试交由 agent 侧管理），但回退到默认的模型失败仍会记入冷却表（`onRequestFail`），成功清除；用户显式指定的模型不记入。
 
 ### 模型匹配规则
 
@@ -342,7 +342,8 @@ Anthropic 协议里这条要求对应 **thinking 块**（`{type:"thinking", thin
 | `host`                     | `127.0.0.1`                           | 监听地址（可用 `--host` 覆盖）                                                                                                                         |
 | `upstream`                 | `https://api.commandcode.ai/provider` | 上游地址（尾部 `/` 自动去除）                                                                                                                          |
 | `apiKey`                   | —                                     | **必填**。GOAT API Key；环境变量 `CMDC_API_KEY` 优先                                                                                                   |
-| `switchOnFail`             | `false`                               | 轮换总闸：`true` / `false` / `{text, image}`（单布尔统一取值）                                                                                         |
+| `switchOnFail`             | `false`                               | 轮换总闸：`true` / `false` / `{text, image}`（单布尔统一取值）；关闭时本 proxy 不重试，失败原样返回                                                    |
+| `firstModelAttempts`       | `2`                                   | 首个选定模型轮换前的尝试次数（含首发）：`2` / `{text, image}`；仅瞬时故障原地重试，轮换候选恒 1 次                                                       |
 | `failTTL`                  | `30000`                               | 失败模型冷却毫秒数，`0` = 不冷却                                                                                                                       |
 | `defaultModels`            | `["deepseek/deepseek-v4-flash"]`      | 文本请求轮换列表，第一个为文本默认模型（旧 `defaultModel` 视为单元素）                                                                                 |
 | `defaultVisionModels`      | `[]`                                  | 带图请求轮换列表，第一个为视觉默认模型（旧 `imageCapableModels` 自动迁移）；为空时带图请求回退 `defaultModels[0]`                                      |
@@ -596,7 +597,7 @@ Get-NetTCPConnection -LocalPort 5411 -State Listen | Stop-Process
 
 或改 `config.json` 的 `port`。
 
-**请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用（`403`）。此错误会进入轮换（开启 `switchOnFail` 时当场换下一个模型）并让该模型冷却 `failTTL`；也可以手动调整 `defaultModels` / `defaultVisionModels` 或把该模型从 `blockedModels` 里排除。
+**请求报 `MODEL_NOT_IN_PLAN`** — 该模型 GOAT 订阅不可用（`403`）。此错误属确定性失败，**不会原地重试**，开启 `switchOnFail` 时当场换下一个模型，并让该模型冷却 `failTTL`；也可以手动调整 `defaultModels` / `defaultVisionModels` 或把该模型从 `blockedModels` 里排除。
 
 **带图请求拿到空/瞎编回答或 400** — 上游纯文本模型（如 `deepseek-v4-flash`）对图片的行为是 **400 拒绝 或 200 静默盲视**（实测两种都有，不同供应商/网关形态不一）。默认开启 `visionAutoRoute`：带图请求决策出的模型若判定不支持视觉，会**前置改走** `defaultVisionModels[0]`，不再把图片发给它。`visionAutoRoute: false` 时退回"先发原模型 + `switchOnFail.image` 轮换"的旧行为。历史图片会把会话一直钉在视觉模型上——先剥后送可用 `cleanHistoryImages: true`。
 

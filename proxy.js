@@ -63,13 +63,16 @@
  *      记录与终端 REQ/RES 两行同源的当前次请求数据, 在 RES 输出时写一条 JSON,
  *      供离线分析 (滚动/累计不入档)。详见 README「结构化请求日志 (JSONL)」。
  *  10. switchOnFail (默认 false): 轮换总开关, 支持布尔或 {text, image} 对象 (单布尔统一
- *      取值)。true 时失败 1 次即切换 + failTTL 冷却: 按请求类型选列表 (文本 defaultModels /
- *      带图 defaultVisionModels, 带图 400 也轮换), 失败模型 TTL 内冷却跳过, 全部失效时返回
- *      上游失败结果; false 时不轮换, 失败原样返回。模型决策见 pickModel (modelMap 优先 ->
- *      resolveModel 目录解析 -> 按请求类型回退默认)。**冷却只对回退到默认的模型生效**:
- *      用户显式指定的模型 (modelMap/目录解析命中) 失败不冷却、下次请求仍从它开始 —— 不去
- *      猜测用户指定模型的能力; 只有未带 model 或指定模型解析失败回退到 defaultForType 时,
- *      失败才进入 TTL 冷却 (默认列表内后续候选无论何种情况都照常冷却)。
+ *      取值)。true 时按请求类型选列表 (文本 defaultModels / 带图 defaultVisionModels,
+ *      带图 400 也轮换) 轮换 + failTTL 冷却: 首个选定模型 (显式指定/兜底默认) 先按
+ *      firstModelAttempts (默认 2 = 首发 + 1 次重试) 尝试, 但只对瞬时故障
+ *      (408/429/5xx 与网络层错误) 原地重试, 确定性失败 (400 能力错配/403/404) 直接轮换;
+ *      后续轮换候选各 1 次机会, 失败模型 TTL 内冷却跳过, 全部失效时返回上游失败结果;
+ *      false 时不轮换也不重试, 失败原样返回 (重试交给 agent 侧管理)。模型决策见 pickModel
+ *      (modelMap 优先 -> resolveModel 目录解析 -> 按请求类型回退默认)。**冷却只对回退到
+ *      默认的模型生效**: 用户显式指定的模型 (modelMap/目录解析命中) 失败不冷却、下次请求
+ *      仍从它开始 —— 不去猜测用户指定模型的能力; 只有未带 model 或指定模型解析失败回退到
+ *      defaultForType 时, 失败才进入 TTL 冷却 (默认列表内后续候选无论何种情况都照常冷却)。
  *  10a. visionAutoRoute (默认 true): 带图请求前置路由。true 时, 请求带图且决策出的模型
  *      判定不支持视觉 (modelCatalog vision 字段与 defaultVisionModels 白名单并集: 在名单内
  *      或 catalog vision:true 视为支持), 则不发该模型、改走 defaultVisionModels[0], 免上游
@@ -449,6 +452,21 @@ const switchOnFailFor = (isImage) => {
   }
   return false;
 };
+// ---- firstModelAttempts: 首个选定模型在轮换前的尝试次数 (含首发) ----
+// switchOnFail=true 时, 首个候选 (客户端显式指定 / 兜底默认, 即候选序列 i===0) 先原地重试:
+// 同模型再发一次只对**瞬时故障**有意义 (RETRY_STATUSES 的状态码与网络层错误), 确定性失败
+// (400 能力错配 / 403 订阅不可用 / 404 模型不存在) 同模型重试必然复现, 不重试、直接轮换。
+// 首个之后的轮换候选恒 1 次机会。支持数字或 {text, image} 对象, 默认 2 (首发 + 1 次重试);
+// 非正整数 (含 0/负数/NaN) 一律按默认 2 处理。
+const firstModelAttemptsRaw = config.firstModelAttempts;
+const firstModelAttemptsFor = (isImage) => {
+  const v = (firstModelAttemptsRaw && typeof firstModelAttemptsRaw === "object")
+    ? (isImage ? firstModelAttemptsRaw.image : firstModelAttemptsRaw.text)
+    : firstModelAttemptsRaw;
+  const n = parseInt(v ?? "2", 10);
+  return Number.isFinite(n) && n >= 1 ? n : 2;
+};
+
 // 失败模型冷却 (TTL): 模型失败后 TTL 毫秒内跳过该模型, 避免反复打已死模型。
 // 0 表示不冷却 (失败即从当次轮换中剔除, 跨请求仍可重试)。
 // ?? 保证显式 0 (不冷却) 不被默认值覆盖: 0 是合法配置值, 不能用 || 兜底
@@ -2320,6 +2338,13 @@ async function upstreamFetch(url, init, requestedModel, signal, isFallback = tru
 const ROTATE_STATUSES = new Set([403, 404, 408, 429, 500, 502, 503, 504]);
 
 /**
+ * 首个候选"原地重试"(同模型再发一次)有意义的上游状态码: 瞬时故障。
+ * 408 超时 / 429 限流 / 5xx 网关抖动重试有概率自愈; 403 (订阅不可用) / 404 (模型不存在)
+ * 属确定性结果, 同模型重试必然复现, 不重试直接轮换 (网络层抛错也视为瞬时, 见 catch 分支)。
+ */
+const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+/**
  * 400 的例外白名单: 一般 400 (请求体非法/key 无效/超限) 换任何模型结果一样, 不轮换;
  * 但"**模型状态/能力错配**"类 400 换模型确实可解 (如 thinking 模型的 reasoning 回传要求、
  * 模型不支持图片), 单列出来允许轮换。匹配错误体摘要 (upstreamBodyBrief)。
@@ -2345,7 +2370,10 @@ function rebuildResponse(r, text) {
  * 轮换语义 (switchOnFail=true 时):
  *   - 候选列表按请求类型: 文本请求 -> defaultModels, 带图请求 (isImage) -> defaultVisionModels;
  *     客户端显式映射的模型 (firstModel) 始终作为首个候选。
- *   - 失败 1 次即切换下一个候选 (不再有阈值/首个模型的区别)。
+ *   - 首个候选 (i===0, 含显式指定与兜底默认) 有 firstModelAttempts (默认 2) 次机会:
+ *     **仅瞬时故障** (RETRY_STATUSES 与网络层错误) 才同模型原地重试, 确定性失败 (400 能力
+ *     错配 / 403 / 404) 直接轮换 —— 同模型重试只会复现同样的结果。
+ *   - 非首候选 (轮换到的模型) 恒 1 次机会, 失败即继续下一个候选。
  *   - 模型失败后进入 TTL 冷却 (config.failTTL, 默认 30s), 冷却期内跳过该模型。
  *   - 候选全部在冷却期 (失效范围) 时, 不再轮换, 直接透传最后一次上游失败结果。
  * 冷却范围 (hooks.isFallback):
@@ -2353,11 +2381,13 @@ function rebuildResponse(r, text) {
  *     失败也不计入冷却 —— 不去猜测用户指定模型的能力, 下次请求仍从它开始。
  *   - isFallback=true (未带 model 或指定模型解析失败回退到默认): 首个候选照常冷却;
  *     默认列表里的后续候选 (index >= 1) 无论哪种情况都照常冷却 (方案 A)。
- * switchOnFail=false: 单次请求不轮换, 与 upstreamFetch 一致 (当次失败原样返回)。
+ * switchOnFail=false: 不轮换也不重试, 单次请求直接透传 (当次失败原样返回) ——
+ *   重试交给 agent 侧自行管理, 与 upstreamFetch 一致。
  * hooks.onModel(finalModel): 轮换后回调实际使用的模型, 供 RES 行 model= 展示。
- * hooks.onAttemptFail({status, model, detail, ms, attempt, total}): 某次尝试失败且将被轮换时回调,
- *   供调用方补一条与 REQ 配对的失败行 (status: 网络失败=502 / HTTP 失败=上游真实码)。
- *   仅在"还会继续重试"时触发; 全部候选试完的终态失败不触发 (由调用方 RES 行负责)。
+ * hooks.onAttemptFail({status, model, detail, ms, attempt, total}): 某次尝试失败且后面还有
+ *   尝试 (原地重试或轮换) 时回调, 供调用方补一条与 REQ 配对的失败行
+ *   (status: 网络失败=502 / HTTP 失败=上游真实码; attempt/total: 尝试序号/总尝试次数)。
+ *   仅在"还会继续尝试"时触发; 全部候选试完的终态失败不触发 (由调用方 RES 行负责)。
  */
 async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
   const { sessTag, onModel, onAttemptFail, isImage = false, isFallback = true } = hooks;
@@ -2376,6 +2406,12 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
   add(firstModel);
   for (const m of list) add(m);
   const pfx = sessTag ? `${sessTag()} ` : "";
+  // 每个候选的尝试次数: 首个候选 firstModelAttempts (默认 2 = 首发 + 1 次重试), 后续轮换候选恒 1
+  const firstAttempts = firstModelAttemptsFor(isImage);
+  const attemptsOf = (i) => (i === 0 ? firstAttempts : 1);
+  // 总尝试次数 (含因冷却被跳过的候选, 仅用于 try=N/M 展示)
+  const totalAttempts = candidates.reduce((n, _, i) => n + attemptsOf(i), 0);
+  let attemptNo = 0; // 全局尝试序号 (跨候选累加), 供日志 try=N/M
   // 每次尝试按候选模型重写 JSON body 的 model 字段 (轮换不能只换计数名, 上游实际收到的模型必须跟着变)
   const attemptInit = (model) => {
     if (typeof init.body !== "string") return init;
@@ -2387,66 +2423,87 @@ async function upstreamFetchRotate(url, init, firstModel, signal, hooks = {}) {
       return init;
     }
   };
+  const tryTag = () => `(尝试 ${attemptNo}/${totalAttempts})`;
   let lastErr = null;
-  for (let i = 0; i < candidates.length; i++) {
+  outer: for (let i = 0; i < candidates.length; i++) {
     const model = candidates[i];
     // 用户显式指定模型 (i===0 且非回退): 不检查冷却, 永远先试 —— 不去猜测它的能力
     const isUserModel = !isFallback && i === 0;
+    const tries = attemptsOf(i);
     // TTL 冷却: 冷却期内的模型跳过 (用户显式指定模型除外)
     if (!isUserModel && modelInCooldown(model)) {
       lastErr = upstreamError(`模型 ${model} 冷却中 (剩 ${Math.ceil(cooldownRemainMs(model) / 1000)}s)`);
       console.warn(TAGW, `${pfx}模型 ${model} 冷却中, 跳过`);
+      attemptNo += tries;
       continue;
     }
-    const t0 = Date.now(); // 本次尝试耗时 (仅该候选), 供失败行 took= 使用
-    try {
-      const r = await rawUpstreamFetch(url, attemptInit(model), signal);
-      if (r.ok) {
-        markModelOk(model);
-        if (onModel) onModel(model);
-        return r;
-      }
-      lastErr = r;
-      // 用户显式指定模型失败不冷却 (不去猜测能力), 只轮换; 回退/默认候选照常冷却
-      if (!isUserModel) markModelFail(model);
-      // 400 例外: 带图请求 (图片不支持的报错就是 400) 与状态/能力错配类 400 也轮换
-      if (r.status === 400) {
-        const brief = await upstreamBodyBrief(r); // 已消费 body: 不轮换时必须重建响应再透传
-        const stateMiss = ROTATE_400_PATTERNS.some((re) => re.test(brief));
-        if ((isImage || stateMiss) && i + 1 < candidates.length) {
-          if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: i + 1, total: candidates.length });
-          console.warn(TAGW, `${pfx}上游 400 (${model}), ${isImage ? "带图" : "状态错配"}轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
+    for (let a = 0; a < tries; a++) {
+      attemptNo++;
+      const t0 = Date.now(); // 本次尝试耗时 (仅该次), 供失败行 took= 使用
+      try {
+        const r = await rawUpstreamFetch(url, attemptInit(model), signal);
+        if (r.ok) {
+          markModelOk(model);
+          if (onModel) onModel(model);
+          return r;
+        }
+        lastErr = r;
+        // 用户显式指定模型失败不冷却 (不去猜测能力), 只轮换; 回退/默认候选照常冷却
+        if (!isUserModel) markModelFail(model);
+        // 400 例外: 带图请求 (图片不支持的报错就是 400) 与状态/能力错配类 400 也轮换
+        if (r.status === 400) {
+          const brief = await upstreamBodyBrief(r); // 已消费 body: 不轮换时必须重建响应再透传
+          const stateMiss = ROTATE_400_PATTERNS.some((re) => re.test(brief));
+          if ((isImage || stateMiss) && i + 1 < candidates.length) {
+            if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: attemptNo, total: totalAttempts });
+            console.warn(TAGW, `${pfx}上游 400 (${model}), ${isImage ? "带图" : "状态错配"}轮换 → ${candidates[i + 1]} ${tryTag()}${brief ? `: ${brief}` : ""}`);
+            continue outer; // 确定性失败: 放弃该候选剩余尝试, 直接换下一个
+          }
+          if (onModel) onModel(model);
+          return rebuildResponse(r, brief); // 不轮换 / 候选已试完: 原样透传 (含全部候选带图都失败)
+        }
+        if (!ROTATE_STATUSES.has(r.status)) {
+          if (onModel) onModel(model);
+          return r; // 401/413/422 等换模型无济于事的失败: 不轮换, 原样透传 (已计冷却)
+        }
+        // 瞬时故障且该候选还有剩余机会: 同模型原地重试, 不换候选
+        if (RETRY_STATUSES.has(r.status) && a + 1 < tries) {
+          const brief = await upstreamBodyBrief(r);
+          if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: attemptNo, total: totalAttempts });
+          console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), 原地重试 ${tryTag()}${brief ? `: ${brief}` : ""}`);
+          discardBody(r);
           continue;
         }
+        if (i + 1 < candidates.length) {
+          const brief = await upstreamBodyBrief(r);
+          if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: attemptNo, total: totalAttempts });
+          console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), 轮换 → ${candidates[i + 1]} ${tryTag()}${brief ? `: ${brief}` : ""}`);
+          discardBody(r);
+          continue outer;
+        }
         if (onModel) onModel(model);
-        return rebuildResponse(r, brief); // 不轮换 / 候选已试完: 原样透传 (含全部候选带图都失败)
-      }
-      if (!ROTATE_STATUSES.has(r.status)) {
-        if (onModel) onModel(model);
-        return r; // 401/413/422 等换模型无济于事的失败: 不轮换, 原样透传 (已计冷却)
-      }
-      if (i + 1 < candidates.length) {
-        const brief = await upstreamBodyBrief(r);
-        if (onAttemptFail) onAttemptFail({ status: r.status, model, ms: Date.now() - t0, attempt: i + 1, total: candidates.length });
-        console.warn(TAGW, `${pfx}上游 ${r.status} (${model}), 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})${brief ? `: ${brief}` : ""}`);
-        discardBody(r);
-        continue;
-      }
-      if (onModel) onModel(model);
-      return r; // 全部候选试完: 透传最后一次上游响应给客户端
-    } catch (e) {
-      if (e.clientAbort) throw e; // 客户端已断开, 立即终止, 不再重试
-      lastErr = e;
-      // 用户显式指定模型失败不冷却, 只轮换; 回退/默认候选照常冷却
-      if (!isUserModel) markModelFail(model);
-      if (i + 1 < candidates.length) {
-        const summary = upstreamErrSummary(e);
+        return r; // 全部候选试完: 透传最后一次上游响应给客户端
+      } catch (e) {
+        if (e.clientAbort) throw e; // 客户端已断开, 立即终止, 不再重试
+        lastErr = e;
+        // 用户显式指定模型失败不冷却, 只轮换; 回退/默认候选照常冷却
+        if (!isUserModel) markModelFail(model);
         // 网络层失败无 HTTP 状态: 按调用方收尾码记 502, 并把 code/msg 摘要写在这条配对行上
-        if (onAttemptFail) onAttemptFail({ status: 502, model, detail: summary, ms: Date.now() - t0, attempt: i + 1, total: candidates.length });
-        console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${summary}, 轮换 → ${candidates[i + 1]} (${i + 1}/${candidates.length})`);
-        continue;
+        const summary = upstreamErrSummary(e);
+        const failHook = () => onAttemptFail && onAttemptFail({ status: 502, model, detail: summary, ms: Date.now() - t0, attempt: attemptNo, total: totalAttempts });
+        // 网络层失败 (含首字节超时) 属瞬时故障: 同模型原地重试
+        if (a + 1 < tries) {
+          failHook();
+          console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${summary}, 原地重试 ${tryTag()}`);
+          continue;
+        }
+        if (i + 1 < candidates.length) {
+          failHook();
+          console.warn(TAGW, `${pfx}上游请求失败 (${model}): ${summary}, 轮换 → ${candidates[i + 1]} ${tryTag()}`);
+          continue outer;
+        }
+        throw e; // 全部候选试完: 抛最后一次错误, 调用方按 502 收尾
       }
-      throw e; // 全部候选试完: 抛最后一次错误, 调用方按 502 收尾
     }
   }
   // 候选全部在冷却期 (失效范围): 返回上游失败结果
@@ -3078,10 +3135,12 @@ const server = http.createServer(async (req, res) => {
   // 会话标签前导空格: @ 开头(带新图)不补, 否则补一个空格 —— REQ/RES 行:
   // 无图 "] S1#2", 带新图 "]@S1#3" 紧贴时间戳
   const tagPad = () => (req._cmdc && req._cmdc.imgNew ? "" : " ");
-  // 尝试失败行 (与 REQ 行配对): 轮换到下一个候选前, 为这次失败的尝试补一条 RES 形态的记录,
-  // 否则 REQ 行要等到最终成功/失败才有对应行。网络层失败记 502 (调用方就此收尾会返回的状态),
-  // HTTP 失败记上游真实状态码; try=i/N 标明这是第几个候选, 耗时按该次尝试单独计。
-  // 只在"还会继续重试"时输出, 终态失败由 RES 行负责, 避免重复。
+  // 尝试失败行 (与 REQ 行配对): 后面还有尝试 (同模型原地重试 / 轮换到下一个候选) 前,
+  // 为这次失败的尝试补一条 RES 形态的记录, 否则 REQ 行要等到最终成功/失败才有对应行。
+  // 网络层失败记 502 (调用方就此收尾会返回的状态), HTTP 失败记上游真实状态码;
+  // try=i/N 是本请求的第几次尝试 / 总尝试次数 (首个候选可有多次, 轮换候选各 1 次),
+  // 耗时按该次尝试单独计。
+  // 只在"还会继续尝试"时输出, 终态失败由 RES 行负责, 避免重复。
   const logUpFail = ({ status, model, detail, ms, attempt, total }) => {
     const stFn = status >= 500 ? cRed : status >= 400 ? cYellow : cCyan;
     const t = sessTag();
@@ -3664,7 +3723,17 @@ server.listen(PORT, HOST, () => {
   const sofDesc = switchOnFailRaw && typeof switchOnFailRaw === "object"
     ? `对象 {text:${!!switchOnFailRaw.text}, image:${!!switchOnFailRaw.image}}`
     : SWITCH_ON_FAIL ? "开启" : "关闭";
-  console.log(cBlue(`  失败轮换   : ${defaultModels.length < 2 && defaultVisionModels.length < 2 ? "不适用 (列表仅一个模型, 不轮换)" : `${sofDesc} (失败1次即切换 + ${FAIL_TTL / 1000}s 冷却)`}`));
+  // 首个候选的尝试次数 (text/image 一致时合并展示)
+  const faT = firstModelAttemptsFor(false);
+  const faI = firstModelAttemptsFor(true);
+  const faDesc = faT === faI ? `${faT} 次尝试` : `text:${faT}/image:${faI} 次尝试`;
+  const noRotate = defaultModels.length < 2 && defaultVisionModels.length < 2;
+  const sofLine = !SWITCH_ON_FAIL
+    ? `${sofDesc} (失败原样返回, 重试交由 agent)`
+    : noRotate
+      ? `开启 (列表仅一个模型, 不轮换; 首个模型 ${faDesc}, 仅瞬时故障原地重试 + ${FAIL_TTL / 1000}s 冷却)`
+      : `${sofDesc} (首个模型 ${faDesc}, 仅瞬时故障原地重试; 轮换候选各 1 次 + ${FAIL_TTL / 1000}s 冷却)`;
+  console.log(cBlue(`  失败轮换   : ${sofLine}`));
   console.log(cBlue(`  历史图清理 : ${CLEAN_HISTORY_IMAGES ? "开启 (无新图请求时剥离历史图, 回流请求指定模型)" : "关闭 (历史图随上下文保留)"}`));
   console.log(cBlue(`  tool结果图 : ${TOOL_RESULT_IMAGES ? "保留 (注入 user 消息透传)" : "丢弃 (折叠为 [image])"}`));
   const rbDesc = !REASONING_BRIDGE

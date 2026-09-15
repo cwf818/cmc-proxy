@@ -4,10 +4,15 @@
   "host": "127.0.0.1",
   "upstream": "https://api.commandcode.ai/provider",
   "apiKey": "",
-  "_失败轮换说明": "switchOnFail: 轮换总开关, 支持布尔或 {text, image} 对象, 单布尔表示统一取值。true 时失败 1 次即切换 + TTL 冷却 (failTTL) 轮换: 文本请求按 defaultModels, 带图请求按 defaultVisionModels, 失败模型 TTL 内冷却跳过, 全部失效时返回上游失败结果。false 时不轮换。",
+  "_失败轮换说明": "switchOnFail: 轮换总开关, 支持布尔或 {text, image} 对象, 单布尔表示统一取值。true 时按类型列表轮换 (文本 defaultModels / 带图 defaultVisionModels) + TTL 冷却 (failTTL): 首个选定模型 (显式指定/兜底默认) 先按 firstModelAttempts 尝试, 但只对瞬时故障 (408/429/5xx/网络错误) 原地重试, 确定性失败 (400 能力错配/403/404) 直接轮换, 首个之后的轮换候选各 1 次机会; 失败模型 TTL 内冷却跳过, 全部失效时返回上游失败结果。false 时不轮换也不重试 (失败原样返回, 重试交由 agent)。",
   "switchOnFail": {
     "text": true,
     "image": true
+  },
+  "_首模型尝试次数说明": "firstModelAttempts: 首个选定模型 (客户端显式指定 / 兜底默认) 在轮换前的尝试次数 (含首发), 默认 2 (= 首发 + 1 次重试)。仅瞬时故障 (408/429/500/502/503/504 与网络层错误) 才同模型原地重试; 400 能力错配 / 403 / 404 属确定性失败, 同模型重试必然复现, 不重试直接轮换。首个之后的轮换候选恒 1 次机会。支持数字或 {text, image}, 非正整数按默认 2 处理。",
+  "firstModelAttempts": {
+    "text": 2,
+    "image": 2
   },
   "_带图前置路由说明": "visionAutoRoute: 带图请求前置路由开关 (默认 true)。true 时, 请求带图且决策出的模型判定不支持视觉 (判定为 modelCatalog 的 vision 字段与 defaultVisionModels 白名单的并集: 在名单内 / catalog vision:true 视为支持), 则不发该模型、改走 defaultVisionModels[0]; false 时保持现状 (先按原模型发, 失败靠 switchOnFail 轮换)。",
   "visionAutoRoute": true,

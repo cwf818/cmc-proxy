@@ -32,7 +32,7 @@
 > 只有路径 A / B / B′ / C 参与模型决策、失败轮换与会话串行化（所有路径都打 REQ/RES 访问日志，非 model 请求无会话标签）；路径 D 只做 Key 注入与转发。
 
 所有转发路径都会做三件统一的事：
-1. **模型决策** `pickModel(requested, isImage)`：请求未带 model → 按请求类型取默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）；带了 model → 先查 `modelMap` 显式映射（命中即用，不区分请求类型，置空即关闭），未命中按 `config.resolveModel`（默认 true）目录匹配解析（命中即用，未命中按请求类型回退默认），`resolveModel:false` 时原样向上游请求。目录匹配规则：精确 → 大小写不敏感 → 去 provider 前缀按裸名匹配 → 去 `[*]` 后缀匹配（如 `deepseek-v4-flash[1m]` → `deepseek/deepseek-v4-flash`，视为同模型的不同上下文窗口变体）。之后进入轮换：`switchOnFail` 按请求类型选列表（文本 `defaultModels` / 带图 `defaultVisionModels`），失败 1 次即切换 + `failTTL` 冷却（详见 §7）。
+1. **模型决策** `pickModel(requested, isImage)`：请求未带 model → 按请求类型取默认（文本 `defaultModels[0]` / 带图 `defaultVisionModels[0]`）；带了 model → 先查 `modelMap` 显式映射（命中即用，不区分请求类型，置空即关闭），未命中按 `config.resolveModel`（默认 true）目录匹配解析（命中即用，未命中按请求类型回退默认），`resolveModel:false` 时原样向上游请求。目录匹配规则：精确 → 大小写不敏感 → 去 provider 前缀按裸名匹配 → 去 `[*]` 后缀匹配（如 `deepseek-v4-flash[1m]` → `deepseek/deepseek-v4-flash`，视为同模型的不同上下文窗口变体）。之后进入轮换：`switchOnFail` 按请求类型选列表（文本 `defaultModels` / 带图 `defaultVisionModels`），首个候选先按 `firstModelAttempts`（默认 2）尝试、仅瞬时故障原地重试，轮换候选各 1 次 + `failTTL` 冷却（详见 §7）。
 2. **Key 注入**：`buildUpstreamHeaders()` 强制写入 `Authorization: Bearer <apiKey>`（覆盖客户端传的任何值），并保留客户端的 `x-api-key`（若调用方未显式设置同名头）。
 3. **客户端断开联动**：`res.on("close")` 会中止上游请求（`AbortController`），打印 `ABT` 行；`CMC_LOGGING_FILE>=1` 时落盘。
 
@@ -265,7 +265,7 @@ User-Agent: claude-cli/2.0.0
 - **已知限制**：文本链路用 `[历史图片已清理]`，而 `tool_result` 折叠用的是 `[image]`（§2.2 表格）。带图轮次的图在下一轮变成占位文本时，该条消息内容必然与上一轮不同 → RES 行触发一次 `pfx~N` 分叉
 - 仅 `/v1/messages` 转换链路生效；`/v1/chat/completions`、`/v1/responses` 不清理
 
-**带图请求路由与轮换**（上游 `/chat/completions` 的 A/B/C 三条链路共用；B′ 直连 `/messages` 时按文本列表 `defaultModels` 轮换）：请求按类型分为文本/带图两种。`config.switchOnFail`（支持布尔或 `{text, image}` 对象，单布尔统一取值）为 true 时，失败 1 次即切换 + TTL 冷却（`config.failTTL`）轮换：文本请求按 `defaultModels` 轮换，带图请求按 `defaultVisionModels` 轮换（图片不支持的报错是 400，因此带图请求 400 也轮换），失败模型在 TTL 内冷却跳过，全部模型在冷却期时直接返回上游失败结果。**冷却只对回退到默认的模型生效**：用户显式指定模型（`modelMap` / 目录解析命中，未落到回退点）失败不冷却，下次请求仍从它开始（不去猜测其能力）；只有未带 model 或指定模型解析失败回退到 `defaultForType` 的模型失败才进入 TTL 冷却，默认列表内后续候选照常冷却。switchOnFail=false 时不轮换，失败原样返回。REQ 行的 `img=N(新M)` 标记显示请求体中检测到的图片块数，其中 `新M` 为最后一条 user 消息（当前轮）中的新图数（仅本路径计算）。
+**带图请求路由与轮换**（上游 `/chat/completions` 的 A/B/C 三条链路共用；B′ 直连 `/messages` 时按文本列表 `defaultModels` 轮换）：请求按类型分为文本/带图两种。`config.switchOnFail`（支持布尔或 `{text, image}` 对象，单布尔统一取值）为 true 时轮换 + TTL 冷却（`config.failTTL`）：文本请求按 `defaultModels` 轮换，带图请求按 `defaultVisionModels` 轮换（图片不支持的报错是 400，因此带图请求 400 也轮换），首个候选先按 `config.firstModelAttempts`（默认 2）尝试——只有瞬时故障（`408/429/5xx` 与网络层错误）同模型原地重试，确定性失败（400 能力错配 / `403` / `404`）直接轮换——其后的轮换候选各 1 次机会，失败模型在 TTL 内冷却跳过，全部模型在冷却期时直接返回上游失败结果。**冷却只对回退到默认的模型生效**：用户显式指定模型（`modelMap` / 目录解析命中，未落到回退点）失败不冷却，下次请求仍从它开始（不去猜测其能力）；只有未带 model 或指定模型解析失败回退到 `defaultForType` 的模型失败才进入 TTL 冷却，默认列表内后续候选照常冷却。switchOnFail=false 时不轮换也不重试，失败原样返回（重试交由 agent 侧管理）。REQ 行的 `img=N(新M)` 标记显示请求体中检测到的图片块数，其中 `新M` 为最后一条 user 消息（当前轮）中的新图数（仅本路径计算）。
 
 ### 2.3 Upstream Response（OpenAI 非流式）
 
@@ -655,23 +655,30 @@ data: [DONE]
 
 ```
 switchOnFail(按请求类型: text / image)?
-├─ false → 单次请求不轮换; 失败原样返回 (回退到默认的模型记入 failTTL 冷却表,
-│          用户显式指定的模型不记入; 成功清除)
+├─ false → 单次请求不轮换也不重试; 失败原样返回 (重试交由 agent 侧管理;
+│          回退到默认的模型记入 failTTL 冷却表, 用户显式指定的模型不记入; 成功清除)
 └─ true  → 候选序列 = [pickModel 决策出的模型] + 类型列表(defaultModels / defaultVisionModels) 去重
-           逐个尝试:
+           i===0 (首个候选) 有 firstModelAttempts 次机会 (默认 2); i>=1 (轮换候选) 恒 1 次
+           逐个候选尝试, 候选内逐次尝试:
              用户显式指定模型 (isFallback=false 且 i===0)
              └─ 不检查冷却, 永远先试; 失败不 markModelFail, 直接轮换
-             冷却中(modelInCooldown) → 跳过, 打印 "模型 X 冷却中, 跳过"
+             冷却中(modelInCooldown) → 跳过整个候选, 打印 "模型 X 冷却中, 跳过"
              2xx                    → 成功, 清除冷却, 结束
              非 2xx                 → markModelFail (进入冷却) [回退/默认候选]
-                  ├─ 带图且 400                → 轮换下一个
-                  ├─ 403/404/408/429/5xx       → 轮换下一个
-                  └─ 其他 (401/413/422...)     → 不轮换, 原样透传
-             网络层错误/首字节超时             → markModelFail, 轮换下一个
+                 ├─ 带图且 400            → 确定性失败: 放弃该候选剩余次数, 轮换下一个
+                 ├─ 400 状态/能力错配     → 同上 (reasoning 回传要求 / 不支持图片等)
+                 ├─ 403/404 (确定性)      → 不重试, 轮换下一个
+                 ├─ 408/429/5xx (瞬时)    → 该候选还有剩余次数 ? 同模型原地重试 : 轮换下一个
+                 └─ 其他 (401/413/422...) → 不轮换不重试, 原样透传
+             网络层错误/首字节超时 (瞬时)      → markModelFail, 同模型原地重试 / 轮换下一个
              客户端断开 (clientAbort)          → 立即终止整个循环
            全部试完 → 透传最后一次上游响应 (或抛最后一次错误 → 502)
            全部在冷却期 → 不发请求, 直接 502
 ```
+
+**重试 vs 轮换**：只有瞬时故障（`408/429/500/502/503/504` 与网络层错误）才值得同模型原地重试；
+`400` 能力错配、`403`（订阅不可用）、`404`（模型不存在）是确定性结果，重试必然复现，直接换模型。
+首个之后的轮换候选不再重试，避免失败请求放大 N 倍。
 
 **冷却范围**（`isFallback`）：只有回退到默认的模型（未带 model，或指定模型解析失败落到
 `defaultForType`）失败才 `markModelFail` 进入 TTL 冷却；用户显式指定的模型（`modelMap` /
@@ -681,10 +688,14 @@ switchOnFail(按请求类型: text / image)?
 轮换日志示例（`TAGW` = 黄色 `[cmc-proxy]` 前缀，带会话标签）：
 
 ```
-[cmc-proxy] S3#1 上游 403 (deepseek/deepseek-v4-flash), 轮换 → deepseek/deepseek-v4-flash-vision-exp (1/5)
-[cmc-proxy] S3#1 上游 400 (deepseek/deepseek-v4-flash), 带图轮换 → xiaomi/mimo-v2.5 (1/3)
+[cmc-proxy] S3#1 上游 503 (deepseek/deepseek-v4-flash), 原地重试 (尝试 1/6)
+[cmc-proxy] S3#1 上游 403 (deepseek/deepseek-v4-flash), 轮换 → deepseek/deepseek-v4-flash-vision-exp (尝试 2/6)
+[cmc-proxy] S3#1 上游 400 (deepseek/deepseek-v4-flash), 带图轮换 → xiaomi/mimo-v2.5 (尝试 3/6)
 [cmc-proxy] S3#1 模型 deepseek/deepseek-v4-flash 冷却中, 跳过
 ```
+
+> `尝试 i/N`：`i` 是本请求第几次尝试，`N = firstModelAttempts + 轮换候选数`（首个候选 2 次 + 其余各 1 次），
+> 冷却跳过的候选也计入分母；与配对失败行的 `try=i/N` 同源。
 
 ### 7.2 错误响应形状
 

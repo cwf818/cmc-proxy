@@ -92,6 +92,7 @@ const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { StringDecoder } = require("string_decoder");
 
 // ---------------------------------------------------------------------------
 // 访问日志颜色 (先于一切日志使用, 非 TTY/重定向时自动无色)
@@ -2965,7 +2966,9 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
 //   3) thread-id —— Codex 对话线程标识, codex resume 恢复后仍保持不变
 //   4) src:port + ua —— curl 等无会话头的客户端, 靠 TCP 源端口近似区分
 // 每个会话维护:
-//   id              —— 自增会话编号 (与 reqSeq 组成日志标签 S{id}#{reqSeq}, 如 S1#10)
+//   id              —— 自增会话编号 (与 reqSeq 组成日志标签 S{id}#{reqSeq}, 如 S1#10);
+//                      启动时自热日志恢复映射 + 空闲回收 TTL 24h, 保证同一会话 key 在
+//                      同一份日志文件内 id 稳定 (超 24h 空闲被回收后会换新 id)
 //   reqSeq          —— 请求编号计数器 (每个 model 请求到达时递增, REQ/RES 行成对输出,
 //                      如 S1#10 表示 1 号会话的第 10 个请求; 不要求有 usage)
 //   seq             —— 请求序号 (仅对解析到 usage 的请求递增, 与 ch 统计同口径)
@@ -2974,6 +2977,85 @@ function prefixDivergeMark(session, msgs, toolsJson, paramsJson) {
 const MODEL_PATHS = ["/v1/messages", "/v1/chat/completions", "/v1/responses"];
 const sessions = new Map();
 let nextSessionId = 1;
+// 启动恢复: 从热日志文件重放 JSONL 记录, 重建 会话key -> 会话状态 映射 (id/reqSeq/seq/
+// 累计 in·cr/lastLowCacheSeq/seen), 并把 nextSessionId 对齐到文件内 max(id)+1。
+// 目的: 同一会话 key 在同一份日志文件中始终同一个 id, 重启后按 id 离线聚合不失连续。
+// 恢复口径与运行时 finish 处理器逐条一致 (见 RES 处 usageStr 分支):
+//   seq     —— 仅 usage 记录 +1;  in/cr —— 累加 usage.in/.cr;
+//   lastLowCacheSeq —— pct=round(cr/(in+cr)*100)<50 时的 seq (首条低缓存也记基准);
+//   reqSeq  —— 取 max(session.req) (单调递增);  seen —— 最后一条记录的 ts。
+// 不可恢复: pfx 基线 / reasoning 缓存 (未入日志, 首次请求自动重建, 与旧版重启行为一致)。
+// 同 key 在文件内出现多个 id (运行中被回收重建过) 时取最后一个 = 最近一次分配。
+// 同步分块扫描 (StringDecoder 处理跨块多字节, 不整载文件), 在 server.listen 之前执行,
+// 且在跨日归档之前 (listen 回调里的 startupJsonlRollover 只改名不丢记录), 跨日重启也能续上;
+// 扫描失败不阻断启动, 退化为从 S1 重新计数。
+function restoreSessionsFromLog() {
+  if (!JSONL_LOG || !fs.existsSync(JSONL_LOG)) return;
+  let maxId = 0;
+  const restored = new Map(); // key -> { id, reqSeq, seq, in, cr, lastLowCacheSeq, seen }
+  const scanLine = (line) => {
+    if (!line.trim()) return;
+    let o;
+    try { o = JSON.parse(line); } catch { return; } // 坏行跳过
+    const s = o && o.session;
+    if (!s || typeof s.key !== "string" || !s.key || !Number.isInteger(s.id)) return;
+    let st = restored.get(s.key);
+    if (!st) {
+      st = { id: s.id, reqSeq: 0, seq: 0, in: 0, cr: 0, lastLowCacheSeq: null, seen: 0 };
+      restored.set(s.key, st);
+    }
+    st.id = s.id;
+    if (Number.isInteger(s.req) && s.req > st.reqSeq) st.reqSeq = s.req;
+    const tsMs = o.ts ? Date.parse(o.ts) : NaN;
+    if (Number.isFinite(tsMs) && tsMs > st.seen) st.seen = tsMs;
+    const u = o.res && o.res.usage;
+    if (u) {
+      st.seq += 1;
+      const rin = Number(u.in) || 0, rcr = Number(u.cr) || 0;
+      st.in += rin;
+      st.cr += rcr;
+      const totalIn = rin + rcr;
+      const pct = totalIn > 0 ? Math.round((rcr / totalIn) * 100) : 0;
+      if (pct < 50) st.lastLowCacheSeq = st.seq;
+    }
+    if (s.id > maxId) maxId = s.id;
+  };
+  try {
+    const CHUNK = 1 << 20;
+    const buf = Buffer.alloc(CHUNK);
+    const decoder = new StringDecoder("utf8");
+    const fd = fs.openSync(JSONL_LOG, "r");
+    try {
+      let rest = "";
+      for (;;) {
+        const n = fs.readSync(fd, buf, 0, CHUNK, null);
+        if (n <= 0) break;
+        rest += decoder.write(buf.subarray(0, n));
+        let idx;
+        while ((idx = rest.indexOf("\n")) >= 0) {
+          scanLine(rest.slice(0, idx));
+          rest = rest.slice(idx + 1);
+        }
+      }
+      rest += decoder.end();
+      if (rest.trim()) scanLine(rest); // 末行无换行符
+    } finally { fs.closeSync(fd); }
+  } catch { /* 扫描失败不阻断启动 */ }
+  if (maxId > 0) nextSessionId = maxId + 1;
+  for (const [key, st] of restored) {
+    sessions.set(key, {
+      id: st.id, reqSeq: st.reqSeq, pending: 0, seq: st.seq,
+      lastLowCacheSeq: st.lastLowCacheSeq, in: st.in, cr: st.cr,
+      pfx: null, reasoning: null, seen: st.seen || Date.now(),
+    });
+  }
+  if (restored.size) {
+    console.log(TAGI, `session 恢复: 自 ${path.basename(JSONL_LOG)} 重建 ${restored.size} 个会话 (id/reqSeq/累计 in·cr 续原值), 新会话从 S${nextSessionId} 起`);
+  } else if (maxId > 0) {
+    console.log(TAGI, `session 续号: 热文件已含 id 至 S${maxId}, 新会话从 S${nextSessionId} 起 (避免同文件编号重复)`);
+  }
+}
+restoreSessionsFromLog();
 function getSession(key) {
   let s = sessions.get(key);
   if (!s) {
@@ -2985,10 +3067,11 @@ function getSession(key) {
 }
 
 // 会话空闲回收: reasoning 缓存按会话常驻 (见 rememberReasoning), 长跑进程需兜底回收。
-// 阈值取 12h —— 客户端午休/断线重连回来仍复用同一份缓存 (实测隔 2h 的上游前缀缓存仍全
-// 命中), 只有隔夜级别的空闲才回收, 避免"回收 → 会话重建 → 前缀一次性失效"的副作用。
+// 阈值取 24h —— 启动时 Map 自热日志恢复 (见 restoreSessionsFromLog), TTL 内的空闲/重启
+// 均保持同会话同 id (同一份日志文件内编号稳定, 供离线按 id 聚合); 超长空闲才回收,
+// 回收后同会话再到达会分配新 id (日志内靠 session.key 字段仍可跨段聚合)。
 // 在途请求的 seen 时间必定很新, 不会被误删。
-const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
+const SESSION_IDLE_MS = 24 * 60 * 60 * 1000;
 const SESSION_SWEEP_MS = 30 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();

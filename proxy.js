@@ -2694,17 +2694,20 @@ function peakTsColor(mapped) {
 }
 
 /**
- * 单次请求: 成本 (USD) + 额度 (credit)。
- *  - 无模型目录 / 未收录模型 / 无 usage -> { credit:0, cost:0, peak:false, rated:false }
+ * 单次请求: 成本 (USD) + 额度 (credit) + 成本单项拆分 (breakdown)。
+ *  - 无模型目录 / 未收录模型 / 无 usage -> { credit:0, cost:0, breakdown:null, peak:false, rated:false }
  *  - monthlyCredits 缺失 (null) -> 成本照算, credit 记为 0, rated=false (不显示)
  *  - peak=true 表示当前 UTC 时刻处于该模型 offPeak 高峰窗口 (且为工作日), 已按峰值牌价
  *    (peakUsdPerMTok 覆盖 input/output/cacheRead) 计费
  *  - cost 为美元成本 (与 credit 不保持固定比例: 不同模型 monthlyCredits 不同)
+ *  - breakdown: cost 四个单项的 USD 金额, key 与 jsonl usage 短名一致 (in/out/cr/cw,
+ *    jsonl costBreakdown 用); 单项无牌价 (rate 为 null/缺字段, 如 Free 模型 cacheWrite)
+ *    时该单项为 null (未计费, 区别于 0 = 牌价为 0), 不计入 cost
  */
 function calcCredit(usage, mapped) {
-  if (!usage || !modelCatalog) return { credit: 0, cost: 0, peak: false, rated: false };
+  if (!usage || !modelCatalog) return { credit: 0, cost: 0, breakdown: null, peak: false, rated: false };
   const model = catalogModel(mapped);
-  if (!model || !model.priceUsdPerMTok) return { credit: 0, cost: 0, peak: false, rated: false };
+  if (!model || !model.priceUsdPerMTok) return { credit: 0, cost: 0, breakdown: null, peak: false, rated: false };
   const peak = inPeakWindow(model);
   const rate = { ...model.priceUsdPerMTok };
   if (peak && model.offPeak && model.offPeak.peakUsdPerMTok) {
@@ -2717,14 +2720,17 @@ function calcCredit(usage, mapped) {
     if (p.cacheRead != null) rate.cacheRead = p.cacheRead;
   }
   let cost = 0;
-  for (const k of ["input", "output", "cacheRead", "cacheWrite"]) {
+  const breakdown = {}; // key 用 jsonl usage 短名 (in/out/cr/cw), 与 usage 字段对齐
+  for (const [k, sk] of [["input", "in"], ["output", "out"], ["cacheRead", "cr"], ["cacheWrite", "cw"]]) {
     const tokens = usage[k] || 0;
     const r = rate[k];
-    if (r != null) cost += (tokens / 1e6) * r;
+    const item = r != null ? (tokens / 1e6) * r : null;
+    breakdown[sk] = item;
+    if (item != null) cost += item;
   }
   const mc = model.monthlyCredits;
   const credit = mc > 0 ? (cost * (modelCatalog.plan.credits || 0)) / mc : 0;
-  return { credit, cost, peak, rated: mc > 0 };
+  return { credit, cost, breakdown, peak, rated: mc > 0 };
 }
 
 /** 最近 n 个请求的聚合 (gen 为解码窗口: 首内容之后到流结束的耗时) */
@@ -2873,6 +2879,7 @@ function jsonlRecord(o) {
       ch: rolling ? rolling.ch : null, // 会话累计缓存命中率 % (同 RES 行 ch:, 仅本次有 usage 时算)
       ts: rolling ? rolling.ts : null, // 最近 1 次生成速度 tokens/s (同 RES 行 ts: 窗口 1)
       cost: o.cq.cost, credit: o.cq.credit, // 0/未收录模型时为 0
+      costBreakdown: o.cq.breakdown || null, // cost 单项拆分 USD {input,output,cacheRead,cacheWrite}; 未计费/无 usage 为 null, 单项无牌价为 null
       lowCache: o.gap != null, gap: o.gap, // 本次 cr/(in+cr) < 50% 时的序号差
       pfx: (o.pfx && o.pfx.mark) || null, // pfx~N / pfx~tools / pfx~params / pfx<N
     },

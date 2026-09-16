@@ -531,6 +531,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
 | `res.ttfb` / `res.ttft`           | RES 行 `ttfb=` / `ttft=`（ms；首字节 / 首内容延迟，相对 `dispatchAt`；未采样为 `null`，仅 2xx 终端显示） |
 | `res.usage`                       | RES 行 `in:/out:/rt:/cr:/cw:`；**本次未解析到 usage 为 `null`**（同 RES 行不显示）       |
 | `res.cost` / `credit`             | RES 行 `cost=` / `credit=`（0 / 未收录模型为 0）                                         |
+| `res.costBreakdown`               | cost 单项拆分（USD）：`{in, out, cr, cw}`，key 与 `res.usage` 一致，四项之和 = `cost`；未收录模型 / 无 usage / 单项无牌价为 `null` |
 | `res.ch`                          | 会话累计缓存命中率 %（同 RES 行尾 `ch:`，会话累计口径）；本次无 usage 为 `null`          |
 | `res.ts`                          | 最近 1 次生成速度 tokens/s（同 RES 行尾 `ts:` 窗口 1；分母按 `speedBase` 锚点扣减，默认扣 `ttfb`）；本次无 usage 为 `null` |
 | `res.lowCache` / `gap`            | RES 行 `gap:` —— 本次缓存命中率 <50% 时为 `true` 并给出与上次低缓存的序号差              |
@@ -579,6 +580,7 @@ OpenAI 客户端 ──chat /v1/chat/completions──▶ │  模型决策 + �
     "ttft": 950,
     "usage": { "in": 1234, "out": 567, "rt": 480, "cr": 890, "cw": 0 },
     "cost": 0.011571,
+    "costBreakdown": { "in": 0.000309, "out": 0.000425, "cr": 0.010837, "cw": 0 },
     "credit": 0.0135,
     "lowCache": false,
     "gap": null,
